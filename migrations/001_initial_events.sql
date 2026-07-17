@@ -16,3 +16,4 @@ CREATE INDEX idx_events_guild_occurred_at
 
 CREATE INDEX idx_events_guild_type
     ON events (guild_id, event_type);
+

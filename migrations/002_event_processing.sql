@@ -21,3 +21,4 @@ END;
 INSERT INTO event_processing (event_id)
 SELECT event_id FROM events
 WHERE event_id NOT IN (SELECT event_id FROM event_processing);
+

@@ -50,3 +50,4 @@ CREATE TABLE cognition_observed_events (
     event_id TEXT PRIMARY KEY REFERENCES events(event_id) ON DELETE CASCADE,
     observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
