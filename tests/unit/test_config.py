@@ -33,10 +33,54 @@ def test_memory_environment_limits_must_be_positive(monkeypatch: pytest.MonkeyPa
         Settings.from_env()
 
 
+def test_memory_lifecycle_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEBILGI_MEMORY_MAX_CONTEXT_EVENTS", "18")
+    monkeypatch.setenv("DEBILGI_MEMORY_RELEVANCE_HALF_LIFE_MINUTES", "12")
+    monkeypatch.setenv("DEBILGI_MEMORY_MIN_CONTEXT_RELEVANCE", "0.21")
+    monkeypatch.setenv("DEBILGI_MEMORY_CONSOLIDATION_MIN_IMPORTANCE", "0.44")
+    monkeypatch.setenv("DEBILGI_MEMORY_CONSOLIDATION_BATCH_SIZE", "8")
+    monkeypatch.setenv("DEBILGI_MEMORY_LONG_TERM_CAPSULE_LIMIT", "2400")
+    monkeypatch.setenv("DEBILGI_MEMORY_LONG_TERM_RECALL_LIMIT", "4")
+
+    settings = Settings.from_env()
+
+    assert settings.memory_max_context_events == 18
+    assert settings.memory_relevance_half_life_minutes == 12
+    assert settings.memory_min_context_relevance == pytest.approx(0.21)
+    assert settings.memory_consolidation_min_importance == pytest.approx(0.44)
+    assert settings.memory_consolidation_batch_size == 8
+    assert settings.memory_long_term_capsule_limit == 2400
+    assert settings.memory_long_term_recall_limit == 4
+
+
 def test_local_reply_mode_can_be_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DEBILGI_TEST_REPLIES", "true")
 
     assert Settings.from_env().test_replies_enabled
+
+
+def test_background_learning_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEBILGI_BACKGROUND_ENABLED", "true")
+    monkeypatch.setenv("DEBILGI_BACKGROUND_INTERVAL_SECONDS", "420")
+    monkeypatch.setenv("DEBILGI_BACKGROUND_WORDS_PER_CYCLE", "7")
+    monkeypatch.setenv("DEBILGI_BACKGROUND_MAX_STUDY_ATTEMPTS", "3")
+    monkeypatch.setenv("DEBILGI_BACKGROUND_GRAPH_DECAY_DAILY_RATE", "0.02")
+    monkeypatch.setenv("DEBILGI_BACKGROUND_SELF_CHECK_CYCLES", "4")
+    monkeypatch.setenv("DEBILGI_BACKGROUND_INITIATIVE_ENABLED", "true")
+    monkeypatch.setenv("DEBILGI_BACKGROUND_INITIATIVE_PROBABILITY", "0.4")
+    monkeypatch.setenv("DEBILGI_BACKGROUND_INITIATIVE_COOLDOWN_MINUTES", "90")
+
+    settings = Settings.from_env()
+
+    assert settings.background_enabled is True
+    assert settings.background_interval_seconds == 420
+    assert settings.background_words_per_cycle == 7
+    assert settings.background_max_study_attempts == 3
+    assert settings.background_graph_decay_daily_rate == pytest.approx(0.02)
+    assert settings.background_self_check_cycles == 4
+    assert settings.background_initiative_enabled is True
+    assert settings.background_initiative_probability == pytest.approx(0.4)
+    assert settings.background_initiative_cooldown_minutes == 90
 
 
 def test_language_limits_are_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -58,6 +102,140 @@ def test_language_limits_must_be_positive(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("DEBILGI_LANGUAGE_CONTEXT_CHARS", "0")
 
     with pytest.raises(ConfigurationError, match="must be positive"):
+        Settings.from_env()
+
+
+def test_language_development_limits_are_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEBILGI_CHARACTER_MARKOV_MIN_ORDER", "3")
+    monkeypatch.setenv("DEBILGI_CHARACTER_MARKOV_MAX_ORDER", "7")
+    monkeypatch.setenv("DEBILGI_CONVERSATION_IDLE_TIMEOUT_MINUTES", "35")
+    monkeypatch.setenv("DEBILGI_CONVERSATION_MAX_IDLE_TIMEOUT_MINUTES", "55")
+    monkeypatch.setenv("DEBILGI_CURIOSITY_THRESHOLD", "0.72")
+    monkeypatch.setenv("DEBILGI_RESPONSE_CONFIDENCE_THRESHOLD", "0.51")
+    monkeypatch.setenv("DEBILGI_RESPONSE_PLAN_RETRY_LIMIT", "3")
+    monkeypatch.setenv("DEBILGI_OPEN_QUESTION_TTL_MESSAGES", "4")
+
+    settings = Settings.from_env()
+
+    assert settings.character_markov_min_order == 3
+    assert settings.character_markov_max_order == 7
+    assert settings.conversation_idle_timeout_minutes == 35
+    assert settings.conversation_max_idle_timeout_minutes == 55
+    assert settings.curiosity_threshold == pytest.approx(0.72)
+    assert settings.response_confidence_threshold == pytest.approx(0.51)
+    assert settings.response_plan_retry_limit == 3
+    assert settings.open_question_ttl_messages == 4
+
+
+def test_semantic_consultant_is_opt_in_and_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEBILGI_SEMANTIC_CONSULTANT_ENABLED", "true")
+    monkeypatch.setenv("DEBILGI_SEMANTIC_CONSULTANT_PROVIDER", "puter")
+    monkeypatch.setenv(
+        "DEBILGI_SEMANTIC_CONSULTANT_ENDPOINT",
+        "http://127.0.0.1:4999/v1/consult",
+    )
+    monkeypatch.setenv(
+        "DEBILGI_SEMANTIC_CONSULTANT_MODEL", "google/gemini-3.5-flash"
+    )
+    monkeypatch.setenv("DEBILGI_SEMANTIC_CONSULTANT_TIMEOUT_SECONDS", "9")
+    monkeypatch.setenv("DEBILGI_SEMANTIC_CONSULTANT_TRIGGER_THRESHOLD", "0.66")
+    monkeypatch.setenv("DEBILGI_SEMANTIC_CONSULTANT_MINIMUM_CONFIDENCE", "0.61")
+    monkeypatch.setenv("DEBILGI_SEMANTIC_CONSULTANT_SECRET", "local-secret")
+
+    settings = Settings.from_env()
+
+    assert settings.semantic_consultant_enabled
+    assert settings.semantic_consultant_endpoint.endswith("/v1/consult")
+    assert settings.semantic_consultant_model == "google/gemini-3.5-flash"
+    assert settings.semantic_consultant_timeout_seconds == 9
+    assert settings.semantic_consultant_trigger_threshold == pytest.approx(0.66)
+    assert settings.semantic_consultant_minimum_confidence == pytest.approx(0.61)
+    assert settings.semantic_consultant_secret == "local-secret"
+
+
+def test_semantic_consultant_rejects_non_http_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEBILGI_SEMANTIC_CONSULTANT_PROVIDER", "puter")
+    monkeypatch.setenv("DEBILGI_SEMANTIC_CONSULTANT_ENDPOINT", "file:///tmp/consult")
+
+    with pytest.raises(ConfigurationError, match="HTTP URL"):
+        Settings.from_env()
+
+
+def test_cloudflare_semantic_consultant_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEBILGI_SEMANTIC_CONSULTANT_ENABLED", "true")
+    monkeypatch.setenv("DEBILGI_SEMANTIC_CONSULTANT_PROVIDER", "cloudflare")
+    monkeypatch.setenv("DEBILGI_CLOUDFLARE_ACCOUNT_ID", "account-id")
+    monkeypatch.setenv("DEBILGI_CLOUDFLARE_API_TOKEN", "secret-token")
+    monkeypatch.setenv(
+        "DEBILGI_CLOUDFLARE_MODEL",
+        "@cf/meta/llama-3.1-8b-instruct-fast",
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.semantic_consultant_provider == "cloudflare"
+    assert settings.semantic_consultant_account_id == "account-id"
+    assert settings.semantic_consultant_api_token == "secret-token"
+    assert "secret-token" not in repr(settings)
+    assert settings.semantic_consultant_instruction_path.is_file()
+
+
+def test_context_gate_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEBILGI_CONTEXT_GATE_WINDOW_TURNS", "4")
+    monkeypatch.setenv("DEBILGI_CONTEXT_GATE_MINIMUM_MATCHES", "2")
+    monkeypatch.setenv("DEBILGI_CONTEXT_GATE_INITIATIVE_IDLE_SECONDS", "240")
+
+    settings = Settings.from_env()
+
+    assert settings.context_gate_window_turns == 4
+    assert settings.context_gate_minimum_matches == 2
+    assert settings.context_gate_initiative_idle_seconds == 240
+
+
+def test_response_arbitration_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEBILGI_ARBITRATION_MODE", "shadow")
+    monkeypatch.setenv("DEBILGI_ARBITRATION_MIN_SCORE", "0.52")
+    monkeypatch.setenv("DEBILGI_ARBITRATION_MAX_TOTAL_CANDIDATES", "36")
+    monkeypatch.setenv("DEBILGI_ARBITRATION_LEARNING_ENABLED", "true")
+    monkeypatch.setenv("DEBILGI_ARBITRATION_LEARNING_RATE", "0.02")
+    monkeypatch.setenv("DEBILGI_ARBITRATION_MIN_FEEDBACK_OBSERVATIONS", "30")
+    monkeypatch.setenv("DEBILGI_ARBITRATION_MAX_WEIGHT_DELTA", "0.04")
+
+    settings = Settings.from_env()
+
+    assert settings.arbitration_mode == "shadow"
+    assert settings.arbitration_minimum_score == pytest.approx(0.52)
+    assert settings.arbitration_max_total_candidates == 36
+    assert settings.arbitration_learning_enabled is True
+    assert settings.arbitration_learning_rate == pytest.approx(0.02)
+    assert settings.arbitration_minimum_feedback_observations == 30
+    assert settings.arbitration_maximum_weight_delta == pytest.approx(0.04)
+
+
+def test_invalid_response_arbitration_mode_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEBILGI_ARBITRATION_MODE", "random")
+
+    with pytest.raises(ConfigurationError, match="off, shadow or active"):
+        Settings.from_env()
+
+
+def test_language_development_ranges_are_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEBILGI_CHARACTER_MARKOV_MIN_ORDER", "9")
+    monkeypatch.setenv("DEBILGI_CHARACTER_MARKOV_MAX_ORDER", "8")
+
+    with pytest.raises(ConfigurationError, match="minimum order"):
         Settings.from_env()
 
 

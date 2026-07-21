@@ -2,28 +2,87 @@
 
 from __future__ import annotations
 
+from debilgi.language.tokenizer import normalize_chat_token
 from debilgi.social.models import PrimitiveVector
 
 AFFIRMATION = frozenset(
-    {"да", "ага", "верно", "согласен", "согласна", "точно", "правда", "ок", "okay", "yes"}
+    {
+        "да",
+        "ага",
+        "верно",
+        "согласен",
+        "согласна",
+        "поддерживаю",
+        "принимаю",
+        "подходит",
+        "разумно",
+        "точно",
+        "правда",
+        "ок",
+        "okay",
+        "yes",
+    }
 )
-REFUSAL = frozenset({"нет", "не", "никогда", "отказываюсь", "хватит", "нельзя", "прекрати", "no"})
+REFUSAL = frozenset(
+    {
+        "нет",
+        "не",
+        "никогда",
+        "отказываюсь",
+        "отклоняю",
+        "отвергаю",
+        "останавливаю",
+        "недопустимо",
+        "хватит",
+        "нельзя",
+        "прекрати",
+        "no",
+    }
+)
 APPROVAL = frozenset(
     {
         "хорошо",
         "отлично",
         "круто",
+        "красава",
+        "красавчик",
+        "молодец",
         "норм",
         "нравится",
         "правильно",
+        "логично",
+        "логичный",
+        "разумно",
+        "разумный",
+        "убедительно",
+        "убедительный",
+        "верно",
+        "полезно",
+        "польза",
+        "рабочий",
+        "удачно",
         "успех",
+        "умница",
         "охуенно",
         "good",
         "great",
     }
 )
 DISAPPROVAL = frozenset(
-    {"плохо", "ошибка", "неправильно", "сломано", "провал", "ужасно", "bad", "wrong"}
+    {
+        "плохо",
+        "ошибка",
+        "неправильно",
+        "сломано",
+        "провал",
+        "ужасно",
+        "риск",
+        "ненадёжно",
+        "противоречит",
+        "вредно",
+        "bad",
+        "wrong",
+    }
 )
 CURIOSITY = frozenset(
     {
@@ -57,7 +116,10 @@ AVERSION = frozenset(
 
 
 def evidence_counts(tokens: tuple[str, ...]) -> dict[str, int]:
-    token_set = set(tokens)
+    token_set = {
+        normalize_chat_token(token).canonical if token[:1].isalnum() else token
+        for token in tokens
+    }
     return {
         "affirmation": len(token_set & AFFIRMATION),
         "refusal": len(token_set & REFUSAL),

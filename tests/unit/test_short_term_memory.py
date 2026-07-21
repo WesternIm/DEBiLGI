@@ -28,6 +28,8 @@ def make_event(
     message_id: int | None = None,
     reply_to: int | None = None,
     mentions: list[int] | None = None,
+    content: str | None = None,
+    bot_mentioned: bool = False,
 ) -> Event:
     payload: dict[str, object] = {}
     if message_id is not None:
@@ -35,6 +37,10 @@ def make_event(
         payload["reply_to_message_id"] = reply_to
     if mentions is not None:
         payload["mentioned_user_ids"] = mentions
+    if content is not None:
+        payload["content"] = content
+    if bot_mentioned:
+        payload["bot_mentioned"] = True
     return Event(
         event_id=event_id,
         guild_id=guild_id,
@@ -199,3 +205,67 @@ async def test_reply_chain_count_and_length_are_bounded(clock: ManualClock) -> N
         "parent-2",
         "reply-2",
     ]
+
+
+async def test_working_context_forgets_unrelated_old_words(clock: ManualClock) -> None:
+    memory = ShortTermMemory(
+        MemoryLimits(max_context_events=3, relevance_half_life=timedelta(minutes=5)),
+        clock=clock,
+    )
+    await memory.observe(make_event("matching", clock, content="обсуждаем ремонт велосипеда"))
+    clock.advance(timedelta(minutes=8))
+    for index in range(6):
+        await memory.observe(
+            make_event(f"noise-{index}", clock, content=f"случайная музыка номер {index}")
+        )
+        clock.advance(timedelta(seconds=5))
+
+    context = await memory.relevant_context(
+        1,
+        channel_id=10,
+        user_id=100,
+        prompt="как закончить ремонт велосипеда",
+    )
+
+    assert "matching" in {event.event_id for event in context}
+    assert len(context) == 3
+    assert "noise-0" not in {event.event_id for event in context}
+
+
+async def test_working_context_keeps_twelve_recent_turns_for_ellipsis(clock: ManualClock) -> None:
+    memory = ShortTermMemory(MemoryLimits(max_context_events=12), clock=clock)
+    for index in range(14):
+        await memory.observe(make_event(f"turn-{index}", clock, content=f"реплика {index}"))
+        clock.advance(timedelta(seconds=1))
+
+    context = await memory.relevant_context(
+        1,
+        channel_id=10,
+        user_id=100,
+        prompt="сверил?",
+    )
+
+    assert [event.event_id for event in context] == [f"turn-{index}" for index in range(2, 14)]
+
+
+async def test_evicted_messages_are_exposed_once_for_consolidation(
+    clock: ManualClock,
+) -> None:
+    memory = ShortTermMemory(MemoryLimits(retention=timedelta(minutes=1)), clock=clock)
+    await memory.observe(
+        make_event(
+            "important",
+            clock,
+            content="запомни важный вывод о проекте",
+            bot_mentioned=True,
+        )
+    )
+    clock.advance(timedelta(minutes=2))
+
+    assert await memory.channel_context(1, 10) == ()
+    fragments = await memory.drain_evicted()
+
+    assert len(fragments) == 1
+    assert fragments[0].event.event_id == "important"
+    assert fragments[0].importance >= 0.5
+    assert await memory.drain_evicted() == ()

@@ -14,6 +14,10 @@ def test_wikipedia_payload_is_parsed_into_a_concept_result() -> None:
                         "pageprops": {"wikibase_item": "Q7559"},
                         "revisions": [{"revid": 777}],
                         "links": [{"title": "Мифология"}, {"title": "Категория:Драконы"}],
+                        "categories": [
+                            {"title": "Категория:Мифические существа"},
+                            {"title": "Категория:Драконы"},
+                        ],
                     }
                 ]
             }
@@ -25,6 +29,10 @@ def test_wikipedia_payload_is_parsed_into_a_concept_result() -> None:
     assert result.wikidata_id == "Q7559"
     assert result.revision_id == 777
     assert result.related_titles == ("Мифология",)
+    assert result.categories == (
+        "Категория:Мифические существа",
+        "Категория:Драконы",
+    )
 
 
 def test_wikipedia_payload_without_pages_has_no_result() -> None:

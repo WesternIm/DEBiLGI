@@ -7,6 +7,7 @@ from uuid import uuid4
 from debilgi.cognition.core_repository import CognitiveRepository
 from debilgi.cognition.models import ActionIntent
 from debilgi.events.models import Event, EventType
+from debilgi.language.pragmatics import analyze_pragmatics
 from debilgi.language.tokenizer import tokenize
 from debilgi.personality.genome import PersonalityGenome
 from debilgi.social.models import PrimitiveVector, SocialReaction, composition
@@ -52,6 +53,7 @@ def assess_reaction(
     text = content if isinstance(content, str) else ""
     tokens = tokenize(text)
     counts = evidence_counts(tokens)
+    pragmatics = analyze_pragmatics(text)
     context = intent.decision_context if intent else {}
     familiarity = _number(context, "familiarity")
     predictability = _number(context, "predictability")
@@ -60,8 +62,10 @@ def assess_reaction(
     tension = _number(context, "state_tension")
     activation = _number(context, "state_activation")
     unexpectedness = _number(context, "state_unexpectedness")
-    question_signal = float("?" in tokens)
+    question_signal = max(float("?" in tokens), pragmatics.question_force)
     exclamation_signal = min(1.0, tokens.count("!") * 0.5)
+    uncertainty_signal = pragmatics.uncertainty
+    emotional_signal = pragmatics.emotional_intensity
 
     vector = PrimitiveVector(
         agreement=_clamp(
@@ -90,6 +94,7 @@ def assess_reaction(
             + counts["curiosity"] * 0.24
             + question_signal * 0.24
             + uncertainty * 0.16
+            + uncertainty_signal * 0.12
             + interest * 0.14
             + genome.curiosity * 0.10
         ),
@@ -112,6 +117,7 @@ def assess_reaction(
             + activation * 0.36
             + tension * 0.26
             + exclamation_signal * 0.22
+            + emotional_signal * 0.12
             + genome.expressiveness * 0.08
         ),
     )

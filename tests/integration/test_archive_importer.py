@@ -98,7 +98,7 @@ async def test_ingestion_is_idempotent_and_extracts_reply_patterns(
     stats = await repository.language_stats(1)
     assert stats.raw_messages == 2
     assert stats.reply_patterns == 1
-    assert stats.semantic_frames >= 1
+    assert stats.semantic_frames == 0  # greeting/interjection is not a factual proposition
     assert await repository.token_count(1, "привет") == 2
     assert await repository.token_count(1, "блять") == 1
     assert await repository.recent_texts(1, 2) == (
@@ -110,7 +110,69 @@ async def test_ingestion_is_idempotent_and_extracts_reply_patterns(
         "блять",
         "😈",
     )
+    assert (await repository.matching_replies(1, tokenize("ну привет сука")))[0] == (
+        "привет блять 😈"
+    )
+    assert await repository.exact_learned_reply(1, tokenize("ну привет сука")) == (
+        "привет блять 😈"
+    )
     assert (("ну", "привет"), 1) in await repository.common_bigrams(1)
+    character_rows = await database.fetchall(
+        "SELECT * FROM language_character_transitions WHERE guild_id = ?", (1,)
+    )
+    assert character_rows
+
+
+async def test_reply_retrieval_ignores_pronoun_only_overlap(database: Database) -> None:
+    repository = ArchiveRepository(database)
+    job = await create_job(repository)
+    await repository.mark_running(job.job_id)
+    await repository.ingest_message(job.job_id, message(10, "ты радуешься"))
+    await repository.ingest_message(
+        job.job_id,
+        message(11, "вижу удачный исход и повышаю доверие", reply_to=10),
+    )
+    await repository.ingest_message(job.job_id, message(12, "ты злишься"))
+    await repository.ingest_message(
+        job.job_id,
+        message(13, "напряжение есть, злость слишком человеческая", reply_to=12),
+    )
+
+    unrelated = tokenize("ты разумный")
+    scaffolding_only = tokenize("хмм ну ты же")
+    related = tokenize("почему ты радуешься")
+
+    assert await repository.matching_replies(1, unrelated) == ()
+    assert await repository.matching_reply_heads(1, unrelated) == ()
+    assert await repository.matching_replies(1, scaffolding_only) == ()
+    assert await repository.matching_reply_heads(1, scaffolding_only) == ()
+    assert (await repository.matching_replies(1, related))[0] == (
+        "вижу удачный исход и повышаю доверие"
+    )
+    assert await repository.exact_learned_reply(1, tokenize("ты радуешься")) == (
+        "вижу удачный исход и повышаю доверие"
+    )
+
+
+async def test_exact_reply_distinguishes_address_punctuation(database: Database) -> None:
+    repository = ArchiveRepository(database)
+    job = await create_job(repository)
+    await repository.mark_running(job.job_id)
+    await repository.ingest_message(job.job_id, message(20, "узнай, умник"))
+    await repository.ingest_message(
+        job.job_id, message(21, "это обращение", reply_to=20)
+    )
+    await repository.ingest_message(job.job_id, message(22, "узнай умник"))
+    await repository.ingest_message(
+        job.job_id, message(23, "это разговорная запись", reply_to=22)
+    )
+
+    assert await repository.exact_learned_reply(1, tokenize("узнай, умник")) == (
+        "это обращение"
+    )
+    assert await repository.exact_learned_reply(1, tokenize("узнай умник")) == (
+        "это разговорная запись"
+    )
 
 
 async def test_semantic_memory_retrieves_old_fact_by_object(database: Database) -> None:
@@ -124,6 +186,18 @@ async def test_semantic_memory_retrieves_old_fact_by_object(database: Database) 
 
     assert context
     assert "лиса положила ключ в ящик" in context
+
+
+async def test_semantic_memory_does_not_return_unrelated_facts(database: Database) -> None:
+    repository = ArchiveRepository(database)
+    job = await create_job(repository)
+    await repository.mark_running(job.job_id)
+    assert await repository.ingest_message(job.job_id, message(13, "Борис положил книгу на полку"))
+
+    semantic = SemanticMemoryRepository(database)
+
+    assert await semantic.context(1, tokenize("чего")) == ()
+    assert await semantic.context(1, tokenize("не лезь к нему")) == ()
 
 
 async def test_raw_deletion_keeps_idempotency_ledger_and_aggregates(

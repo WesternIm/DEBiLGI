@@ -21,6 +21,14 @@ def test_message_normalization_is_deterministic_and_discord_independent() -> Non
         content="бля а я падумал 🤔",
         author_is_bot=False,
         mentioned_user_ids=[500],
+        author_identity={
+            "id": 400,
+            "username": "ferzevina",
+            "display_name": "Эвелина",
+        },
+        mentioned_users=[
+            {"id": 500, "username": "furybam", "display_name": "FuryBaM"}
+        ],
         attachments=[{"filename": "x.png", "size": 10}],
     )
 
@@ -29,6 +37,8 @@ def test_message_normalization_is_deterministic_and_discord_independent() -> Non
     assert event.timestamp == created_at
     assert event.payload["content"] == "бля а я падумал 🤔"
     assert event.payload["mentioned_user_ids"] == [500]
+    assert event.payload["author_identity"]["display_name"] == "Эвелина"
+    assert event.payload["mentioned_users"][0]["username"] == "furybam"
 
 
 def test_reply_becomes_message_replied() -> None:

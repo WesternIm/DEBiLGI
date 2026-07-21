@@ -17,6 +17,17 @@ class PreparedReply:
     goal_id: str | None = None
     initiative_drive: float = 0.0
     initiative_reasoning: tuple[dict[str, object], ...] = ()
+    fallback: bool = False
+    pending_concept: str | None = None
+    contextual_learning: bool = False
+    response_source: str = "graph"
+    arbitration_decision_id: str | None = None
+    winner_candidate_id: str | None = None
+    arbitration_weight_version: int = 0
+    semantic_plan_id: str | None = None
+    processing_outcome_type: str = "replied"
+    failure_stage: str | None = None
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

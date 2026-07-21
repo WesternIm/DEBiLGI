@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from debilgi.cognition.models import ActionIntent, ActionType
+from debilgi.language.construction_nlg import ConstructionSpec
+from debilgi.language.dialogue_state import DialogueContextWindow, DialogueStateAnalysis
+from debilgi.language.productive_nlg import DependencyPattern
+from debilgi.language.social_reasoning import SocialPolicy
+from debilgi.language.usage_learning import UsageGuidance
 from debilgi.personality.expression import PersonalityExpression
 from debilgi.reflection.models import ReflectionGuidance
 from debilgi.social.models import SocialReaction
@@ -26,15 +31,31 @@ class ReplyContext:
 
     prompt: str = ""
     memory_messages: tuple[str, ...] = ()
+    dialogue_messages: tuple[str, ...] = ()
+    # Role-labelled turns are kept separately for the optional semantic
+    # teacher.  Local dialogue algorithms intentionally continue to consume
+    # plain text, while the teacher must know which ``я``/``ты`` belongs to
+    # the user and which belongs to the agent.
+    consultation_messages: tuple[str, ...] = ()
     memory_ngrams: tuple[tuple[tuple[str, ...], int], ...] = ()
     experience_transitions: tuple[tuple[tuple[str, ...], float], ...] = ()
     reply_heads: tuple[tuple[str, ...], ...] = ()
     knowledge_facts: tuple[str, ...] = ()
+    required_facts: tuple[str, ...] = ()
     seed: str = ""
     personality: PersonalityExpression | None = None
     reaction: SocialReaction | None = None
     reflection: ReflectionGuidance | None = None
     exact_answer: str | None = None
+    usage_hints: tuple[UsageGuidance, ...] = ()
+    learned_syntax_patterns: tuple[tuple[str, ...], ...] = ()
+    learned_constructions: tuple[ConstructionSpec, ...] = ()
+    dependency_patterns: tuple[DependencyPattern, ...] = ()
+    expected_response_acts: tuple[str, ...] = ()
+    learned_registers: tuple[str, ...] = ()
+    social_policies: tuple[SocialPolicy, ...] = ()
+    dialogue_window: DialogueContextWindow | None = None
+    dialogue_state: DialogueStateAnalysis | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,10 +93,16 @@ def utterance_plan(
     reaction = context.reaction if context is not None else None
     if speech_act and speech_act != "clarifying_question" and reaction is not None:
         vector = reaction.vector
-        if vector.resistance >= 0.58 and vector.resistance > vector.agreement:
+        positive = max(vector.agreement, vector.approval)
+        negative = max(vector.resistance, vector.aversion)
+        if positive >= 0.45 and negative >= 0.45 and abs(positive - negative) <= 0.28:
+            speech_act = "qualified_position"
+        elif vector.resistance >= 0.58 and vector.resistance > vector.agreement:
             speech_act = "boundary_statement"
         elif vector.aversion >= 0.58:
             speech_act = "aversive_statement"
+        elif thought.confidence < 0.5 and positive >= 0.36:
+            speech_act = "cautious_position"
         elif vector.approval >= 0.55:
             speech_act = "approving_statement"
         elif vector.agreement >= 0.55:

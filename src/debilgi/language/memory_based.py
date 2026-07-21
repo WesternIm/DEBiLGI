@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import inf
 
+from debilgi.language.content import content_lemmas
 from debilgi.language.grammar import SoftGrammar, role
+from debilgi.language.morphology import DEFAULT_MORPHOLOGY
 from debilgi.language.planning import UtterancePlan
+from debilgi.language.surface_coherence import evaluate_surface
+from debilgi.language.surface_policy import internal_surface_reason
 from debilgi.language.tokenizer import tokenize
+from debilgi.language.usage_learning import UsageGuidance
 from debilgi.social.models import PrimitiveVector
 from debilgi.social.signals import reaction_affinity
 
@@ -18,6 +23,8 @@ _BLOCKED_TOKENS = {"<user>", "<role>", "<channel>", "<url>"}
 _NO_SPACE_BEFORE = frozenset(",.!?:;)]}»…")
 _NO_SPACE_AFTER = frozenset("([{«")
 _SENTENCE_END = {".", "!", "?", "…"}
+_OPENING_DELIMITERS = {"(": ")", "[": "]", "{": "}", "«": "»", "“": "”", "„": "“"}
+_CLOSING_DELIMITERS = frozenset(_OPENING_DELIMITERS.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +49,13 @@ class _LanguageModel:
     question_grammar: SoftGrammar
 
 
+@dataclass(frozen=True, slots=True)
+class GeneratedUtterance:
+    text: str
+    variant: int
+    renderer: str = "memory_graph"
+
+
 class MemoryPhraseGenerator:
     """Generate and rank many utterances using no authored response phrases."""
 
@@ -51,13 +65,57 @@ class MemoryPhraseGenerator:
         self.max_output_tokens = max_output_tokens
         self.max_output_chars = max_output_chars
 
+    def generate_candidates(
+        self, plan: UtterancePlan, *, limit: int = 8
+    ) -> tuple[GeneratedUtterance, ...]:
+        """Expose several deterministic surfaces instead of hiding the internal winner."""
+
+        limit = max(1, min(limit, 24))
+        seen: set[str] = set()
+        generated: list[GeneratedUtterance] = []
+        for variant in range(limit):
+            context = replace(
+                plan.context,
+                seed=f"{plan.context.seed}|surface-variant:{variant}",
+            )
+            text = self.generate(replace(plan, context=context)).strip()
+            key = " ".join(text.casefold().split())
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            generated.append(GeneratedUtterance(text, variant))
+        return tuple(generated)
+
     def generate(self, plan: UtterancePlan) -> str:
         context = plan.context
         if context.exact_answer:
-            return context.exact_answer[: self.max_output_chars]
+            return self._truncate_complete(context.exact_answer, self.max_output_chars)
         prompt_tokens = self._usable_tokens(tokenize(context.prompt))
-        retrieved = self._retrieve(context.memory_messages, prompt_tokens, limit=30)
+        retrieved = self._retrieve(context.memory_messages, prompt_tokens, limit=8)
         knowledge = context.knowledge_facts[:8]
+        reply_heads = tuple(
+            head for raw_head in context.reply_heads if (head := self._usable_tokens(raw_head))
+        )
+        if not retrieved and not knowledge and not reply_heads:
+            return ""
+        relevant_terms = set(content_lemmas(prompt_tokens))
+        relevant_terms.update(
+            lemma
+            for message in (*retrieved, *knowledge)
+            for lemma in content_lemmas(message)
+        )
+        stored_ngrams = tuple(
+            item
+            for item in context.memory_ngrams
+            if len(relevant_terms) >= 2
+            and relevant_terms.intersection(content_lemmas(item[0]))
+        )
+        experience_transitions = tuple(
+            item
+            for item in context.experience_transitions
+            if len(relevant_terms) >= 2
+            and relevant_terms.intersection(content_lemmas(item[0]))
+        )
         tokenized = tuple(
             tokens
             for message in (*retrieved, *knowledge, context.prompt)
@@ -65,31 +123,54 @@ class MemoryPhraseGenerator:
         )
         model = self._build_model(
             tokenized,
-            context.memory_ngrams,
-            context.experience_transitions,
-        )
-        reply_heads = tuple(
-            head for raw_head in context.reply_heads if (head := self._usable_tokens(raw_head))
+            stored_ngrams,
+            experience_transitions,
         )
         if not model.vocabulary and not reply_heads:
             return ""
         if len(model.vocabulary) == 1:
-            only = next(iter(model.vocabulary))
-            tokens = (only, only, only)
-            if plan.speech_act == "clarifying_question":
-                tokens = (*tokens, "?")
-            return self._detokenize(tokens)[: self.max_output_chars]
+            return ""
 
         profile = self._profile(plan)
         source_tokens = tuple(self._usable_tokens(tokenize(message)) for message in retrieved)
         knowledge_tokens = tuple(self._usable_tokens(tokenize(fact)) for fact in knowledge)
         candidates: dict[tuple[str, ...], float] = {}
+        for source_index, source in enumerate(source_tokens[:3]):
+            if not source:
+                continue
+            is_question = source[-1:] == ("?",)
+            if plan.speech_act == "clarifying_question" and not is_question:
+                continue
+            if plan.speech_act != "clarifying_question" and is_question:
+                continue
+            rendered_source = self._detokenize(source)
+            source_preview = rendered_source
+            if source[-1] not in _SENTENCE_END:
+                source_preview += "."
+            source_surface = evaluate_surface(source_preview)
+            if source_surface.hard_issues or source_surface.score < 0.72:
+                continue
+            candidates[source] = (
+                self._score(
+                    source,
+                    prompt_tokens,
+                    source_tokens,
+                    knowledge_tokens,
+                    model,
+                    profile,
+                    plan.speech_act,
+                    context.usage_hints,
+                    context.learned_syntax_patterns,
+                    context.expected_response_acts,
+                )
+                + max(0.15, 0.75 - source_index * 0.20)
+            )
         if plan.speech_act != "clarifying_question":
-            prompt_words = {token for token in prompt_tokens if self._is_word(token)}
+            prompt_words = set(content_lemmas(context.prompt))
             maximum = min(plan.max_tokens, self.max_output_tokens)
             for fact_index, fact in enumerate(knowledge_tokens[:3]):
                 grounded = fact[:maximum]
-                fact_words = {token for token in grounded if self._is_word(token)}
+                fact_words = set(content_lemmas(grounded))
                 overlap = len(prompt_words & fact_words)
                 if not grounded or (prompt_words and overlap == 0):
                     continue
@@ -104,6 +185,9 @@ class MemoryPhraseGenerator:
                         model,
                         profile,
                         plan.speech_act,
+                        context.usage_hints,
+                        context.learned_syntax_patterns,
+                        context.expected_response_acts,
                     )
                     + recall_bonus
                 )
@@ -120,6 +204,12 @@ class MemoryPhraseGenerator:
             )
             if not candidate:
                 continue
+            preview = candidate
+            if preview[-1] not in _SENTENCE_END:
+                preview = (*preview, "?" if plan.speech_act == "clarifying_question" else ".")
+            surface = evaluate_surface(self._detokenize(preview))
+            if surface.hard_issues or surface.score < 0.72:
+                continue
             score = self._score(
                 candidate,
                 prompt_tokens,
@@ -128,18 +218,23 @@ class MemoryPhraseGenerator:
                 model,
                 profile,
                 plan.speech_act,
+                context.usage_hints,
+                context.learned_syntax_patterns,
+                context.expected_response_acts,
             )
             candidates[candidate] = max(score, candidates.get(candidate, -inf))
         if not candidates:
-            maximum = min(plan.max_tokens, self.max_output_tokens)
-            return self._detokenize(prompt_tokens[:maximum])[: self.max_output_chars]
+            return ""
         selected = max(
             candidates.items(),
             key=lambda item: (item[1], self._number(f"{context.seed}|{item[0]}")),
         )[0]
         if plan.speech_act == "clarifying_question" and selected[-1] not in _SENTENCE_END:
             selected = (*selected, "?")
-        return self._detokenize(selected)[: self.max_output_chars]
+        elif selected[-1] not in _SENTENCE_END:
+            selected = (*selected, ".")
+        rendered = self._truncate_complete(self._detokenize(selected), self.max_output_chars)
+        return rendered if not evaluate_surface(rendered).hard_issues else ""
 
     def _generate_candidate(
         self,
@@ -175,10 +270,8 @@ class MemoryPhraseGenerator:
             min(self.max_output_tokens, profile.target_tokens + variation),
         )
         minimum = min(maximum, max(5, round(profile.target_tokens * 0.62)))
-        target_sentences = 1 + int(profile.target_tokens >= 24)
-        target_sentences += int(profile.target_tokens >= 40 and profile.expressiveness >= 0.65)
+        target_sentences = 1
         sentence_ends = sum(token in _SENTENCE_END for token in output)
-        restarts = 0
         while output and len(output) < maximum:
             history = (*prompt[-3:], *output)
             following = self._next_token(
@@ -189,14 +282,7 @@ class MemoryPhraseGenerator:
                 grammar,
             )
             if following == _END:
-                if (
-                    (len(output) >= minimum and sentence_ends >= target_sentences)
-                    or not starts
-                    or restarts >= 3
-                ):
-                    break
-                following = self._weighted_pick(starts, f"{seed}:restart:{restarts}")
-                restarts += 1
+                break
             if len(output) >= 2 and output[-1] == output[-2] == following:
                 break
             output.append(following)
@@ -244,7 +330,8 @@ class MemoryPhraseGenerator:
         vocabulary: set[str] = set()
         question_starts: Counter[str] = Counter()
         for tokens in messages:
-            starts[tokens[0]] += 1
+            if cls._is_word(tokens[0]):
+                starts[tokens[0]] += 1
             if tokens[-1:] == ("?",) or role(tokens[0]) == "question":
                 question_starts[tokens[0]] += 1
             vocabulary.update(tokens)
@@ -256,7 +343,8 @@ class MemoryPhraseGenerator:
             usable = cls._usable_tokens(gram)
             if len(usable) < 2 or count <= 0:
                 continue
-            starts[usable[0]] += count
+            if cls._is_word(usable[0]):
+                starts[usable[0]] += count
             vocabulary.update(usable)
             transitions[usable[:-1]][usable[-1]] += count
         for gram, adjustment in experience_transitions:
@@ -284,13 +372,19 @@ class MemoryPhraseGenerator:
     def _retrieve(
         cls, messages: tuple[str, ...], prompt: tuple[str, ...], *, limit: int
     ) -> tuple[str, ...]:
-        prompt_words = {token for token in prompt if cls._is_word(token)}
+        prompt_words = set(content_lemmas(prompt))
         ranked: list[tuple[float, int, str]] = []
         total = max(1, len(messages))
         for index, message in enumerate(messages):
+            if internal_surface_reason(message) is not None:
+                continue
+            if evaluate_surface(message).hard_issues:
+                continue
             tokens = cls._usable_tokens(tokenize(message))
-            words = {token for token in tokens if cls._is_word(token)}
+            words = set(content_lemmas(tokens))
             overlap = len(prompt_words & words) / max(1, len(prompt_words | words))
+            if prompt_words and overlap <= 0.0:
+                continue
             recency = (index + 1) / total
             ranked.append((overlap * 5.0 + recency * 0.35, index, message))
         selected = sorted(ranked, key=lambda item: (-item[0], -item[1]))[:limit]
@@ -307,18 +401,24 @@ class MemoryPhraseGenerator:
         model: _LanguageModel,
         profile: _Profile,
         speech_act: str,
+        usage_hints: tuple[UsageGuidance, ...] = (),
+        learned_syntax_patterns: tuple[tuple[str, ...], ...] = (),
+        expected_response_acts: tuple[str, ...] = (),
     ) -> float:
         words = tuple(token for token in candidate if cls._is_word(token))
-        unique = set(words)
-        prompt_words = {token for token in prompt if cls._is_word(token)}
-        source_words = {token for source in sources[:8] for token in source if cls._is_word(token)}
+        unique = set(content_lemmas(candidate))
+        prompt_words = set(content_lemmas(prompt))
+        source_words = {
+            lemma for source in sources[:8] for lemma in content_lemmas(source)
+        }
         knowledge_words = {
-            token for source in knowledge_sources for token in source if cls._is_word(token)
+            lemma for source in knowledge_sources for lemma in content_lemmas(source)
         }
         topic = len(unique & (prompt_words | source_words | knowledge_words)) / max(1, len(unique))
         grounding = len(unique & knowledge_words) / max(1, len(unique))
         novelty = len(unique - prompt_words) / max(1, len(unique))
-        repetition = 1.0 - len(unique) / max(1, len(words))
+        surface_unique = set(words)
+        repetition = 1.0 - len(surface_unique) / max(1, len(words))
         coherent = sum(
             model.transitions.get((left,), Counter()).get(right, 0) > 0
             for left, right in zip(candidate, candidate[1:], strict=False)
@@ -326,6 +426,7 @@ class MemoryPhraseGenerator:
         copy_similarity = max(
             (cls._sequence_similarity(candidate, source) for source in sources), default=0.0
         )
+        prompt_copy_similarity = cls._sequence_similarity(candidate, prompt)
         length_fit = 1.0 - min(
             1.0, abs(len(candidate) - profile.target_tokens) / max(1, profile.target_tokens)
         )
@@ -346,9 +447,83 @@ class MemoryPhraseGenerator:
             + length_fit * 0.75
             + act_fit
             + reaction_affinity(candidate, profile.reaction, speech_act) * 1.35
+            + cls._usage_fit(candidate, usage_hints) * 0.55
+            + cls._learned_syntax_fit(candidate, learned_syntax_patterns) * 0.45
+            + (0.22 if speech_act in expected_response_acts else 0.0)
             - repetition * (1.35 - profile.chaos * 0.45)
             - copy_similarity * (0.45 + profile.novelty * 0.55)
+            - prompt_copy_similarity * 2.10
         )
+
+    @staticmethod
+    def _learned_syntax_fit(
+        candidate: tuple[str, ...], patterns: tuple[tuple[str, ...], ...]
+    ) -> float:
+        if not patterns:
+            return 0.0
+        candidate_pattern = tuple(
+            reading.part_of_speech
+            for token in candidate
+            if (reading := DEFAULT_MORPHOLOGY.best(token)) is not None
+            and reading.part_of_speech is not None
+        )
+        if not candidate_pattern:
+            return 0.0
+        best = 0.0
+        for pattern in patterns:
+            if not pattern:
+                continue
+            span = min(len(candidate_pattern), len(pattern))
+            positional = sum(
+                candidate_pattern[index] == pattern[index] for index in range(span)
+            ) / max(len(candidate_pattern), len(pattern))
+            shared = len(set(candidate_pattern) & set(pattern)) / max(
+                1, len(set(candidate_pattern) | set(pattern))
+            )
+            best = max(best, positional * 0.72 + shared * 0.28)
+        return best
+
+    @staticmethod
+    def _usage_fit(
+        candidate: tuple[str, ...], hints: tuple[UsageGuidance, ...]
+    ) -> float:
+        """Reward learned collocations softly; never reject an unseen construction."""
+
+        if not hints:
+            return 0.0
+        readings = tuple(DEFAULT_MORPHOLOGY.best(token) for token in candidate)
+        candidate_lemmas = {
+            reading.lemma
+            for reading in readings
+            if reading is not None
+        }
+        scores: list[float] = []
+        for hint in hints:
+            target_readings = tuple(
+                reading
+                for token, reading in zip(candidate, readings, strict=True)
+                if reading is not None
+                and (
+                    reading.lemma == hint.lemma
+                    or token.casefold().replace("ё", "е") == hint.word
+                )
+            )
+            if not target_readings:
+                continue
+            matches = 0.15
+            if hint.preferred_case and any(
+                item.case == hint.preferred_case for item in target_readings
+            ):
+                matches += 0.30
+            if hint.preferred_number and any(
+                item.number == hint.preferred_number for item in target_readings
+            ):
+                matches += 0.20
+            neighbors = set(hint.neighbors)
+            if neighbors & candidate_lemmas:
+                matches += 0.35
+            scores.append(matches * max(0.0, min(1.0, hint.confidence)))
+        return max(scores, default=0.0)
 
     @staticmethod
     def _sequence_similarity(left: tuple[str, ...], right: tuple[str, ...]) -> float:
@@ -466,3 +641,56 @@ class MemoryPhraseGenerator:
                 result += f" {token}"
             previous = token
         return result
+
+    @staticmethod
+    def _truncate_complete(text: str, maximum: int) -> str:
+        """Respect the cap, semantic boundaries and balanced quotes/brackets."""
+
+        cleaned = text.strip()
+        if len(cleaned) <= maximum:
+            return _balance_delimiters(cleaned, maximum)
+        if maximum <= 1:
+            return "…"[:maximum]
+        prefix = cleaned[:maximum]
+        sentence_end = max(prefix.rfind(mark) for mark in _SENTENCE_END)
+        if sentence_end >= min(120, maximum // 3):
+            return _balance_delimiters(prefix[: sentence_end + 1].rstrip(), maximum)
+        word_end = prefix.rfind(" ", 0, maximum - 1)
+        if word_end <= 0:
+            shortened = prefix[: maximum - 1].rstrip() + "…"
+        else:
+            shortened = prefix[:word_end].rstrip(" ,;:—-") + "…"
+        return _balance_delimiters(shortened, maximum)
+
+
+def _balance_delimiters(text: str, maximum: int) -> str:
+    candidate = text[:maximum].rstrip()
+    for _ in range(4):
+        missing = _missing_closers(candidate)
+        if not missing:
+            return candidate
+        if len(candidate) + len(missing) <= maximum:
+            return candidate + missing
+        budget = maximum - len(missing)
+        if budget <= 1:
+            return candidate[:maximum]
+        prefix = candidate[:budget].rstrip()
+        word_end = prefix.rfind(" ")
+        candidate = (prefix[:word_end] if word_end > 0 else prefix).rstrip(" ,;:—-")
+    return candidate[:maximum].rstrip()
+
+
+def _missing_closers(text: str) -> str:
+    stack: list[str] = []
+    straight_quote_open = False
+    for character in text:
+        if character == '"':
+            straight_quote_open = not straight_quote_open
+            continue
+        expected = _OPENING_DELIMITERS.get(character)
+        if expected is not None:
+            stack.append(expected)
+        elif character in _CLOSING_DELIMITERS and stack and stack[-1] == character:
+            stack.pop()
+    closers = "".join(reversed(stack))
+    return ('"' if straight_quote_open else "") + closers

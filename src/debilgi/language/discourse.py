@@ -11,8 +11,8 @@ from typing import Any
 import aiosqlite
 
 from debilgi.events.models import Event, EventType
-from debilgi.language.grammar import role
-from debilgi.language.semantics import lexeme_key
+from debilgi.language.addressing import DEFAULT_ADDRESSING
+from debilgi.language.content import content_lemmas
 from debilgi.language.tokenizer import tokenize
 from debilgi.storage.database import Database
 
@@ -20,7 +20,10 @@ _MESSAGE_TYPES = {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}
 _QUESTION_WORDS = frozenset(
     {"кто", "что", "где", "куда", "откуда", "когда", "зачем", "почему", "как", "какой"}
 )
-_COMMAND_ENDINGS = ("й", "йте", "и", "ите")
+_LEADING_FILLERS = frozenset({"а", "да", "давай", "ладно", "ну", "так", "эй"})
+_NON_COMMAND_DETERMINERS = frozenset(
+    {"мой", "моя", "мое", "моё", "мои", "твой", "твоя", "свой", "своя"}
+)
 _MENTION_RE = re.compile(r"<@!?\d+>")
 _SPACE_RE = re.compile(r"\s+")
 
@@ -42,25 +45,31 @@ class DiscourseStats:
 
 
 def classify_utterance(content: str) -> str:
-    tokens = tokenize(content)
-    words = tuple(token for token in tokens if any(character.isalnum() for character in token))
+    tokens = DEFAULT_ADDRESSING.analyze(content).content_tokens
+    words = tuple(
+        token.casefold().replace("ё", "е")
+        for token in tokens
+        if any(character.isalnum() for character in token)
+    )
     first = words[0].replace("ё", "е") if words else ""
     if content.rstrip().endswith("?") or first in _QUESTION_WORDS:
         return "question"
-    if first and len(first) >= 4 and first.endswith(_COMMAND_ENDINGS):
+    command_index = 0
+    while command_index < len(words) and words[command_index] in _LEADING_FILLERS:
+        command_index += 1
+    command = words[command_index] if command_index < len(words) else ""
+    if (
+        command
+        and command not in _NON_COMMAND_DETERMINERS
+        and DEFAULT_ADDRESSING.is_imperative(command)
+    ):
         return "command"
     return "assertion"
 
 
 def topic_keys(content: str) -> tuple[str, ...]:
-    topics: list[str] = []
-    for token in tokenize(content):
-        if role(token) not in {"content", "adjective", "verb", "number"}:
-            continue
-        key = lexeme_key(token)
-        if key and key not in topics:
-            topics.append(key)
-    return tuple(topics[:24])
+    addressed = DEFAULT_ADDRESSING.analyze(content)
+    return content_lemmas(addressed.content_tokens)[:24]
 
 
 async def store_discourse_turn(
@@ -166,6 +175,16 @@ class DiscourseMemoryRepository:
                 content=cleaned,
                 observed_at=event.utc_timestamp.isoformat(),
             )
+            if inserted and event.payload.get("suppress_full_parse") is True:
+                # Keep the turn as conversational context, but never let a
+                # bare reaction such as "ты понял" become a graph topic.
+                await connection.execute(
+                    """UPDATE language_discourse_turns
+                       SET topics_json = '[]', utterance_type = 'assertion',
+                           question_status = 'not_question'
+                       WHERE source_id = ?""",
+                    (event.event_id,),
+                )
             if inserted and parent_message_id is None and event.actor_id is not None:
                 await connection.execute(
                     """

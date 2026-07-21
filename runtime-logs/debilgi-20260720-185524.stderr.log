@@ -1,0 +1,24 @@
+2026-07-20 18:55:27,021 WARNING discord.client: PyNaCl is not installed, voice will NOT be supported
+2026-07-20 18:55:27,026 WARNING discord.client: davey is not installed, voice will NOT be supported
+2026-07-20 18:55:27,036 INFO pymorphy3.opencorpora_dict.wrapper: Loading dictionaries from C:\Users\Admin\Documents\DEBiLGI\.venv-admin\Lib\site-packages\pymorphy3_dicts_ru\data
+2026-07-20 18:55:27,078 INFO pymorphy3.opencorpora_dict.wrapper: format: 2.4, revision: 417150, updated: 2022-01-08T22:09:24.565962
+2026-07-20 18:55:27,089 INFO pymorphy3.opencorpora_dict.wrapper: Loading dictionaries from C:\Users\Admin\Documents\DEBiLGI\.venv-admin\Lib\site-packages\pymorphy3_dicts_ru\data
+2026-07-20 18:55:27,130 INFO pymorphy3.opencorpora_dict.wrapper: format: 2.4, revision: 417150, updated: 2022-01-08T22:09:24.565962
+2026-07-20 18:55:27,135 INFO discord.client: logging in using static token
+2026-07-20 18:55:28,392 INFO debilgi.discord.bot: Installed abstract curricula: social=13 productive=0
+2026-07-20 18:55:29,069 INFO debilgi.events.pipeline: Event pipeline started with 0 recovered events
+2026-07-20 18:55:29,458 INFO debilgi.discord.bot: Synced 1 commands to development guild
+2026-07-20 18:55:30,946 INFO discord.gateway: Shard ID None has connected to Gateway (Session ID: 85d16285271efccfd55f69bfadf058a9).
+2026-07-20 18:55:32,970 INFO debilgi.discord.bot: Connected to Discord as DEBiLGI#3646 (1527681283470135466)
+2026-07-20 18:55:34,988 INFO debilgi.semantic_assimilation: guild=1371151602559225978 input=19b6c96b87d9 lessons=5 active=3
+2026-07-20 18:55:34,989 INFO debilgi.semantic_consultant: event=discord:message:1527735954071097496 mode=utterance provider=cloudflare-workers-ai model=@cf/meta/llama-3.1-8b-instruct-fast confidence=0.800 status=confirmed lessons=3
+2026-07-20 18:56:45,388 INFO debilgi.utterance_understanding: event=discord:message:1528762558473965759 known=('толкнуть', 'книга', 'стол', 'быть') unknown=() relations=(('быть', 'acts_on', 'книга'), ('толкнуть', 'acts_on', 'книга')) context_links=() score=1.000 sufficient=True
+2026-07-20 19:03:02,888 INFO debilgi.utterance_understanding: event=discord:message:1528764148341669908 known=('снести', 'конь', '€йцо', 'простой', 'дед', 'копыто') unknown=() relations=(('конь', 'снести', '€йцо'),) context_links=() score=0.715 sufficient=True
+2026-07-20 19:03:03,389 INFO debilgi.discord.events: Context gate withheld event=discord:message:1528764148341669908 source=initiative_graph reason=initiative_unrelated_to_active_focus
+2026-07-20 19:03:19,687 INFO debilgi.utterance_understanding: event=discord:message:1528764215295217767 known=('снести', 'конь', '€йцо', 'простой', 'дед', 'копыто') unknown=() relations=(('конь', 'снести', '€йцо'),) context_links=('снести', 'конь', '€йцо', 'простой', 'дед', 'копыто') score=0.865 sufficient=True
+2026-07-20 19:03:35,550 INFO debilgi.utterance_understanding: event=discord:message:1528764283452657714 known=('вымысел', 'сработать') unknown=() relations=(('вымысел', 'associated_with', 'сработать'),) context_links=('сработать',) score=0.790 sufficient=True
+2026-07-20 19:04:20,840 INFO debilgi.utterance_understanding: event=discord:message:1528764471852666940 known=('снести', 'конь', '€йцо', 'простой', 'дед', 'копыто') unknown=() relations=(('конь', 'снести', '€йцо'),) context_links=('снести', 'конь', '€йцо', 'простой', 'дед', 'копыто') score=0.865 sufficient=True
+2026-07-20 19:05:47,239 INFO debilgi.semantic_assimilation: guild=1371151602559225978 input=dc08d0519a86 lessons=25 active=20
+2026-07-20 19:05:47,239 INFO debilgi.semantic_consultant: event=discord:message:1527739435897323731 mode=utterance provider=cloudflare-workers-ai model=@cf/meta/llama-3.1-8b-instruct-fast confidence=0.800 status=confirmed lessons=20
+2026-07-20 19:15:52,456 INFO debilgi.semantic_assimilation: guild=1371151602559225978 input=91d27cdc2212 lessons=5 active=2
+2026-07-20 19:15:52,456 INFO debilgi.semantic_consultant: event=discord:message:1527739480553820311 mode=utterance provider=cloudflare-workers-ai model=@cf/meta/llama-3.1-8b-instruct-fast confidence=0.800 status=confirmed lessons=2

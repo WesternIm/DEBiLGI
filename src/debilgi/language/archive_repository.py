@@ -8,6 +8,12 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from debilgi.language.character_markov import (
+    CharacterMarkovConfig,
+    character_transition_rows,
+    words_from_text,
+)
+from debilgi.language.content import content_lemmas
 from debilgi.language.discourse import store_discourse_turn
 from debilgi.language.models import ArchivedMessage, ArchiveImportJob, ImportStatus
 from debilgi.language.ngrams import ngram_frequencies, token_frequencies
@@ -30,8 +36,14 @@ class LanguageStats:
 
 
 class ArchiveRepository:
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        character_markov_config: CharacterMarkovConfig | None = None,
+    ) -> None:
         self._database = database
+        self._character_markov_config = character_markov_config or CharacterMarkovConfig()
 
     async def create_job(
         self,
@@ -211,6 +223,11 @@ class ArchiveRepository:
             2: ngram_frequencies(tokens, 2),
             3: ngram_frequencies(tokens, 3),
         }
+        character_rows, _ = character_transition_rows(
+            message.guild_id,
+            words_from_text(message.content),
+            self._character_markov_config,
+        )
 
         async with self._database.transaction() as connection:
             job_row = await (
@@ -279,6 +296,16 @@ class ArchiveRepository:
                 content=message.content,
                 observed_at=message.created_at.astimezone(UTC).isoformat(),
             )
+
+            if character_rows:
+                await connection.executemany(
+                    """INSERT INTO language_character_transitions (
+                        guild_id, order_size, prefix, next_character, count
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (guild_id, order_size, prefix, next_character)
+                    DO UPDATE SET count = count + excluded.count""",
+                    character_rows,
+                )
 
             if token_counts:
                 await connection.executemany(
@@ -410,6 +437,9 @@ class ArchiveRepository:
     async def matching_reply_heads(
         self, guild_id: int, prompt_tokens: tuple[str, ...], limit: int = 8
     ) -> tuple[tuple[str, ...], ...]:
+        query_terms = self._retrieval_terms(prompt_tokens)
+        if not query_terms:
+            return ()
         rows = await self._database.fetchall(
             """
             SELECT prompt_tail_json, response_head_json, count
@@ -423,11 +453,14 @@ class ArchiveRepository:
         for row in rows:
             prompt_tail = tuple(json.loads(str(row["prompt_tail_json"])))
             response_head = tuple(json.loads(str(row["response_head_json"])))
+            if not (query_terms & self._retrieval_terms(prompt_tail)):
+                continue
             overlap = self._suffix_overlap(prompt_tokens, prompt_tail)
             ranked.append((overlap, int(row["count"]), response_head))
         ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
-        matching = [item for item in ranked if item[0] > 0]
-        selected = matching or ranked
+        selected = [item for item in ranked if item[0] > 0]
+        if not selected:
+            selected = ranked
         unique: list[tuple[str, ...]] = []
         for _, _, response_head in selected:
             if response_head and response_head not in unique:
@@ -435,6 +468,97 @@ class ArchiveRepository:
             if len(unique) >= max(1, min(limit, 50)):
                 break
         return tuple(unique)
+
+    async def matching_replies(
+        self,
+        guild_id: int,
+        prompt_tokens: tuple[str, ...],
+        limit: int = 8,
+    ) -> tuple[str, ...]:
+        """Retrieve complete learned replies while keeping generation decision-independent."""
+
+        rows = await self._database.fetchall(
+            """SELECT parent.content AS prompt, reply.content AS response,
+                      reply.created_at AS observed_at
+               FROM archive_messages AS reply
+               JOIN archive_messages AS parent
+                 ON parent.message_id = reply.reply_to_message_id
+                AND parent.guild_id = reply.guild_id
+               WHERE reply.guild_id = ?
+                 AND parent.content IS NOT NULL
+                 AND reply.content IS NOT NULL
+               ORDER BY reply.created_at DESC
+               LIMIT 5000""",
+            (guild_id,),
+        )
+        query = tuple(token for token in prompt_tokens if token[:1].isalnum())
+        query_set = self._retrieval_terms(query)
+        if not query_set:
+            return ()
+        ranked: list[tuple[float, int, str]] = []
+        for index, row in enumerate(rows):
+            learned_prompt = tuple(
+                token for token in tokenize(str(row["prompt"])) if token[:1].isalnum()
+            )
+            learned_set = self._retrieval_terms(learned_prompt)
+            intersection = len(query_set & learned_set)
+            if intersection == 0:
+                continue
+            query_coverage = intersection / max(1, len(query_set))
+            learned_coverage = intersection / max(1, len(learned_set))
+            if query_coverage < 0.34 and intersection < 2:
+                continue
+            exact_bonus = 5.0 if query == learned_prompt else 0.0
+            suffix_bonus = self._suffix_overlap(query, learned_prompt) * 0.35
+            score = exact_bonus + query_coverage * 4.0 + learned_coverage * 2.0 + suffix_bonus
+            ranked.append((score, -index, str(row["response"])))
+        selected: list[str] = []
+        for score, _, response in sorted(ranked, reverse=True):
+            if score <= 0.0:
+                continue
+            if response not in selected:
+                selected.append(response)
+            if len(selected) >= max(1, min(limit, 50)):
+                break
+        return tuple(selected)
+
+    async def exact_learned_reply(
+        self,
+        guild_id: int,
+        prompt_tokens: tuple[str, ...],
+    ) -> str | None:
+        query = self._exact_prompt_tokens(prompt_tokens)
+        rows = await self._database.fetchall(
+            """SELECT parent.content AS prompt, reply.content AS response
+               FROM archive_messages AS reply
+               JOIN archive_messages AS parent
+                 ON parent.message_id = reply.reply_to_message_id
+                AND parent.guild_id = reply.guild_id
+               WHERE reply.guild_id = ?
+                 AND parent.content IS NOT NULL
+                 AND reply.content IS NOT NULL
+               ORDER BY reply.created_at DESC
+               LIMIT 5000""",
+            (guild_id,),
+        )
+        for row in rows:
+            learned = self._exact_prompt_tokens(tokenize(str(row["prompt"])))
+            if learned == query:
+                return str(row["response"])
+        return None
+
+    @staticmethod
+    def _exact_prompt_tokens(tokens: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(
+            token
+            for token in tokens
+            if token not in {"<user>", "<role>", "<channel>", "<url>"}
+            and not token.startswith("<emoji:")
+        )
+
+    @staticmethod
+    def _retrieval_terms(tokens: tuple[str, ...]) -> set[str]:
+        return set(content_lemmas(tokens))
 
     async def common_bigrams(
         self, guild_id: int, limit: int = 500
