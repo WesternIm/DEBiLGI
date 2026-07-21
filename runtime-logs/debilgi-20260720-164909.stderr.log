@@ -1,0 +1,20 @@
+2026-07-20 16:49:11,214 WARNING discord.client: PyNaCl is not installed, voice will NOT be supported
+2026-07-20 16:49:11,217 WARNING discord.client: davey is not installed, voice will NOT be supported
+2026-07-20 16:49:11,223 INFO pymorphy3.opencorpora_dict.wrapper: Loading dictionaries from C:\Users\Admin\Documents\DEBiLGI\.venv-admin\Lib\site-packages\pymorphy3_dicts_ru\data
+2026-07-20 16:49:11,256 INFO pymorphy3.opencorpora_dict.wrapper: format: 2.4, revision: 417150, updated: 2022-01-08T22:09:24.565962
+2026-07-20 16:49:11,264 INFO pymorphy3.opencorpora_dict.wrapper: Loading dictionaries from C:\Users\Admin\Documents\DEBiLGI\.venv-admin\Lib\site-packages\pymorphy3_dicts_ru\data
+2026-07-20 16:49:11,294 INFO pymorphy3.opencorpora_dict.wrapper: format: 2.4, revision: 417150, updated: 2022-01-08T22:09:24.565962
+2026-07-20 16:49:11,298 INFO discord.client: logging in using static token
+2026-07-20 16:49:12,414 INFO debilgi.discord.bot: Installed abstract curricula: social=13 productive=0
+2026-07-20 16:49:12,957 INFO debilgi.events.pipeline: Event pipeline started with 0 recovered events
+2026-07-20 16:49:13,410 INFO debilgi.discord.bot: Synced 1 commands to development guild
+2026-07-20 16:49:15,118 INFO discord.gateway: Shard ID None has connected to Gateway (Session ID: c9c1b57423225dc7180348b009de7501).
+2026-07-20 16:49:17,128 INFO debilgi.discord.bot: Connected to Discord as DEBiLGI#3646 (1527681283470135466)
+2026-07-20 16:49:20,363 WARNING debilgi.semantic_consultant: Puter sidecar returned HTTP 502: No usage left for request.
+2026-07-20 16:49:22,461 WARNING debilgi.semantic_consultant: Puter sidecar returned HTTP 502: No usage left for request.
+2026-07-20 16:51:29,618 INFO debilgi.utterance_understanding: event=discord:message:1528731033816797306 known=('знать', 'насевать') unknown=() relations=() context_links=() score=0.580 sufficient=True
+2026-07-20 16:51:45,737 INFO debilgi.utterance_understanding: event=discord:message:1528731109649813684 known=('нравиться',) unknown=() relations=() context_links=() score=0.580 sufficient=True
+2026-07-20 16:52:01,329 INFO debilgi.utterance_understanding: event=discord:message:1528731170827796491 known=('нравиться', 'насвай', 'насевать') unknown=() relations=(('нравиться', 'associated_with', 'насевать'),) context_links=('нравиться', 'насевать') score=1.000 sufficient=True
+2026-07-20 16:52:22,378 INFO debilgi.utterance_understanding: event=discord:message:1528731257003835484 known=('достаточный', 'данные') unknown=() relations=(('нет', 'associated_with', 'достаточный'), ('нет', 'associated_with', 'данные')) context_links=('достаточный', 'данные') score=1.000 sufficient=True
+2026-07-20 16:59:27,346 WARNING debilgi.semantic_consultant: Puter sidecar returned HTTP 502: No usage left for request.
+2026-07-20 16:59:29,589 WARNING debilgi.semantic_consultant: Puter sidecar returned HTTP 502: No usage left for request.

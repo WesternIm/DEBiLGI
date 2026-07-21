@@ -15,6 +15,7 @@ class WikipediaResult:
     wikidata_id: str | None
     revision_id: int | None
     related_titles: tuple[str, ...]
+    categories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

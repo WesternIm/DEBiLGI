@@ -63,6 +63,11 @@ class ExperienceConsolidator:
         await self._expire(event)
         if event.payload.get("author_is_bot") is True:
             return
+        # Short reactions are resolved against an exact bot turn by the
+        # pre-parser service.  Treating them as generic continuation here
+        # would turn even "нет же" into positive feedback.
+        if event.payload.get("suppress_full_parse") is True:
+            return
         experience = None
         outcome = ""
         reward = 0.0
@@ -104,6 +109,26 @@ class ExperienceConsolidator:
                 reward=reward,
                 resolved_at=event.utc_timestamp,
             )
+
+    async def apply_short_act(
+        self,
+        event: Event,
+        *,
+        response_message_id: int,
+        accepted: bool,
+    ) -> bool:
+        experience = await self.repository.pending_for_response_message(
+            event.guild_id, response_message_id
+        )
+        if experience is None:
+            return False
+        await self._resolve(
+            experience,
+            outcome_type="short_act_confirmation" if accepted else "short_act_rejection",
+            reward=0.80 if accepted else -0.85,
+            resolved_at=event.utc_timestamp,
+        )
+        return True
 
     async def transition_adjustments(
         self, guild_id: int

@@ -74,3 +74,22 @@ def test_resistance_changes_statement_into_boundary_act() -> None:
 
     assert plan is not None
     assert plan.speech_act == "boundary_statement"
+
+
+def test_mixed_positive_and_negative_evidence_keeps_a_qualified_position() -> None:
+    vector = PrimitiveVector(
+        agreement=0.58,
+        resistance=0.62,
+        approval=0.64,
+        curiosity=0.2,
+        aversion=0.35,
+        trust=0.5,
+        arousal=0.3,
+    )
+    context = ReplyContext(reaction=reaction(vector))
+    thought = StructuredThought(ActionType.SHORT_REPLY, 3, "evaluate proposal", 0.76, ())
+
+    plan = utterance_plan(thought, context=context)
+
+    assert plan is not None
+    assert plan.speech_act == "qualified_position"

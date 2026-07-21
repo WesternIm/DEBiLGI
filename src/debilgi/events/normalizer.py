@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from debilgi.events.models import Event, EventType
+from debilgi.language.short_acts import detect_short_speech_act
 
 
 def normalize_message_created(
@@ -22,10 +23,18 @@ def normalize_message_created(
     reply_to_message_id: int | None = None,
     reply_to_author_id: int | None = None,
     bot_mentioned: bool = False,
+    bot_user_id: int | None = None,
     mentioned_user_ids: Iterable[int] = (),
+    author_identity: Mapping[str, Any] | None = None,
+    bot_identity: Mapping[str, Any] | None = None,
+    reply_to_author_identity: Mapping[str, Any] | None = None,
+    mentioned_users: Iterable[Mapping[str, Any]] = (),
+    mentioned_roles: Iterable[Mapping[str, Any]] = (),
+    mentioned_channels: Iterable[Mapping[str, Any]] = (),
     attachments: Iterable[Mapping[str, Any]] = (),
 ) -> Event:
     event_type = EventType.MESSAGE_REPLIED if reply_to_message_id else EventType.MESSAGE_CREATED
+    short_act = None if author_is_bot else detect_short_speech_act(content)
     return Event(
         event_id=f"discord:message:{message_id}",
         guild_id=guild_id,
@@ -40,11 +49,46 @@ def normalize_message_created(
             "author_is_bot": author_is_bot,
             "reply_to_message_id": reply_to_message_id,
             "bot_mentioned": bot_mentioned,
+            "bot_user_id": bot_user_id,
             "mentioned_user_ids": list(mentioned_user_ids),
+            "author_identity": _identity_record(author_identity, fallback_id=author_id),
+            "bot_identity": _identity_record(bot_identity, fallback_id=bot_user_id),
+            "reply_to_author_identity": _identity_record(
+                reply_to_author_identity, fallback_id=reply_to_author_id
+            ),
+            "mentioned_users": [_identity_record(item) for item in mentioned_users],
+            "mentioned_roles": [_identity_record(item) for item in mentioned_roles],
+            "mentioned_channels": [_identity_record(item) for item in mentioned_channels],
             "attachments": [dict(attachment) for attachment in attachments],
+            "short_speech_act": short_act.kind if short_act else None,
+            "short_act_pattern": short_act.matched_pattern if short_act else None,
+            "short_act_recognized": short_act.recognized if short_act else False,
+            "short_act_coreference": short_act.coreference_to_bot if short_act else False,
+            "short_act_interpretation": short_act.interpretation if short_act else None,
+            "short_act_word_count": short_act.word_count if short_act else 0,
+            "suppress_full_parse": short_act.suppress_full_parse if short_act else False,
         },
         source="discord",
     )
+
+
+def _identity_record(
+    raw: Mapping[str, Any] | None, *, fallback_id: int | None = None
+) -> dict[str, Any] | None:
+    """Keep only stable public identity fields in the event payload."""
+
+    if raw is None and fallback_id is None:
+        return None
+    source = raw or {}
+    record: dict[str, Any] = {}
+    identity_id = source.get("id", fallback_id)
+    if isinstance(identity_id, int) and not isinstance(identity_id, bool):
+        record["id"] = identity_id
+    for key in ("username", "display_name", "global_name", "name", "kind"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            record[key] = value.strip()[:128]
+    return record or None
 
 
 def normalize_reaction(

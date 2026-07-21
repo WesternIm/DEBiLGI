@@ -29,6 +29,11 @@ class Diagnostics(
     group_name="debilgi",
     group_description="Read-only DEBiLGI diagnostics",
 ):
+    language = app_commands.Group(
+        name="language",
+        description="Lexicon, uncertainty and conversation diagnostics",
+    )
+
     def __init__(
         self,
         bot: DebilgiBot,
@@ -131,6 +136,126 @@ class Diagnostics(
             f"counting queries: {stats.counting_queries}\n"
             f"comparison queries: {stats.comparison_queries}\n"
             f"symbol queries: {stats.symbol_queries}",
+            ephemeral=True,
+        )
+
+    @language.command(name="interpret", description="Show how DEBiLGI understands a word")
+    @app_commands.describe(word="Word to inspect in the current server context")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def interpret(self, interaction: discord.Interaction, word: str) -> None:
+        assert interaction.guild_id is not None
+        analysis = await self.bot.lexicon.analyze_word(
+            word,
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+        )
+        meanings = "; ".join(analysis.dictionary_meanings) or "-"
+        features = (
+            ", ".join(f"{name}={value}" for name, value in analysis.grammatical_features.items())
+            or "-"
+        )
+        await interaction.response.send_message(
+            f"surface: {analysis.surface_form}\nnormalized: {analysis.normalized_form}\n"
+            f"lemma: {analysis.lemma or '-'}\npart of speech: {analysis.part_of_speech or '-'}\n"
+            f"grammar: {features}\nreference meanings: {meanings}\n"
+            f"selected meaning: {analysis.selected_meaning or '-'}\n"
+            f"server meaning: {analysis.local_meaning or '-'}\n"
+            f"personal interpretation: {analysis.personal_interpretation or '-'}\n"
+            f"associations: {', '.join(analysis.associations) or '-'}\n"
+            f"source: {analysis.source}\nneologism: {analysis.is_neologism}\n"
+            f"confidence: form={analysis.confidence.form:.2f} "
+            f"meaning={analysis.confidence.meaning:.2f} "
+            f"context={analysis.confidence.context_fit:.2f} "
+            f"memory={analysis.confidence.memory:.2f} "
+            f"response={analysis.confidence.response:.2f}",
+            ephemeral=True,
+        )
+
+    @language.command(
+        name="conversation-state", description="Show the active coherent conversation state"
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def conversation_state(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None and interaction.channel_id is not None
+        state = await self.bot.conversation_memory.active(
+            interaction.guild_id, interaction.channel_id
+        )
+        if state is None:
+            body = "No active conversation session."
+        else:
+            body = (
+                f"conversation: {state.conversation_id}\nstatus: active\n"
+                f"main topic: {state.main_topic or '-'}\nmessages: {state.message_count}\n"
+                f"participants: {', '.join(map(str, state.participants)) or '-'}\n"
+                f"unresolved questions: {len(state.unresolved_questions)}\n"
+                f"summary: {state.current_summary[:1200]}"
+            )
+        await interaction.response.send_message(body, ephemeral=True)
+
+    @language.command(name="unknowns", description="Show the strongest current knowledge gaps")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def unknowns(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        items = await self.bot.lexicon.top_unknowns(
+            interaction.guild_id, channel_id=interaction.channel_id, limit=15
+        )
+        body = (
+            "\n".join(
+                f"{item.concept_key}: {item.unknown_kind.value}, seen={item.occurrence_count}, "
+                f"curiosity={item.curiosity_score:.2f}, asked={item.question_count}"
+                for item in items
+            )
+            or "No unresolved concepts."
+        )
+        await interaction.response.send_message(body[:1900], ephemeral=True)
+
+    @language.command(name="neologisms", description="Show quarantined generated words")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def neologisms(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        items = await self.bot.neologisms.active(interaction.guild_id, 15)
+        body = (
+            "\n".join(
+                f"{item.word}: {item.status}, confidence={item.confidence:.2f}, "
+                f"uses={item.usage_count}, repeats={item.human_repeat_count} — "
+                f"{item.intended_meaning}"
+                for item in items
+            )
+            or "No words in quarantine."
+        )
+        await interaction.response.send_message(body[:1900], ephemeral=True)
+
+    @language.command(name="word-check", description="Explain word classification")
+    @app_commands.describe(word="Word to classify")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def word_check(self, interaction: discord.Interaction, word: str) -> None:
+        assert interaction.guild_id is not None
+        analysis = await self.bot.lexicon.analyze_word(
+            word, guild_id=interaction.guild_id, channel_id=interaction.channel_id
+        )
+        if analysis.local_meaning:
+            classification = "server slang: a scoped local meaning has priority"
+        elif analysis.is_dictionary_word:
+            classification = f"normative: found in {analysis.source}"
+        elif analysis.is_neologism:
+            classification = "neologism: generated form remains under quarantine"
+        else:
+            classification = (
+                f"unknown: {analysis.unknown_kind.value if analysis.unknown_kind else '-'}"
+            )
+        await interaction.response.send_message(
+            f"{analysis.normalized_form}: {classification}\n"
+            f"response confidence: {analysis.response_confidence:.2f}",
             ephemeral=True,
         )
 
@@ -438,10 +563,16 @@ class Diagnostics(
     ) -> None:
         assert interaction.guild_id is not None
         stats = await self._memory.stats(interaction.guild_id)
+        long_term = await self.bot.long_term_memory.stats(interaction.guild_id)
         body = (
             f"events: {stats.events}\nchannels: {stats.channels}\n"
             f"users: {stats.users}\nreply chains: {stats.reply_chains}\n"
-            f"charged users: {stats.charged_users}"
+            f"charged users: {stats.charged_users}\n"
+            f"awaiting consolidation: {stats.pending_consolidation}\n"
+            f"durable fragments: {long_term.pending_fragments}\n"
+            f"long-term capsules: {long_term.capsules}\n"
+            f"forgotten noise: {long_term.forgotten_fragments}\n"
+            f"context recalls: {long_term.recalled_capsules}"
         )
         if user is not None:
             context = await self._memory.user_context(interaction.guild_id, user.id)

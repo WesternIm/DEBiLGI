@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from debilgi.events.models import Event, EventType
+from debilgi.language.content import content_lemmas
+from debilgi.language.pragmatics import analyze_pragmatics
+from debilgi.language.tokenizer import tokenize
 
 Clock = Callable[[], datetime]
 ChannelKey = tuple[int, int]
@@ -26,6 +30,9 @@ class MemoryLimits:
     max_user_events: int = 50
     max_reply_chains: int = 100
     max_chain_events: int = 50
+    max_context_events: int = 24
+    relevance_half_life: timedelta = timedelta(minutes=20)
+    min_context_relevance: float = 0.10
     max_charge: float = 10.0
 
     def __post_init__(self) -> None:
@@ -35,11 +42,18 @@ class MemoryLimits:
             self.max_user_events,
             self.max_reply_chains,
             self.max_chain_events,
+            self.max_context_events,
         )
-        if self.retention <= timedelta(0) or self.charge_half_life <= timedelta(0):
+        if (
+            self.retention <= timedelta(0)
+            or self.charge_half_life <= timedelta(0)
+            or self.relevance_half_life <= timedelta(0)
+        ):
             raise ValueError("memory durations must be positive")
         if any(value <= 0 for value in numeric_limits) or self.max_charge <= 0:
             raise ValueError("memory size limits must be positive")
+        if not 0.0 <= self.min_context_relevance <= 1.0:
+            raise ValueError("minimum context relevance must be between zero and one")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +63,14 @@ class MemoryStats:
     users: int
     reply_chains: int
     charged_users: int
+    pending_consolidation: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryFragment:
+    event: Event
+    importance: float
+    eviction_reason: str
 
 
 @dataclass(slots=True)
@@ -81,6 +103,8 @@ class ShortTermMemory:
         self._chains: dict[ChainKey, deque[str]] = {}
         self._chain_updated: dict[ChainKey, datetime] = {}
         self._charges: dict[UserKey, _Charge] = {}
+        self._importance: dict[str, float] = {}
+        self._evicted: deque[MemoryFragment] = deque(maxlen=self.limits.max_total_events)
 
     async def observe(self, event: Event) -> bool:
         async with self._lock:
@@ -92,6 +116,7 @@ class ShortTermMemory:
                 return False
 
             self._events[event.event_id] = event
+            self._importance[event.event_id] = self._event_importance(event)
             self._timeline.append(event.event_id)
             if event.channel_id is not None:
                 channel = self._channels.setdefault((event.guild_id, event.channel_id), deque())
@@ -111,6 +136,8 @@ class ShortTermMemory:
         await self.clear()
         for event in sorted(events, key=lambda item: (item.utc_timestamp, item.event_id)):
             await self.observe(event)
+        async with self._lock:
+            self._evicted.clear()
 
     async def clear(self) -> None:
         async with self._lock:
@@ -123,6 +150,8 @@ class ShortTermMemory:
             self._chains.clear()
             self._chain_updated.clear()
             self._charges.clear()
+            self._importance.clear()
+            self._evicted.clear()
 
     async def channel_context(self, guild_id: int, channel_id: int) -> tuple[Event, ...]:
         async with self._lock:
@@ -142,6 +171,73 @@ class ShortTermMemory:
                 for event_id in self._timeline
                 if event_id in self._events and self._events[event_id].guild_id == guild_id
             )
+
+    async def relevant_context(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int | None,
+        user_id: int | None,
+        prompt: str,
+        limit: int | None = None,
+    ) -> tuple[Event, ...]:
+        """Select a small working set by topic, recency and salience."""
+
+        async with self._lock:
+            now = self._utc_now()
+            self._prune_locked(now)
+            maximum = max(1, min(limit or self.limits.max_context_events, 100))
+            prompt_terms = self._content_terms(prompt)
+            candidates = [
+                self._events[event_id]
+                for event_id in self._timeline
+                if event_id in self._events
+                and self._events[event_id].guild_id == guild_id
+                and (
+                    channel_id is None
+                    or self._events[event_id].channel_id == channel_id
+                    or (user_id is not None and self._events[event_id].actor_id == user_id)
+                )
+            ]
+            recent_channel_ids = [
+                event.event_id
+                for event in candidates
+                if channel_id is not None and event.channel_id == channel_id
+            ]
+            # Keep an actual conversational window even when a short follow-up has
+            # no lexical overlap with the earlier subject ("сверил?", "и что?").
+            continuity_width = min(maximum, 12)
+            continuity = set(recent_channel_ids[-continuity_width:])
+            ranked: list[tuple[float, datetime, Event]] = []
+            for event in candidates:
+                content = event.payload.get("content")
+                event_terms = self._content_terms(content if isinstance(content, str) else "")
+                overlap = len(prompt_terms & event_terms)
+                topical = overlap / math.sqrt(max(1, len(prompt_terms) * len(event_terms)))
+                age = max(0.0, (now - event.utc_timestamp).total_seconds())
+                recency = 0.5 ** (age / self.limits.relevance_half_life.total_seconds())
+                importance = self._importance.get(event.event_id, 0.2)
+                scope = 0.0
+                if channel_id is not None and event.channel_id == channel_id:
+                    scope += 0.06
+                if user_id is not None and event.actor_id == user_id:
+                    scope += 0.05
+                relevance = recency * 0.38 + topical * 0.38 + importance * 0.13 + scope
+                if relevance >= self.limits.min_context_relevance or event.event_id in continuity:
+                    ranked.append((relevance, event.utc_timestamp, event))
+            selected = sorted(ranked, key=lambda item: (item[0], item[1]), reverse=True)[
+                :maximum
+            ]
+            return tuple(event for _, _, event in sorted(selected, key=lambda item: item[1]))
+
+    async def drain_evicted(self, limit: int = 500) -> tuple[MemoryFragment, ...]:
+        """Hand evicted fragments to durable consolidation exactly once."""
+
+        async with self._lock:
+            drained: list[MemoryFragment] = []
+            for _ in range(min(max(1, limit), len(self._evicted))):
+                drained.append(self._evicted.popleft())
+            return tuple(drained)
 
     async def reply_chain(
         self, guild_id: int, channel_id: int, message_id: int
@@ -173,6 +269,9 @@ class ShortTermMemory:
                 users=sum(key[0] == guild_id for key in self._users),
                 reply_chains=sum(key[0] == guild_id for key in self._chains),
                 charged_users=sum(key[0] == guild_id for key in self._charges),
+                pending_consolidation=sum(
+                    item.event.guild_id == guild_id for item in self._evicted
+                ),
             )
 
     def _observe_reply_chain_locked(self, event: Event) -> None:
@@ -224,6 +323,8 @@ class ShortTermMemory:
         self._charges[key] = _Charge(min(self.limits.max_charge, value + amount), at)
 
     def _prune_locked(self, now: datetime) -> None:
+        previous_events = dict(self._events)
+        previous_importance = dict(self._importance)
         cutoff = now - self.limits.retention
         retained_ids_in_arrival_order = [
             event_id
@@ -237,8 +338,22 @@ class ShortTermMemory:
         while len(retained) > self.limits.max_total_events:
             retained.popleft()
         retained_ids = set(retained)
+        for event_id, event in previous_events.items():
+            if event_id in retained_ids:
+                continue
+            reason = "expired" if event.utc_timestamp < cutoff else "capacity"
+            self._queue_evicted_locked(
+                event,
+                previous_importance.get(event_id, 0.2),
+                reason,
+            )
         self._events = {
             event_id: event for event_id, event in self._events.items() if event_id in retained_ids
+        }
+        self._importance = {
+            event_id: value
+            for event_id, value in self._importance.items()
+            if event_id in retained_ids
         }
         self._timeline = retained
         self._clean_deques_locked(self._channels, self.limits.max_channel_events)
@@ -281,6 +396,45 @@ class ShortTermMemory:
         elapsed = max(0.0, (at - charge.updated_at).total_seconds())
         half_life = self.limits.charge_half_life.total_seconds()
         return charge.value * (0.5 ** (elapsed / half_life))
+
+    def _queue_evicted_locked(self, event: Event, importance: float, reason: str) -> None:
+        content = event.payload.get("content")
+        if (
+            event.event_type in {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}
+            and isinstance(content, str)
+            and content.strip()
+        ):
+            self._evicted.append(MemoryFragment(event, importance, reason))
+
+    @staticmethod
+    def _event_importance(event: Event) -> float:
+        score = {
+            EventType.MESSAGE_CREATED: 0.28,
+            EventType.MESSAGE_REPLIED: 0.42,
+            EventType.REACTION_ADDED: 0.16,
+            EventType.REACTION_REMOVED: 0.12,
+            EventType.BOT_REPLIED: 0.34,
+            EventType.COMMAND_USED: 0.38,
+        }.get(event.event_type, 0.12)
+        content = event.payload.get("content")
+        if isinstance(content, str):
+            normalized = content.casefold()
+            pragmatics = analyze_pragmatics(content)
+            score += min(0.12, len(tokenize(content)) / 200.0)
+            score += 0.10 if content.rstrip().endswith("?") else 0.0
+            score += min(0.08, pragmatics.emotional_intensity * 0.08)
+            score += 0.04 if pragmatics.question_force >= 0.5 else 0.0
+            score += 0.16 if any(
+                marker in normalized
+                for marker in ("потому", "поэтому", "решили", "важно", "запомни", "вывод")
+            ) else 0.0
+        score += 0.18 if event.payload.get("bot_mentioned") is True else 0.0
+        score += 0.12 if event.payload.get("reply_to_message_id") is not None else 0.0
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _content_terms(text: str) -> set[str]:
+        return set(content_lemmas(text))
 
     def _resolve(self, event_ids: Iterable[str]) -> tuple[Event, ...]:
         return tuple(self._events[event_id] for event_id in event_ids if event_id in self._events)

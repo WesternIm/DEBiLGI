@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
+from debilgi.language.morphology import DEFAULT_MORPHOLOGY
+
 _START = "start"
 _END = "end"
 _PUNCTUATION = frozenset(",.!?:;—-()[]{}«»…")
@@ -310,4 +312,20 @@ def role(token: str) -> str:
         return "verb"
     if len(normalized) >= 4 and normalized.endswith(_ADJECTIVE_SUFFIXES):
         return "adjective"
+    morphological_role = DEFAULT_MORPHOLOGY.role(normalized)
+    if morphological_role in {
+        "pronoun",
+        "verb",
+        "adjective",
+        "number",
+        "adverb",
+        "predicate",
+        "preposition",
+        "conjunction",
+        "particle",
+        "interjection",
+        "participle",
+        "gerund",
+    }:
+        return morphological_role
     return "content"

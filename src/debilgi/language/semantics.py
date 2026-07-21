@@ -10,8 +10,9 @@ from typing import Any
 import aiosqlite
 
 from debilgi.events.models import Event, EventType
+from debilgi.language.addressing import DEFAULT_ADDRESSING
+from debilgi.language.content import content_lemmas
 from debilgi.language.grammar import role
-from debilgi.language.tokenizer import tokenize
 from debilgi.storage.database import Database
 
 _MESSAGE_TYPES = {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}
@@ -137,11 +138,7 @@ class SemanticFrame:
         return " ".join(parts)
 
     def terms(self) -> frozenset[str]:
-        values = [self.actor, self.action, self.target or ""]
-        values.extend(value for pair in self.modifiers for value in pair)
-        return frozenset(
-            key for value in values for token in tokenize(value) if (key := lexeme_key(token))
-        )
+        return frozenset(content_lemmas(self.surface_text()))
 
 
 def extract_semantic_frames(text: str) -> tuple[SemanticFrame, ...]:
@@ -149,7 +146,7 @@ def extract_semantic_frames(text: str) -> tuple[SemanticFrame, ...]:
 
     if text.rstrip().endswith("?"):
         return ()
-    tokens = tuple(token.casefold() for token in tokenize(text))
+    tokens = DEFAULT_ADDRESSING.analyze(text).content_tokens
     clauses: list[tuple[str, ...]] = []
     current: list[str] = []
     for token in tokens:
@@ -235,6 +232,8 @@ class SemanticMemoryRepository:
     async def observe(self, event: Event) -> None:
         if event.event_type not in _MESSAGE_TYPES or event.payload.get("author_is_bot") is True:
             return
+        if event.payload.get("suppress_full_parse") is True:
+            return
         content = event.payload.get("content")
         if not isinstance(content, str) or not content.strip():
             return
@@ -264,7 +263,7 @@ class SemanticMemoryRepository:
             (guild_id,),
         )
         prompt_token_tuple = tuple(token.casefold().replace("ё", "е") for token in prompt_tokens)
-        prompt_terms = {key for token in prompt_token_tuple if (key := lexeme_key(token))}
+        prompt_terms = set(content_lemmas(prompt_token_tuple))
         ranked: list[tuple[float, int, str]] = []
         seen_counts: dict[str, int] = {}
         total = max(1, len(rows))
@@ -275,6 +274,8 @@ class SemanticMemoryRepository:
             overlap = len(prompt_terms & frame.terms())
             recency = (total - index) / total
             question_fit = self._question_fit(prompt_token_tuple, frame)
+            if overlap == 0 and question_fit == 0.0:
+                continue
             score = overlap * 3.0 + frame.confidence + recency * 0.20 + question_fit
             ranked.append((score, index, rendered))
         ranked.sort(

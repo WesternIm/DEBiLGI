@@ -125,6 +125,48 @@ class AutonomyRepository:
         )
         return self._goal_from_row(row) if row else None
 
+    async def background_initiative_allowed(
+        self,
+        guild_id: int,
+        channel_id: int,
+        *,
+        minimum_balance: float = 0.58,
+    ) -> bool:
+        state = await self.state(guild_id, channel_id)
+        return (
+            state.evidence_balance >= minimum_balance
+            and await self.open_goal(guild_id, channel_id) is None
+        )
+
+    async def record_background_initiative(
+        self,
+        guild_id: int,
+        channel_id: int,
+        *,
+        created_at: datetime,
+    ) -> None:
+        """Charge the same initiative balance used by reactive autonomy."""
+
+        await self._database.execute(
+            """INSERT INTO cognition_initiative_states (
+                   guild_id, channel_id, evidence_balance,
+                   observed_human_events, initiatives_started, updated_at
+               ) VALUES (?, ?, ?, 0, 1, ?)
+               ON CONFLICT (guild_id, channel_id) DO UPDATE SET
+                   evidence_balance = MAX(
+                       0.0, cognition_initiative_states.evidence_balance - ?
+                   ),
+                   initiatives_started = cognition_initiative_states.initiatives_started + 1,
+                   updated_at = excluded.updated_at""",
+            (
+                guild_id,
+                channel_id,
+                max(0.0, 1.0 - self._initiative_cost),
+                created_at.isoformat(),
+                self._initiative_cost,
+            ),
+        )
+
     async def start_goal(
         self,
         prompt: Event,

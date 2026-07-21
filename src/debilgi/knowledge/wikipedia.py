@@ -43,6 +43,12 @@ class WikipediaClient:
             self._session = None
 
     async def search(self, query: str) -> WikipediaResult | None:
+        candidates = await self.search_candidates(query)
+        return candidates[0] if candidates else None
+
+    async def search_candidates(
+        self, query: str, *, limit: int = 5
+    ) -> tuple[WikipediaResult, ...]:
         await self.start()
         assert self._session is not None
         parameters = {
@@ -50,8 +56,8 @@ class WikipediaClient:
             "generator": "search",
             "gsrsearch": query,
             "gsrnamespace": "0",
-            "gsrlimit": "1",
-            "prop": "extracts|info|pageprops|links|revisions",
+            "gsrlimit": str(max(1, min(limit, 10))),
+            "prop": "extracts|info|pageprops|links|revisions|categories",
             "exintro": "1",
             "explaintext": "1",
             "inprop": "url",
@@ -60,6 +66,7 @@ class WikipediaClient:
             "pllimit": "20",
             "rvprop": "ids",
             "rvlimit": "1",
+            "cllimit": "50",
             "redirects": "1",
             "format": "json",
             "formatversion": "2",
@@ -69,17 +76,31 @@ class WikipediaClient:
         async with self._session.get(self.endpoint, params=parameters) as response:
             response.raise_for_status()
             payload = await response.json(content_type=None)
-        return self._parse(payload)
+        return self._parse_candidates(payload)
 
     @staticmethod
     def _parse(payload: Any) -> WikipediaResult | None:
+        candidates = WikipediaClient._parse_candidates(payload)
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _parse_candidates(payload: Any) -> tuple[WikipediaResult, ...]:
         if not isinstance(payload, dict):
-            return None
+            return ()
         query = payload.get("query")
         pages = query.get("pages") if isinstance(query, dict) else None
         if not isinstance(pages, list) or not pages:
-            return None
-        page = pages[0]
+            return ()
+        parsed = tuple(
+            result
+            for page in pages
+            if isinstance(page, dict)
+            if (result := WikipediaClient._parse_page(page)) is not None
+        )
+        return parsed
+
+    @staticmethod
+    def _parse_page(page: dict[str, Any]) -> WikipediaResult | None:
         if not isinstance(page, dict) or page.get("missing") is True:
             return None
         page_id = page.get("pageid")
@@ -109,6 +130,13 @@ class WikipediaClient:
         canonical_url = page.get("canonicalurl")
         if not isinstance(canonical_url, str):
             canonical_url = ""
+        raw_categories = page.get("categories")
+        categories = tuple(
+            title
+            for item in raw_categories
+            if isinstance(item, dict)
+            if isinstance((title := item.get("title")), str)
+        ) if isinstance(raw_categories, list) else ()
         return WikipediaResult(
             page_id=page_id,
             title=title,
@@ -117,4 +145,5 @@ class WikipediaClient:
             wikidata_id=wikidata_id if isinstance(wikidata_id, str) else None,
             revision_id=revision_id,
             related_titles=related_titles,
+            categories=categories,
         )

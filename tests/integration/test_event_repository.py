@@ -1,3 +1,5 @@
+import hashlib
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -44,7 +46,7 @@ async def test_migration_and_round_trip(database: Database) -> None:
     duplicate_inserted = await repository.append(original)
     restored = (await repository.recent(10))[0]
 
-    assert await database.schema_version() == 15
+    assert await database.schema_version() == 37
     assert inserted is True
     assert duplicate_inserted is False
     assert restored == original
@@ -101,7 +103,7 @@ async def test_existing_v1_database_is_backfilled_by_processing_migration(
     await upgraded_database.initialize()
     upgraded_repository = EventRepository(upgraded_database)
     try:
-        assert await upgraded_database.schema_version() == 15
+        assert await upgraded_database.schema_version() == 37
         assert (
             await upgraded_repository.processing_status("before-upgrade")
             is ProcessingStatus.PENDING
@@ -130,7 +132,7 @@ async def test_existing_v4_database_upgrades_to_cognitive_core_without_data_loss
     upgraded = Database(db_path, MIGRATIONS)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 15
+        assert await upgraded.schema_version() == 37
         assert await EventRepository(upgraded).get("preserved-v4-event") is not None
         tables = await upgraded.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
         table_names = {str(row["name"]) for row in tables}
@@ -152,7 +154,212 @@ async def test_existing_v4_database_upgrades_to_cognitive_core_without_data_loss
             "knowledge_acquisition_states",
             "knowledge_event_concepts",
             "knowledge_context_associations",
+            "learning_instruction_examples",
+            "learning_dataset_feedback",
+            "learning_graph_nodes",
+            "learning_graph_edges",
+            "learning_example_sources",
+            "language_open_questions",
+            "language_short_speech_acts",
+            "background_cycle_runs",
+            "background_graph_conflicts",
+            "background_identity_checks",
+            "background_initiative_queue",
         } <= table_names
+    finally:
+        await upgraded.close()
+
+
+async def test_service_word_cleanup_removes_old_graph_noise(tmp_path: Path) -> None:
+    db_path = tmp_path / "service-word-cleanup.sqlite3"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE learning_graph_nodes (
+            node_id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, node_type TEXT NOT NULL,
+            node_key TEXT NOT NULL, label TEXT NOT NULL
+        );
+        CREATE TABLE learning_graph_edges (
+            edge_id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, relation TEXT NOT NULL,
+            source_node_id TEXT NOT NULL REFERENCES learning_graph_nodes(node_id)
+                ON DELETE CASCADE,
+            target_node_id TEXT NOT NULL REFERENCES learning_graph_nodes(node_id)
+                ON DELETE CASCADE
+        );
+        CREATE TABLE language_semantic_frames (
+            source_id TEXT NOT NULL, frame_index INTEGER NOT NULL, actor TEXT NOT NULL,
+            target TEXT, PRIMARY KEY (source_id, frame_index)
+        );
+        CREATE TABLE knowledge_relations (
+            relation_id TEXT PRIMARY KEY, normalized_object_title TEXT NOT NULL
+        );
+        CREATE TABLE learning_instruction_examples (
+            example_id TEXT PRIMARY KEY, answer_text TEXT NOT NULL,
+            status TEXT NOT NULL, quality_score REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE memory_long_term_capsules (
+            capsule_id TEXT PRIMARY KEY, summary TEXT NOT NULL
+        );
+        CREATE TABLE language_conversation_sessions (
+            conversation_id TEXT PRIMARY KEY, current_summary TEXT NOT NULL
+        );
+        INSERT INTO learning_graph_nodes VALUES
+            ('node:tipa', 1, 'concept', 'типо', 'типо'),
+            ('node:person', 1, 'concept', 'человек', 'человек');
+        INSERT INTO learning_graph_edges VALUES (
+            'edge:noise', 1, 'associated_with', 'node:tipa', 'node:person'
+        );
+        INSERT INTO language_semantic_frames VALUES ('old:frame', 0, 'кто', 'человек');
+        """
+    )
+    for source in sorted(MIGRATIONS.glob("*.sql")):
+        version_text, name_with_suffix = source.name.split("_", 1)
+        version = int(version_text)
+        if version >= 28:
+            continue
+        sql = source.read_text(encoding="utf-8")
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, checksum) VALUES (?, ?, ?)",
+            (
+                version,
+                name_with_suffix.removesuffix(".sql"),
+                hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            ),
+        )
+    connection.commit()
+    connection.close()
+
+    upgraded = Database(db_path, MIGRATIONS)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 37
+        assert await upgraded.fetchone(
+            "SELECT 1 FROM learning_graph_nodes WHERE node_id = 'node:tipa'"
+        ) is None
+        assert await upgraded.fetchone(
+            "SELECT 1 FROM learning_graph_edges WHERE edge_id = 'edge:noise'"
+        ) is None
+        assert await upgraded.fetchone(
+            "SELECT 1 FROM language_semantic_frames WHERE source_id = 'old:frame'"
+        ) is None
+        person = await upgraded.fetchone(
+            "SELECT 1 FROM learning_graph_nodes WHERE node_id = 'node:person'"
+        )
+        audit = await upgraded.fetchone(
+            "SELECT * FROM language_relation_filter_cleanups WHERE cleanup_id = 'migration:028'"
+        )
+        assert person is not None
+        assert audit is not None
+        assert int(audit["removed_graph_edges"]) == 1
+        assert int(audit["removed_graph_nodes"]) == 1
+        assert int(audit["removed_semantic_frames"]) == 1
+    finally:
+        await upgraded.close()
+
+
+async def test_internal_surface_cleanup_preserves_raw_history_and_rejects_derivatives(
+    tmp_path: Path,
+) -> None:
+    v29_migrations = tmp_path / "v29_migrations"
+    v29_migrations.mkdir()
+    for source in sorted(MIGRATIONS.glob("*.sql")):
+        if int(source.name.split("_", 1)[0]) >= 30:
+            continue
+        (v29_migrations / source.name).write_text(
+            source.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    db_path = tmp_path / "upgrade-v29.sqlite3"
+    old_database = Database(db_path, v29_migrations)
+    await old_database.initialize()
+    await EventRepository(old_database).append(
+        event("raw-event-survives-cleanup", 1, EventType.MESSAGE_CREATED)
+    )
+    timestamp = datetime(2026, 7, 19, 12, 0, tzinfo=UTC).isoformat()
+    await old_database.execute(
+        """
+        INSERT INTO learning_instruction_examples (
+            example_id, guild_id, channel_id, user_id, source_event_id,
+            response_message_id, instruction_text, answer_text, prompt_hash,
+            answer_hash, quality_score, status, created_at, updated_at
+        ) VALUES (
+            'polluted-example', 1, 20, 30, 'raw-event-survives-cleanup',
+            1001, 'У тебя есть носки?', 'команды узнай названного объекта.',
+            'prompt-hash', 'answer-hash', 0.9, 'accepted', ?, ?
+        )
+        """,
+        (timestamp, timestamp),
+    )
+    await old_database.execute(
+        """
+        INSERT INTO learning_graph_nodes (
+            node_id, guild_id, node_type, node_key, label, confidence,
+            occurrence_count, created_at, updated_at
+        ) VALUES (
+            'polluted-node', 1, 'phrase', 'polluted-node',
+            'значения и памяти. но не хватает фактов', 0.9, 2, ?, ?
+        )
+        """,
+        (timestamp, timestamp),
+    )
+    await old_database.execute(
+        """
+        INSERT INTO memory_long_term_capsules (
+            capsule_id, guild_id, channel_id, summary, importance, confidence,
+            created_at, updated_at
+        ) VALUES (
+            'polluted-capsule', 1, 20,
+            'в памяти пока не хватает фактов о носках', 0.8, 0.8, ?, ?
+        )
+        """,
+        (timestamp, timestamp),
+    )
+    await old_database.execute(
+        """
+        INSERT INTO language_conversation_sessions (
+            conversation_id, guild_id, channel_id, started_at, last_activity_at,
+            current_summary
+        ) VALUES (
+            'polluted-session', 1, 20, ?, ?,
+            'по реплике вижу тему носков'
+        )
+        """,
+        (timestamp, timestamp),
+    )
+    await old_database.close()
+
+    upgraded = Database(db_path, MIGRATIONS)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 37
+        assert await EventRepository(upgraded).get("raw-event-survives-cleanup") is not None
+        example = await upgraded.fetchone(
+            "SELECT status, quality_score FROM learning_instruction_examples "
+            "WHERE example_id = 'polluted-example'"
+        )
+        assert example is not None
+        assert example["status"] == "rejected"
+        assert float(example["quality_score"]) == 0.0
+        assert await upgraded.fetchone(
+            "SELECT 1 FROM learning_graph_nodes WHERE node_id = 'polluted-node'"
+        ) is None
+        assert await upgraded.fetchone(
+            "SELECT 1 FROM memory_long_term_capsules "
+            "WHERE capsule_id = 'polluted-capsule'"
+        ) is None
+        session = await upgraded.fetchone(
+            "SELECT current_summary FROM language_conversation_sessions "
+            "WHERE conversation_id = 'polluted-session'"
+        )
+        assert session is not None
+        assert session["current_summary"] == ""
     finally:
         await upgraded.close()
 

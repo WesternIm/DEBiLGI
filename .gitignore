@@ -1,4 +1,5 @@
 .env
+.env.local
 .venv/
 __pycache__/
 *.py[cod]
@@ -8,6 +9,7 @@ __pycache__/
 htmlcov/
 build/
 dist/
+node_modules/
 *.egg-info/
 data/
 *.sqlite3

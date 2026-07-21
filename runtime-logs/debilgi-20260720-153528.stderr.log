@@ -1,0 +1,13 @@
+2026-07-20 15:35:29,994 WARNING discord.client: PyNaCl is not installed, voice will NOT be supported
+2026-07-20 15:35:29,998 WARNING discord.client: davey is not installed, voice will NOT be supported
+2026-07-20 15:35:30,004 INFO pymorphy3.opencorpora_dict.wrapper: Loading dictionaries from C:\Users\Admin\Documents\DEBiLGI\.venv-admin\Lib\site-packages\pymorphy3_dicts_ru\data
+2026-07-20 15:35:30,037 INFO pymorphy3.opencorpora_dict.wrapper: format: 2.4, revision: 417150, updated: 2022-01-08T22:09:24.565962
+2026-07-20 15:35:30,046 INFO pymorphy3.opencorpora_dict.wrapper: Loading dictionaries from C:\Users\Admin\Documents\DEBiLGI\.venv-admin\Lib\site-packages\pymorphy3_dicts_ru\data
+2026-07-20 15:35:30,078 INFO pymorphy3.opencorpora_dict.wrapper: format: 2.4, revision: 417150, updated: 2022-01-08T22:09:24.565962
+2026-07-20 15:35:30,081 INFO discord.client: logging in using static token
+2026-07-20 15:35:31,207 INFO debilgi.discord.bot: Installed abstract curricula: social=13 productive=0
+2026-07-20 15:35:31,500 INFO debilgi.events.pipeline: Event pipeline started with 0 recovered events
+2026-07-20 15:35:32,058 INFO debilgi.discord.bot: Synced 1 commands to development guild
+2026-07-20 15:35:33,233 INFO discord.gateway: Shard ID None has connected to Gateway (Session ID: 45eb135faa3fb8310975b8f136457635).
+2026-07-20 15:35:35,246 INFO debilgi.discord.bot: Connected to Discord as DEBiLGI#3646 (1527681283470135466)
+2026-07-20 15:35:36,410 WARNING debilgi.semantic_consultant: Puter sidecar returned HTTP 502: No usage left for request.

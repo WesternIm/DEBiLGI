@@ -16,6 +16,7 @@ from debilgi.knowledge.models import (
     WikipediaResult,
 )
 from debilgi.knowledge.text import alias_keys, clean_extract, normalize_key
+from debilgi.language.content import content_lemmas
 from debilgi.storage.database import Database
 
 
@@ -63,20 +64,103 @@ class KnowledgeRepository:
             ),
         )
 
-    async def concept_for_alias(self, value: str) -> KnowledgeConcept | None:
+    async def concept_for_alias(
+        self,
+        value: str,
+        *,
+        preferred_sources: tuple[str, ...] = (),
+    ) -> KnowledgeConcept | None:
         key = normalize_key(value)
         if not key:
             return None
+        keys = tuple(
+            dict.fromkeys(
+                (key, *(content_lemmas(value) if len(key.split()) == 1 else ()))
+            )
+        )
+        placeholders = ",".join("?" for _ in keys)
+        rows = await self._database.fetchall(
+            f"""
+            SELECT concept.*, alias.confidence AS alias_confidence, alias.alias_key
+            FROM knowledge_aliases AS alias
+            JOIN knowledge_concepts AS concept ON concept.concept_id = alias.concept_id
+            WHERE alias.alias_key IN ({placeholders})
+            ORDER BY alias.confidence DESC, concept.confidence DESC LIMIT 32
+            """,
+            keys,
+        )
+        if not rows:
+            return None
+        if preferred_sources:
+            source_rank = {source: index for index, source in enumerate(preferred_sources)}
+            rows.sort(
+                key=lambda row: (
+                    source_rank.get(str(row["source"]), len(source_rank)),
+                    str(row["alias_key"]) != key,
+                    -float(row["alias_confidence"]),
+                    -float(row["confidence"]),
+                )
+            )
+        else:
+            rows.sort(
+                key=lambda row: (
+                    str(row["alias_key"]) != key,
+                    -float(row["alias_confidence"]),
+                    -float(row["confidence"]),
+                )
+            )
+        return self._concept_from_row(rows[0])
+
+    async def resolved_concept_for_event(self, event_id: str) -> KnowledgeConcept | None:
+        """Return the concept deliberately looked up for this exact event."""
+
         row = await self._database.fetchone(
             """
-            SELECT concept.* FROM knowledge_aliases AS alias
-            JOIN knowledge_concepts AS concept ON concept.concept_id = alias.concept_id
-            WHERE alias.alias_key = ?
-            ORDER BY alias.confidence DESC, concept.confidence DESC LIMIT 1
+            SELECT concept.* FROM knowledge_queries AS query
+            JOIN knowledge_concepts AS concept ON concept.concept_id = query.concept_id
+            WHERE query.event_id = ? AND query.status IN ('resolved', 'cached')
+              AND query.reason IN ('explicit', 'followup')
+            ORDER BY query.completed_at DESC LIMIT 1
             """,
-            (key,),
+            (event_id,),
         )
         return self._concept_from_row(row) if row else None
+
+    async def any_resolved_concept_for_event(self, event_id: str) -> KnowledgeConcept | None:
+        """Return knowledge learned for an event, including an autonomous uncertainty lookup."""
+
+        row = await self._database.fetchone(
+            """SELECT concept.* FROM knowledge_queries AS query
+               JOIN knowledge_concepts AS concept ON concept.concept_id = query.concept_id
+               WHERE query.event_id = ? AND query.status IN ('resolved', 'cached')
+               ORDER BY query.completed_at DESC LIMIT 1""",
+            (event_id,),
+        )
+        return self._concept_from_row(row) if row else None
+
+    async def recent_explicit_query(
+        self,
+        guild_id: int,
+        channel_id: int,
+        actor_id: int | None,
+        *,
+        before: datetime,
+    ) -> str | None:
+        """Recover the latest explicit subject for commands such as ``узнай``."""
+
+        row = await self._database.fetchone(
+            """
+            SELECT query_text FROM knowledge_queries
+            WHERE guild_id = ? AND channel_id = ?
+              AND (? IS NULL OR actor_id = ?)
+              AND reason IN ('explicit', 'followup')
+              AND status IN ('resolved', 'cached')
+              AND created_at < ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (guild_id, channel_id, actor_id, actor_id, before.isoformat()),
+        )
+        return str(row["query_text"]) if row else None
 
     async def record_cache_hit(
         self,
@@ -128,7 +212,7 @@ class KnowledgeRepository:
                     actor_id=event.actor_id,
                     concept_id=concept_id,
                     source_query_id=query_id,
-                    explicit=reason == "explicit",
+                    explicit=reason in {"explicit", "followup"},
                     observed_at=now,
                 )
 
@@ -148,7 +232,11 @@ class KnowledgeRepository:
         query_key = normalize_key(query)
         if not query_key:
             return None
-        cost = self._explicit_query_cost if reason == "explicit" else self._autonomous_query_cost
+        cost = (
+            self._explicit_query_cost
+            if reason in {"explicit", "followup"}
+            else self._autonomous_query_cost
+        )
         async with self._database.transaction() as connection:
             state = await (
                 await connection.execute(
@@ -160,7 +248,10 @@ class KnowledgeRepository:
                 )
             ).fetchone()
             balance = float(state["evidence_balance"]) if state else 1.0
-            if reason != "explicit" and balance < self._minimum_autonomous_balance:
+            if (
+                reason not in {"explicit", "followup"}
+                and balance < self._minimum_autonomous_balance
+            ):
                 return None
             try:
                 await connection.execute(
@@ -343,7 +434,129 @@ class KnowledgeRepository:
                 ),
                 concept_id=concept_id,
                 source_query_id=query_id,
-                explicit=str(query_row["reason"]) == "explicit",
+                explicit=str(query_row["reason"]) in {"explicit", "followup"},
+                observed_at=now,
+            )
+        concept = await self.concept(concept_id)
+        assert concept is not None
+        return concept
+
+    async def store_internalized_concept(
+        self,
+        event: Event,
+        *,
+        query: str,
+        result: WikipediaResult,
+        source: str,
+        language: str,
+        completed_at: datetime | None = None,
+    ) -> KnowledgeConcept:
+        """Persist background/reasoning study without creating a ready-made answer.
+
+        Unlike ``complete_query``, this method deliberately creates no
+        ``knowledge_queries`` row.  The acquired definition becomes internal
+        evidence linked to the triggering event, but cannot be returned by
+        ``resolved_concept_for_event`` as an exact retrieval response.
+        """
+
+        if event.channel_id is None:
+            raise ValueError("Internal study requires a channel-scoped event")
+        now = (completed_at or datetime.now(UTC)).isoformat()
+        concept_id = f"{source}:{language}:{result.page_id}"
+        definition = clean_extract(result.extract)
+        async with self._database.transaction() as connection:
+            await connection.execute(
+                """
+                INSERT INTO knowledge_concepts (
+                    concept_id, source, language, external_id, title, normalized_title,
+                    definition, canonical_url, wikidata_id, revision_id, confidence,
+                    fetched_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.88, ?, ?)
+                ON CONFLICT (concept_id) DO UPDATE SET
+                    title = excluded.title,
+                    normalized_title = excluded.normalized_title,
+                    definition = excluded.definition,
+                    canonical_url = excluded.canonical_url,
+                    wikidata_id = excluded.wikidata_id,
+                    revision_id = excluded.revision_id,
+                    confidence = excluded.confidence,
+                    fetched_at = excluded.fetched_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    concept_id,
+                    source,
+                    language,
+                    str(result.page_id),
+                    result.title,
+                    normalize_key(result.title),
+                    definition,
+                    result.canonical_url,
+                    result.wikidata_id,
+                    result.revision_id,
+                    now,
+                    now,
+                ),
+            )
+            for alias, confidence in ((query, 0.82), (result.title, 0.98)):
+                alias_key = normalize_key(alias)
+                if alias_key:
+                    await connection.execute(
+                        """
+                        INSERT INTO knowledge_aliases (
+                            alias_key, alias_text, concept_id, confidence, created_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT (alias_key, concept_id) DO UPDATE SET
+                            confidence = MAX(knowledge_aliases.confidence, excluded.confidence)
+                        """,
+                        (alias_key, alias, concept_id, confidence, now),
+                    )
+            for title in result.related_titles:
+                normalized = normalize_key(title)
+                if not normalized:
+                    continue
+                linked_row = await (
+                    await connection.execute(
+                        """SELECT concept_id FROM knowledge_aliases
+                           WHERE alias_key = ? ORDER BY confidence DESC LIMIT 1""",
+                        (normalized,),
+                    )
+                ).fetchone()
+                linked_concept_id = str(linked_row["concept_id"]) if linked_row else None
+                digest = hashlib.sha256(
+                    f"{concept_id}\x1frelated_to\x1f{normalized}".encode()
+                ).hexdigest()[:24]
+                await connection.execute(
+                    """
+                    INSERT OR IGNORE INTO knowledge_relations (
+                        relation_id, subject_concept_id, predicate, object_title,
+                        normalized_object_title, object_concept_id, confidence,
+                        source_query_id, created_at
+                    ) VALUES (?, ?, 'related_to', ?, ?, ?, 0.45, NULL, ?)
+                    """,
+                    (
+                        f"relation:{digest}",
+                        concept_id,
+                        title,
+                        normalized,
+                        linked_concept_id,
+                        now,
+                    ),
+                )
+            await connection.execute(
+                """UPDATE knowledge_relations SET object_concept_id = ?
+                   WHERE normalized_object_title = ? AND object_concept_id IS NULL""",
+                (concept_id, normalize_key(result.title)),
+            )
+            await self._link_concept(
+                connection,
+                event_id=event.event_id,
+                guild_id=event.guild_id,
+                channel_id=event.channel_id,
+                actor_id=event.actor_id,
+                concept_id=concept_id,
+                source_query_id=None,
+                explicit=False,
                 observed_at=now,
             )
         concept = await self.concept(concept_id)
@@ -403,25 +616,40 @@ class KnowledgeRepository:
         return linked
 
     async def concepts_for_text(
-        self, value: str, limit: int = 3, *, mark_used: bool = True
+        self,
+        value: str,
+        limit: int = 3,
+        *,
+        mark_used: bool = True,
+        preferred_sources: tuple[str, ...] = (),
     ) -> tuple[KnowledgeConcept, ...]:
-        keys = alias_keys(value)
+        keys = tuple(dict.fromkeys((*alias_keys(value), *content_lemmas(value))))
         if not keys:
             return ()
         placeholders = ",".join("?" for _ in keys)
         rows = await self._database.fetchall(
             f"""
-            SELECT concept.*, MAX(alias.confidence) AS alias_confidence
+            SELECT concept.*, MAX(alias.confidence) AS alias_confidence,
+                   MAX(LENGTH(alias.alias_key)) AS alias_length
             FROM knowledge_aliases AS alias
             JOIN knowledge_concepts AS concept ON concept.concept_id = alias.concept_id
             WHERE alias.alias_key IN ({placeholders})
             GROUP BY concept.concept_id
-            ORDER BY alias_confidence DESC, LENGTH(alias.alias_key) DESC
+            ORDER BY alias_confidence DESC, alias_length DESC
             LIMIT ?
             """,
-            (*keys, limit),
+            (*keys, max(limit, 32 if preferred_sources else limit)),
         )
-        concepts = tuple(self._concept_from_row(row) for row in rows)
+        if preferred_sources:
+            source_rank = {source: index for index, source in enumerate(preferred_sources)}
+            rows.sort(
+                key=lambda row: (
+                    source_rank.get(str(row["source"]), len(source_rank)),
+                    -float(row["alias_confidence"]),
+                    -int(row["alias_length"]),
+                )
+            )
+        concepts = tuple(self._concept_from_row(row) for row in rows[:limit])
         if concepts and mark_used:
             now = datetime.now(UTC).isoformat()
             async with self._database.transaction() as connection:
