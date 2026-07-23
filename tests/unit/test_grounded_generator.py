@@ -40,3 +40,21 @@ def test_does_not_splice_memory_when_no_grounded_fact_exists() -> None:
     )
 
     assert GroundedConstructionGenerator().generate(plan) == ""
+
+
+def test_rejects_a_memory_fragment_with_missing_predicate_argument() -> None:
+    plan = _plan(
+        ReplyContext(
+            prompt="Что даст большая база?",
+            knowledge_facts=(
+                "Большая база даст тебе.",
+                "Большая база даст тебе примеры.",
+            ),
+        )
+    )
+
+    candidates = GroundedConstructionGenerator().generate_candidates(plan)
+
+    assert tuple(item.text for item in candidates) == (
+        "Большая база даст тебе примеры.",
+    )

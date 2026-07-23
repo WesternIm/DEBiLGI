@@ -181,6 +181,20 @@ SOCIAL_POLICY_CURRICULUM: tuple[SocialPolicy, ...] = (
         confidence=0.95,
     ),
     SocialPolicy(
+        "understanding_challenge_gets_acknowledgement",
+        ("understanding_challenge",),
+        ("acknowledge_understanding",),
+        ("any",),
+        "acknowledge",
+        ("continue_topic", "playful_reply"),
+        ("state_unknown", "define_isolated_word", "meta_diagnostic", "evade"),
+        stance_mode="own_position",
+        answer_first=True,
+        warmth=0.58,
+        playfulness=0.62,
+        confidence=0.97,
+    ),
+    SocialPolicy(
         "statement_gets_engagement_not_dictionary_dump",
         ("statement",),
         ("continue_topic",),
@@ -402,6 +416,7 @@ def candidate_social_features(
         "knowledge_retrieval",
         "lexical_reference",
         "semantic_reasoning",
+        "abstract_reasoning",
         "relation_reasoning",
         "semantic_thought",
         "position_reasoning",
@@ -500,6 +515,7 @@ def _candidate_move(source: str, metadata: Mapping[str, object]) -> str:
         "relation_reasoning",
         "semantic_reasoning",
         "semantic_thought",
+        "abstract_reasoning",
         "discord_identity",
     }:
         return "answer"

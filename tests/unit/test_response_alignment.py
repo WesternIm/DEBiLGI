@@ -51,3 +51,14 @@ def test_reflexive_topic_must_survive_an_open_self_question() -> None:
     assert not unrelated.allowed
     assert "себя" in unrelated.question_focus
     assert bound.allowed
+
+
+def test_unknown_named_entity_is_a_required_question_focus() -> None:
+    prompt = analyze_structured_utterance("Ты играл в гта 5?")
+
+    unrelated = assess_response_alignment(prompt, "Свои игрульки играешь.")
+    bound = assess_response_alignment(prompt, "Нет, я не играл в гта 5.")
+
+    assert not unrelated.allowed
+    assert set(unrelated.question_focus) >= {"гта", "5"}
+    assert bound.allowed

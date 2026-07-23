@@ -43,7 +43,8 @@ def test_expressive_chat_forms_do_not_pollute_topics() -> None:
     )
 
 
-def test_short_uppercase_acronym_survives_the_content_filter() -> None:
-    assert "iq" in content_lemmas("Сколько IQ у тебя?")
-    assert "ии" in content_lemmas("Как работает ИИ?")
-    assert "ну" not in content_lemmas("ну")
+def test_short_abbreviation_remains_a_content_concept() -> None:
+    assert content_tokens("Что такое ИИ?") == ("ии",)
+    assert content_lemmas("Что такое ИИ?") == ("ии",)
+    assert content_tokens("т.е. объясни иначе") == ("т.е.", "объясни", "иначе")
+    assert content_lemmas("т.е. объясни иначе") == ("те", "объяснить", "иначе")

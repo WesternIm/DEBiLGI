@@ -17,14 +17,16 @@ def analysis(
     unknown: UnknownKind | None = None,
     lemma: str | None = None,
     meaning: str | None = None,
+    meanings: tuple[str, ...] = (),
 ) -> WordAnalysis:
+    dictionary_meanings = meanings or ((meaning,) if meaning else ())
     return WordAnalysis(
         surface_form=surface,
         normalized_form=surface,
         lemma=None if unknown else (lemma or surface),
         part_of_speech=part,
         grammatical_features={},
-        dictionary_meanings=(meaning,) if meaning else (),
+        dictionary_meanings=dictionary_meanings,
         style_labels=(),
         source="unknown" if unknown else "opencorpora",
         confidence=ConfidenceProfile(0.1, 0.0, 0.0, 0.0, 0.0),
@@ -33,56 +35,15 @@ def analysis(
     )
 
 
-def test_social_routines_receive_direct_conversational_answers() -> None:
-    assert is_social_routine("как дела?")
-    assert "А у тебя как?" in compose_recovery(RecoveryEvidence("как дела?"))
-    assert "попал в смысл" in compose_recovery(RecoveryEvidence("Это хорошо)))"))
-
-
-def test_unknown_word_uses_grammar_to_ask_a_precise_question() -> None:
-    reply = compose_recovery(
-        RecoveryEvidence(
-            prompt="закинул трощкэ?",
-            analyses=(
-                analysis("закинул", part="VERB"),
-                analysis("трощкэ", unknown=UnknownKind.UNKNOWN_FORM),
-            ),
-        )
-    )
-
-    assert "очеред" not in reply
-    assert "действие «закинул»" in reply
-    assert "трощкэ" in reply
-
-
-def test_found_fact_is_used_instead_of_an_uncertainty_template() -> None:
-    reply = compose_recovery(
-        RecoveryEvidence(
-            prompt="что такое мороженое?",
-            facts=("Мороженое — замороженный сладкий десерт.",),
-        )
-    )
-
-    assert reply == "Мороженое — замороженный сладкий десерт."
-
-
-def test_short_clarification_is_not_treated_as_a_factual_question() -> None:
-    reply = compose_recovery(RecoveryEvidence("Чего"))
-
-    assert is_social_routine("Чего")
-    assert reply.startswith("Я ответил бессвязно")
-    assert "узнать" not in reply
-
-
-def test_attention_calls_and_implicit_complaints_are_dialogue_acts() -> None:
+def test_only_irreducible_social_routines_keep_fixed_surfaces() -> None:
     assert compose_dialogue_reply(RecoveryEvidence("ауу")) == "Я здесь. Говори."
     assert compose_dialogue_reply(RecoveryEvidence("але")) == "Я здесь. Говори."
-    assert is_social_routine("тупишь что-ли?")
-    assert "предыдущий ответ" in compose_recovery(RecoveryEvidence("тупишь что-ли?")).casefold()
-    assert is_social_routine("чего бля")
+    assert compose_recovery(RecoveryEvidence("как дела?")) == "Я в работе. А ты как?"
+    assert compose_recovery(RecoveryEvidence("спасибо")) == "Пожалуйста."
+    assert compose_recovery(RecoveryEvidence("не смейся")) == "Хорошо, без шуток."
 
 
-def test_person_directed_trait_is_not_sent_to_encyclopedic_search() -> None:
+def test_person_label_is_a_dynamic_social_frame_not_encyclopedic_retrieval() -> None:
     reply = compose_recovery(
         RecoveryEvidence(
             "ты обманщик?",
@@ -97,132 +58,90 @@ def test_person_directed_trait_is_not_sent_to_encyclopedic_search() -> None:
     )
 
     assert is_social_routine("ты обманщик?")
-    assert "не пытаюсь тебя обмануть" in reply
-    assert "пьес" not in reply
+    assert "оцениваешь меня как «обманщик»" in reply
+    assert "на каком ответе" in reply.casefold()
+    assert "телесериал" not in reply
 
 
-def test_interpretation_correction_uses_the_lemma_meaning() -> None:
+def test_unknown_word_failure_is_single_terminal_lookup_report() -> None:
+    replies = {unknown_word_fallback("трощкэ", variant) for variant in range(10)}
+
+    assert replies == {"Поиск не дал значения для «трощкэ». Уточни написание."}
+
+
+def test_unknown_word_uses_found_spelling_candidates() -> None:
     reply = compose_recovery(
         RecoveryEvidence(
-            "ты не так узнал обманщика",
+            prompt="закинул трощкэ?",
+            analyses=(
+                analysis("закинул", part="VERB"),
+                analysis("трощкэ", unknown=UnknownKind.UNKNOWN_FORM),
+            ),
+            similar_words=(("трощкэ", ("трошки", "крошка")),),
+        )
+    )
+
+    assert "после поиска" in reply.casefold()
+    assert "«трошки»" in reply
+    assert "«крошка»" in reply
+
+
+def test_found_fact_is_used_instead_of_recovery_language() -> None:
+    reply = compose_recovery(
+        RecoveryEvidence(
+            prompt="что такое мороженое?",
+            facts=("Мороженое — замороженный сладкий десерт.",),
+        )
+    )
+
+    assert reply == "Мороженое — замороженный сладкий десерт."
+
+
+def test_ambiguous_meaning_asks_from_actual_found_variants() -> None:
+    reply = compose_recovery(
+        RecoveryEvidence(
+            "что значит ключ?",
             analyses=(
                 analysis(
-                    "обманщика",
-                    part="NOUN",
-                    lemma="обманщик",
-                    meaning="человек, который намеренно вводит других в заблуждение",
+                    "ключ",
+                    unknown=UnknownKind.AMBIGUOUS_CONTEXT,
+                    meanings=(
+                        "инструмент для замка",
+                        "источник воды",
+                    ),
                 ),
             ),
         )
     )
 
-    assert "Исправляю" in reply
-    assert "не название объекта" in reply
-    assert "вводит других в заблуждение" in reply
+    assert "инструмент для замка" in reply
+    assert "источник воды" in reply
 
 
-def test_self_name_request_is_left_to_generation_instead_of_hardcoding_a_name() -> None:
-    reply = compose_dialogue_reply(
-        RecoveryEvidence(
-            "Да, ты себе придумай",
-            analyses=(analysis("придумай", part="VERB", lemma="придумать"),),
-            context_messages=("А имя какое у тебя?", "Имя не попадать разговора в поиск"),
-        )
+def test_content_domains_are_not_answered_by_recovery_scripts() -> None:
+    prompts = (
+        "кто твоя мама",
+        "Ты осознан?",
+        "Что такое осознанность?",
+        "ладно, иди отдыхай",
+        "Да, это команда",
     )
 
-    assert reply is None
-    assert is_identity_question("Как тебя зовут?")
-    assert is_identity_question("кто ты")
-
-
-def test_rest_directive_gets_a_direct_conversational_answer() -> None:
-    reply = compose_recovery(
-        RecoveryEvidence(
-            "ладно, иди отдыхай",
-            analyses=(analysis("отдыхай", part="VERB", lemma="отдыхать"),),
-        )
-    )
-
-    assert "отойду" in reply
-    assert "что именно" not in reply.casefold()
-
-
-def test_command_confirmation_is_not_treated_as_a_dictionary_subject() -> None:
-    reply = compose_recovery(RecoveryEvidence("Да, это команда"))
-
-    assert "выполнить указанное действие" in reply
-    assert "неоднознач" not in reply
+    for prompt in prompts:
+        assert compose_dialogue_reply(RecoveryEvidence(prompt)) is None
+        assert not is_social_routine(prompt)
 
 
 def test_extracts_single_word_from_explicit_lexical_lookup() -> None:
     assert lexical_lookup_target("Узнай что такое отдыхать, дурень") == "отдыхать"
     assert lexical_lookup_target("Что значит слово «кринж»?") == "кринж"
     assert lexical_lookup_target("Что такое слово фырбуль?") == "фырбуль"
+    assert lexical_lookup_target("Что значит API?") == "api"
+    assert lexical_lookup_target("Что значит т.е.?") == "те"
     assert lexical_lookup_target("поговорим об отдыхе") is None
 
 
-def test_parent_identity_and_short_followup_use_the_reply_chain() -> None:
-    mother = compose_recovery(RecoveryEvidence("кто твоя мама"))
-    checked = compose_recovery(
-        RecoveryEvidence(
-            "Сверил?",
-            context_messages=(
-                "кто твоя мама",
-                "Сначала сверю ближайший контекст и доступные источники.",
-            ),
-        )
-    )
-
-    assert "родителей у меня нет" in mother
-    assert "ты спрашивала, кто моя мама" in checked
-
-
-def test_unknown_word_fallback_pool_varies_and_preserves_the_word() -> None:
-    replies = {unknown_word_fallback("трощкэ", variant) for variant in range(10)}
-
-    assert len(replies) == 10
-    assert all("трощкэ" in reply for reply in replies)
-
-
-def test_false_topic_anchor_is_replaced_by_conversational_followups() -> None:
-    father = compose_recovery(RecoveryEvidence("кто твой папа"))
-    clarification = compose_recovery(
-        RecoveryEvidence(
-            "Всмысле",
-            context_messages=(
-                "кто твой папа",
-                "Продолжаю прежнюю тему «осознанный».",
-            ),
-        )
-    )
-    difficult = compose_recovery(RecoveryEvidence("Это сложно объяснить"))
-
-    assert "родителей у меня нет" in father
-    assert "ошибочно привязал вопрос о папе" in clarification
-    assert "Скажи кусками" in difficult
-    assert "прежнюю тему" not in difficult
-
-
-def test_consciousness_questions_receive_a_direct_position_and_definition() -> None:
-    position = compose_recovery(RecoveryEvidence("Ты осознан?"))
-    followup = compose_recovery(
-        RecoveryEvidence(
-            "Так да или нет?",
-            context_messages=("ты осознан?",),
-        )
-    )
-    definition = compose_recovery(RecoveryEvidence("Что такое осознанность, осознанный и прочее?"))
-
-    assert position.startswith("Нет,")
-    assert followup.startswith("Нет,")
-    assert "Осознанность — способность" in definition
-
-
-def test_consciousness_self_assessment_is_detected_by_roles_not_exact_word_order() -> None:
-    direct = compose_dialogue_reply(RecoveryEvidence("Насколько считаешь ты себя осознанным?"))
-    prefixed = compose_dialogue_reply(
-        RecoveryEvidence("Ладно. Ты считаешь себя осознанным, да или нет?")
-    )
-
-    assert direct is not None and direct.startswith("Нет,")
-    assert prefixed is not None and prefixed.startswith("Нет,")
+def test_identity_detection_remains_routing_only() -> None:
+    assert is_identity_question("Как тебя зовут?")
+    assert is_identity_question("кто ты")
+    assert not is_identity_question("кто твоя мама")

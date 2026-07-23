@@ -115,7 +115,7 @@ def understand_utterance(
         dict.fromkeys(
             item.lemma or item.normalized_form
             for item in analyses
-            if item.unknown_kind is not None
+            if item.requires_lexical_study
             if (item.lemma or item.normalized_form) not in entity_terms
         )
     )
@@ -123,11 +123,8 @@ def understand_utterance(
         dict.fromkeys(
             item.lemma or item.normalized_form
             for item in analyses
-            if item.unknown_kind is None
-            or item.dictionary_meanings
-            or item.selected_meaning
-            or item.personal_interpretation
-            or item.local_meaning
+            if not item.requires_lexical_study
+            or item.has_usable_meaning
         )
     )
     known_terms = tuple(

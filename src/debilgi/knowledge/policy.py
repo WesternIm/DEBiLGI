@@ -18,7 +18,11 @@ _EXPLICIT_RE = re.compile(
     r"расскажи\s+(?:про|о)|объясни(?:\s+что\s+такое)?)\s+(.+)",
     re.IGNORECASE,
 )
-_LOOKUP_RE = re.compile(r"\b(?:узнай|найди|проверь|поищи)\b(?:\s+(.+))?", re.IGNORECASE)
+_LOOKUP_RE = re.compile(
+    r"\b(?:узнай|найди|проверь|поищи|изучи|исследуй|разберись)\b"
+    r"(?:\s+(.+))?",
+    re.IGNORECASE,
+)
 _LOOKUP_FILLERS = frozenset(
     {
         "а",
@@ -41,6 +45,29 @@ MEDIA_ARTICLE_MARKERS = (
     "песня",
     "телешоу",
     "аниме",
+)
+_TRAILING_LOOKUP_ACTIONS = frozenset(
+    {
+        "ответь",
+        "ответить",
+        "расскажи",
+        "рассказать",
+        "объясни",
+        "объяснить",
+        "скажи",
+        "сказать",
+        "сообщи",
+        "сообщить",
+    }
+)
+_DEICTIC_LOOKUP_OBJECTS = frozenset(
+    {
+        "это",
+        "что это",
+        "что это такое",
+        "об этом",
+        "про это",
+    }
 )
 
 
@@ -80,8 +107,7 @@ class KnowledgeQueryPolicy:
         explicit = _EXPLICIT_RE.search(semantic_content)
         uncertainty = _context_number(intent, "state_uncertainty")
         if explicit:
-            query = normalize_key(explicit.group(1))
-            query = " ".join(query.split()[:6])
+            query = _clean_lookup_query(explicit.group(1))
             query = canonical_lexical_query(query, semantic_content)
             return KnowledgeDecision(bool(query), query or None, "explicit", uncertainty)
         followup, lookup_query = self.followup_query(semantic_content)
@@ -94,7 +120,13 @@ class KnowledgeQueryPolicy:
             return KnowledgeDecision(
                 lookup_query is not None,
                 lookup_query,
-                "explicit" if lookup_query else "followup",
+                (
+                    "explicit"
+                    if lookup_query
+                    else "contextual_followup"
+                    if is_deictic_lookup_query(semantic_content)
+                    else "followup"
+                ),
                 uncertainty,
             )
         if is_social_routine(semantic_content):
@@ -127,7 +159,7 @@ class KnowledgeQueryPolicy:
         match = _LOOKUP_RE.search(semantic_content)
         if match is None:
             return False, None
-        tail = normalize_key(match.group(1) or "")
+        tail = _clean_lookup_query(match.group(1) or "")
         tokens = [token for token in tail.split() if token not in _LOOKUP_FILLERS]
         for prefix in (
             ("значение", "слова"),
@@ -141,7 +173,24 @@ class KnowledgeQueryPolicy:
         if tokens[:1] == ["слово"]:
             tokens = tokens[1:]
         query = " ".join(tokens[:6])
+        if query in _DEICTIC_LOOKUP_OBJECTS:
+            query = ""
         return True, query or None
+
+
+def _clean_lookup_query(value: str) -> str:
+    tokens = normalize_key(value).split()
+    while tokens and tokens[-1] in _TRAILING_LOOKUP_ACTIONS:
+        tokens.pop()
+    return " ".join(tokens[:6])
+
+
+def is_deictic_lookup_query(content: str) -> bool:
+    normalized = normalize_key(content)
+    return any(
+        re.search(rf"(?<![\w-]){re.escape(value)}(?![\w-])", normalized)
+        for value in _DEICTIC_LOOKUP_OBJECTS
+    )
 
 
 def _context_number(intent: ActionIntent | None, key: str) -> float:

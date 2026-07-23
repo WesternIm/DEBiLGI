@@ -63,6 +63,7 @@ def test_background_learning_is_configurable(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("DEBILGI_BACKGROUND_ENABLED", "true")
     monkeypatch.setenv("DEBILGI_BACKGROUND_INTERVAL_SECONDS", "420")
     monkeypatch.setenv("DEBILGI_BACKGROUND_WORDS_PER_CYCLE", "7")
+    monkeypatch.setenv("DEBILGI_BACKGROUND_STUDY_WORKERS", "6")
     monkeypatch.setenv("DEBILGI_BACKGROUND_MAX_STUDY_ATTEMPTS", "3")
     monkeypatch.setenv("DEBILGI_BACKGROUND_GRAPH_DECAY_DAILY_RATE", "0.02")
     monkeypatch.setenv("DEBILGI_BACKGROUND_SELF_CHECK_CYCLES", "4")
@@ -75,12 +76,19 @@ def test_background_learning_is_configurable(monkeypatch: pytest.MonkeyPatch) ->
     assert settings.background_enabled is True
     assert settings.background_interval_seconds == 420
     assert settings.background_words_per_cycle == 7
+    assert settings.background_study_workers == 6
     assert settings.background_max_study_attempts == 3
     assert settings.background_graph_decay_daily_rate == pytest.approx(0.02)
     assert settings.background_self_check_cycles == 4
     assert settings.background_initiative_enabled is True
     assert settings.background_initiative_probability == pytest.approx(0.4)
     assert settings.background_initiative_cooldown_minutes == 90
+
+
+def test_reference_worker_pool_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEBILGI_RUSSIAN_REFERENCE_WORKERS", "5")
+
+    assert Settings.from_env().russian_reference_workers == 5
 
 
 def test_language_limits_are_configurable(monkeypatch: pytest.MonkeyPatch) -> None:

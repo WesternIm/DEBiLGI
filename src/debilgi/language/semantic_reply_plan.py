@@ -309,50 +309,26 @@ def realize_clarification_plan(
             False,
         )
 
-    fallback = "Не понял. Пояснишь?"
-    fallback_validation = validate_semantic_reply(plan, fallback)
-    if fallback_validation.is_valid:
-        reason = realization_failure or (
-            "productive NLG produced no candidate"
-            if not candidates
-            else "all productive candidates failed semantic validation"
-        )
-        return SemanticRealizationResult(
-            plan,
-            fallback,
-            fallback_validation,
-            tuple(candidates),
-            ProcessingOutcome(
-                ProcessingOutcomeType.REPLIED,
-                plan.intention_id,
-                plan.plan_id,
-                fallback,
-                "language_realization" if not candidates else "semantic_validation",
-                reason,
-                False,
-                {
-                    "candidate_count": len(candidates),
-                    "used_fallback": True,
-                },
-            ),
-            True,
-        )
-
     failure_type = (
         ProcessingOutcomeType.FAILED_TO_REALIZE_LANGUAGE
         if not candidates
         else ProcessingOutcomeType.VALIDATION_REJECTED
     )
+    failure_reason = realization_failure or (
+        "productive NLG produced no candidate"
+        if not candidates
+        else "all productive candidates failed semantic validation"
+    )
     return SemanticRealizationResult(
         plan,
         None,
-        fallback_validation,
+        _invalid_validation("no_semantic_preserving_surface"),
         tuple(candidates),
         _technical_outcome(
             failure_type,
             plan,
             "language_realization" if not candidates else "semantic_validation",
-            "no semantic-preserving clarification surface",
+            failure_reason,
             candidate_count=len(candidates),
         ),
         False,

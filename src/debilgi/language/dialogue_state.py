@@ -32,54 +32,22 @@ _RETURN_MARKERS = (
     "снова о",
 )
 _REFERENCE_PRONOUNS = frozenset(
-    {"он", "она", "оно", "они", "его", "её", "ее", "их", "ему", "ей", "им"}
+    {
+        "он",
+        "она",
+        "оно",
+        "они",
+        "его",
+        "её",
+        "ее",
+        "их",
+        "ему",
+        "ей",
+        "им",
+        "это",
+    }
 )
 _ASK_PREDICATES = frozenset({"спрашивать", "спросить", "задавать"})
-_REFERENCE_TOPIC_STOPWORDS = frozenset(
-    {"где", "зачем", "как", "какой", "когда", "кто", "куда", "почему", "сколько", "что"}
-)
-
-
-@dataclass(frozen=True, slots=True)
-class DialogueContextWindow:
-    """A bounded turn window with explicit reply-chain and human anchors."""
-
-    messages: tuple[str, ...]
-    reply_chain: tuple[str, ...]
-    semantic_anchors: tuple[str, ...]
-
-    @classmethod
-    def build(
-        cls,
-        recent_messages: tuple[str, ...] = (),
-        *,
-        reply_chain: tuple[str, ...] = (),
-        semantic_anchors: tuple[str, ...] = (),
-        max_turns: int = 12,
-        max_chain_turns: int = 8,
-        max_anchors: int = 4,
-    ) -> DialogueContextWindow:
-        """Keep chronology while ensuring the direct chain survives topical ranking."""
-
-        safe_turns = max(1, min(max_turns, 32))
-        safe_chain = max(1, min(max_chain_turns, safe_turns))
-        safe_anchors = max(1, min(max_anchors, safe_chain))
-        recent = _clean_messages(recent_messages)[-safe_turns:]
-        chain = _clean_messages(reply_chain)[-safe_chain:]
-        anchors = _clean_messages(semantic_anchors)[-safe_anchors:]
-        combined = list(recent)
-        for message in chain:
-            if message in combined:
-                combined.remove(message)
-            combined.append(message)
-        for message in anchors:
-            if message not in combined:
-                combined.append(message)
-        return cls(
-            messages=tuple(combined[-safe_turns:]),
-            reply_chain=chain,
-            semantic_anchors=anchors,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +94,6 @@ class DialogueStateAnalysis:
     added_context_terms: tuple[str, ...]
     confidence: float
     repair_target: str | None
-    context_window: DialogueContextWindow
 
     @property
     def unresolved_references(self) -> tuple[ReferenceResolution, ...]:
@@ -148,22 +115,14 @@ class DialogueStateAnalysis:
 def analyze_dialogue_state(
     prompt: str,
     context_messages: tuple[str, ...] = (),
-    *,
-    context_window: DialogueContextWindow | None = None,
 ) -> DialogueStateAnalysis:
     """Resolve topic movement and references against a bounded recent window."""
 
-    window = context_window or DialogueContextWindow.build(context_messages)
-    recent_messages = window.messages
+    recent_messages = tuple(message.strip() for message in context_messages[-8:] if message.strip())
     prompt_structure = analyze_structured_utterance(prompt)
-    topic = _topic_state(
-        prompt,
-        recent_messages,
-        prompt_structure,
-        semantic_anchors=window.semantic_anchors,
-    )
+    topic = _topic_state(prompt, recent_messages, prompt_structure)
     repair_target = _repair_target(prompt, recent_messages)
-    candidates = _reference_candidates(window.semantic_anchors or recent_messages)
+    candidates = _reference_candidates(recent_messages)
     references = _resolve_references(prompt_structure, candidates)
     added_terms = tuple(
         dict.fromkeys(
@@ -179,10 +138,7 @@ def analyze_dialogue_state(
         and topic.transition == "continuation"
         and topic.confidence >= 0.78
         and len(topic.current_concepts) <= 2
-        and (
-            any(frame.elliptical for frame in prompt_structure.clauses)
-            or topic.reason.startswith("reply_chain_")
-        )
+        and any(frame.elliptical for frame in prompt_structure.clauses)
     ):
         added_terms = tuple(
             concept
@@ -209,7 +165,6 @@ def analyze_dialogue_state(
         added_context_terms=added_terms,
         confidence=min(1.0, topic.confidence * 0.56 + reference_confidence * 0.44),
         repair_target=repair_target,
-        context_window=window,
     )
 
 
@@ -230,18 +185,12 @@ def _topic_state(
     prompt: str,
     messages: tuple[str, ...],
     structure: StructuredUtterance,
-    *,
-    semantic_anchors: tuple[str, ...] = (),
 ) -> TopicState:
     current = tuple(dict.fromkeys(content_lemmas(prompt)))
     histories = tuple(tuple(dict.fromkeys(content_lemmas(message))) for message in messages)
     histories = tuple(item for item in histories if item)
     normalized = " ".join(prompt.casefold().replace("ё", "е").split())
     previous = histories[-1] if histories else ()
-    anchor_message = semantic_anchors[-1] if semantic_anchors else None
-    anchor_concepts = (
-        tuple(dict.fromkeys(content_lemmas(anchor_message))) if anchor_message else ()
-    )
     if not histories:
         return TopicState("new", current, current, (), None, 0.90, "no_previous_turn")
 
@@ -300,23 +249,6 @@ def _topic_state(
             min(0.98, 0.70 + latest_overlap * 0.28),
             "latest_topic_overlap",
         )
-    anchor_overlap = _concept_overlap(current, anchor_concepts)
-    if anchor_concepts and (
-        anchor_overlap >= 0.24 or _needs_reply_chain_anchor(prompt, structure)
-    ):
-        return TopicState(
-            "continuation",
-            current,
-            tuple(dict.fromkeys((*anchor_concepts, *current))),
-            previous,
-            anchor_message,
-            min(0.96, 0.82 + anchor_overlap * 0.14),
-            (
-                "reply_chain_topic_overlap"
-                if anchor_overlap >= 0.24
-                else "reply_chain_semantic_anchor"
-            ),
-        )
     if older_match is not None and current:
         _, anchor = older_match
         return TopicState(
@@ -354,11 +286,6 @@ def _reference_candidates(messages: tuple[str, ...]) -> tuple[ReferenceCandidate
     seen: set[tuple[str, str, int]] = set()
     for distance, message in enumerate(reversed(messages), start=1):
         structure = analyze_structured_utterance(message)
-        parsed_lemmas = {
-            token.lemma
-            for token in structure.tokens
-            if token.part_of_speech is not None or token.entity_kind is not None
-        }
         for token in structure.tokens:
             if token.part_of_speech != "noun" and token.entity_kind is None:
                 continue
@@ -390,60 +317,7 @@ def _reference_candidates(messages: tuple[str, ...]) -> tuple[ReferenceCandidate
                     score=min(1.0, score),
                 )
             )
-        for lemma in content_lemmas(message):
-            if lemma in parsed_lemmas or lemma in _REFERENCE_TOPIC_STOPWORDS:
-                continue
-            key = (lemma, "topic", distance)
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(
-                ReferenceCandidate(
-                    lemma=lemma,
-                    surface=lemma,
-                    semantic_role="topic",
-                    source_message=message,
-                    source_distance=distance,
-                    gender=None,
-                    number=None,
-                    animacy=None,
-                    score=max(0.10, 0.78 - (distance - 1) * 0.10 + 0.08),
-                )
-            )
     return tuple(result)
-
-
-def _needs_reply_chain_anchor(prompt: str, structure: StructuredUtterance) -> bool:
-    """Detect a short turn whose missing semantic slot is supplied by its parent chain."""
-
-    current = content_lemmas(prompt)
-    if len(current) > 3:
-        return False
-    for frame in structure.clauses:
-        if frame.predicate_index is None:
-            continue
-        predicate = structure.tokens[frame.predicate_index]
-        profile = predicate_valency(predicate.lemma)
-        if profile is None:
-            continue
-        present = {
-            *(('subject',) if frame.subject_indices or frame.implicit_subject else ()),
-            *(('direct_object',) if frame.direct_object_indices else ()),
-            *(('indirect_object',) if frame.indirect_object_indices else ()),
-            *(('action_complement',) if frame.action_complement_indices else ()),
-            *(item.role for item in frame.complements),
-        }
-        if any(
-            slot.required_in_isolated_fact and slot.role not in present
-            for slot in profile.slots
-            if slot.role != "subject"
-        ):
-            return True
-    return False
-
-
-def _clean_messages(messages: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(message.strip() for message in messages if message.strip()))
 
 
 def _resolve_references(
@@ -520,7 +394,11 @@ def _rank_candidates(
     features = dict(token.grammatical_features)
     ranked: list[tuple[float, ReferenceCandidate]] = []
     for candidate in candidates:
-        if not _compatible(features, candidate):
+        # Demonstrative ``это`` points at a proposition or discourse topic and
+        # does not inherit the neuter agreement restrictions of nominal
+        # ``оно``.  Applying gender here made ``что это`` reject a masculine
+        # antecedent such as ``рэпер`` before topic ranking even began.
+        if token.lemma != "это" and not _compatible(features, candidate):
             continue
         score = candidate.score
         if token.semantic_role == "subject":
@@ -528,6 +406,8 @@ def _rank_candidates(
             score += 0.10 if candidate.animacy == "animate" else 0.0
         if token.semantic_role == "direct_object":
             score += 0.08 if candidate.semantic_role == "direct_object" else 0.0
+        if token.lemma == "это":
+            score += 0.12 if candidate.semantic_role == "direct_object" else 0.0
         ranked.append((min(1.0, score), candidate))
     return tuple(
         sorted(ranked, key=lambda pair: (-pair[0], pair[1].source_distance, pair[1].lemma))

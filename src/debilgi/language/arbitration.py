@@ -133,6 +133,7 @@ DEFAULT_SOURCE_BIASES: Mapping[str, float] = MappingProxyType(
         "meaning_plan": 0.22,
         "dialogue_context": 0.24,
         "semantic_reasoning": 0.23,
+        "abstract_reasoning": 0.32,
         "relation_reasoning": 0.28,
         "causal_reasoning": 0.30,
         "dialogue_act": 0.26,
@@ -333,7 +334,19 @@ class ResponseArbitrator:
         if internal_surface_reason(normalized) is not None:
             reasons.append("internal_diagnostic_leak")
         surface = evaluate_surface(text)
-        reasons.extend(f"surface:{issue}" for issue in surface.hard_issues)
+        researched_fact_surface = bool(
+            candidate.metadata.get("foreground_research") is True
+            and candidate.required_facts
+            and all(_covers_fact(text, fact) for fact in candidate.required_facts)
+        )
+        reasons.extend(
+            f"surface:{issue}"
+            for issue in surface.hard_issues
+            if not (
+                researched_fact_surface
+                and issue == "unexpected_valency_role"
+            )
+        )
         explicit_rejection = candidate.metadata.get("hard_rejection")
         if isinstance(explicit_rejection, str) and explicit_rejection:
             reasons.append(explicit_rejection)

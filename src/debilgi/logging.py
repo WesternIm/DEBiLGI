@@ -22,7 +22,6 @@ _DIAGNOSTIC_LOGGERS = {
     "debilgi.structured_utterance": "structured-utterance.log",
     "debilgi.sense_resolution": "sense-resolution.log",
     "debilgi.meaning_plan": "meaning-plan.log",
-    "debilgi.semantic_reply_plan": "semantic-reply-plan.log",
     "debilgi.dialogue_state": "dialogue-state.log",
     "debilgi.contextual_question_reasoning": "contextual-question-reasoning.log",
 }

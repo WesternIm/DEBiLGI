@@ -16,10 +16,17 @@ from debilgi.knowledge.policy import (
     MEDIA_ARTICLE_MARKERS,
     KnowledgeQueryPolicy,
     canonical_lexical_query,
+    is_deictic_lookup_query,
     media_article_reasons,
 )
 from debilgi.knowledge.repository import KnowledgeRepository
 from debilgi.knowledge.text import normalize_key
+from debilgi.language.abbreviations import (
+    abbreviation_mentions,
+    generated_abbreviation_aliases,
+    is_abbreviation_candidate,
+    normalize_abbreviation,
+)
 from debilgi.language.content import content_lemmas
 
 logger = logging.getLogger(__name__)
@@ -264,11 +271,65 @@ class KnowledgeAcquisitionService:
         if not self.enabled:
             return (), None
         await self.wait_for_event(event.event_id)
-        looked_up = await self.repository.resolved_concept_for_event(event.event_id)
-        if looked_up is not None:
+        resolved = await self.repository.resolved_lookup_for_event(event.event_id)
+        if resolved is not None:
+            query, looked_up = resolved
+            if is_deictic_lookup_query(query) or not _title_matches_query(
+                query,
+                looked_up.title,
+            ):
+                selection_logger.info(
+                    "query=%r rejected_grounding=%r reason=event_lookup_topic_mismatch",
+                    query,
+                    looked_up.title,
+                )
+                return await self.context_for_text(prompt), None
             facts = self._format_concepts((looked_up,))
             return facts, (facts[0] if facts else None)
         return await self.context_for_text(prompt), None
+
+    async def internalize_consulted_fact(
+        self,
+        event: Event,
+        *,
+        query: str,
+        definition: str,
+        confidence: float,
+    ) -> KnowledgeConcept | None:
+        """Persist a checked teacher fact so later turns can retrieve it locally."""
+
+        normalized_query = normalize_key(query)
+        cleaned = " ".join(definition.split())
+        if (
+            not self.enabled
+            or event.channel_id is None
+            or not normalized_query
+            or not cleaned
+        ):
+            return None
+        page_id = int.from_bytes(
+            hashlib.sha256(
+                f"semantic-consultant:{normalized_query}".encode()
+            ).digest()[:8],
+            "big",
+        ) & 0x7FFF_FFFF_FFFF_FFFF
+        return await self.repository.store_internalized_concept(
+            event,
+            query=normalized_query,
+            result=WikipediaResult(
+                page_id=page_id,
+                title=normalized_query,
+                extract=cleaned,
+                canonical_url="",
+                wikidata_id=None,
+                revision_id=None,
+                related_titles=(),
+                categories=("semantic_consultant",),
+            ),
+            source="semantic_consultant",
+            language="ru",
+            confidence=max(0.45, min(0.74, confidence)),
+        )
 
     async def investigate(self, event: Event, query: str) -> tuple[str, ...]:
         """Use cached or newly acquired evidence when response generation reaches an impasse."""
@@ -356,7 +417,7 @@ class KnowledgeAcquisitionService:
         event: Event,
         terms: tuple[str, ...],
         *,
-        limit: int = 6,
+        limit: int = 20,
     ) -> tuple[KnowledgeConcept, ...]:
         """Study missing terms before generation, without returning source prose.
 
@@ -503,26 +564,45 @@ class KnowledgeAcquisitionService:
         self, query: str, signals: LookupSignals
     ) -> WikipediaResult | None:
         candidate_search = getattr(self.source, "search_candidates", None)
-        if callable(candidate_search):
-            candidates = tuple(await candidate_search(query, limit=5))
-        else:
-            single = await self.source.search(query)
-            candidates = (single,) if single is not None else ()
         capitalized_media_fallback: WikipediaResult | None = None
-        for result in candidates:
-            if not result.extract.strip() or not _title_matches_query(query, result.title):
-                selection_logger.info(
-                    "query=%r rejected_article=%r reason=title_or_extract_mismatch",
-                    query,
+        for search_query in _encyclopedia_query_variants(query):
+            if callable(candidate_search):
+                # MediaWiki ranking often puts an exact numbered title behind
+                # franchise/category pages.  Inspect the API maximum instead
+                # of turning a valid sixth or seventh hit into "no data".
+                candidates = tuple(await candidate_search(search_query, limit=10))
+            else:
+                single = await self.source.search(search_query)
+                candidates = (single,) if single is not None else ()
+            for result in candidates:
+                if not result.extract.strip() or not _title_matches_query(
+                    search_query,
                     result.title,
-                )
-                continue
-            media_reasons = media_article_reasons(result)
-            if media_reasons and not signals.media_context:
-                if not signals.lowercase_surface and not signals.conflict_lemma:
-                    capitalized_media_fallback = capitalized_media_fallback or result
+                ):
                     selection_logger.info(
-                        "query=%r deferred_article=%r reason=capitalized_media_fallback "
+                        "query=%r search_query=%r rejected_article=%r "
+                        "reason=title_or_extract_mismatch",
+                        query,
+                        search_query,
+                        result.title,
+                    )
+                    continue
+                media_reasons = media_article_reasons(result)
+                if media_reasons and not signals.media_context:
+                    if not signals.lowercase_surface and not signals.conflict_lemma:
+                        capitalized_media_fallback = capitalized_media_fallback or result
+                        selection_logger.info(
+                            "query=%r deferred_article=%r "
+                            "reason=capitalized_media_fallback "
+                            "media_markers=%s categories=%s",
+                            query,
+                            result.title,
+                            media_reasons,
+                            result.categories,
+                        )
+                        continue
+                    selection_logger.info(
+                        "query=%r rejected_article=%r reason=media_without_context "
                         "media_markers=%s categories=%s",
                         query,
                         result.title,
@@ -530,16 +610,7 @@ class KnowledgeAcquisitionService:
                         result.categories,
                     )
                     continue
-                selection_logger.info(
-                    "query=%r rejected_article=%r reason=media_without_context "
-                    "media_markers=%s categories=%s",
-                    query,
-                    result.title,
-                    media_reasons,
-                    result.categories,
-                )
-                continue
-            return result
+                return result
         return capitalized_media_fallback
 
     @staticmethod
@@ -595,6 +666,7 @@ def _lookup_signals(
     normalized_content = normalize_key(content)
     media_context = bool(
         set(content_lemmas(normalized_content)) & _MEDIA_CONTEXT_TERMS
+        or _looks_like_named_media_query(normalized_query)
         or any(
             re.search(rf"(?<![\w-]){re.escape(term)}(?![\w-])", normalized_content)
             for term in _MEDIA_CONTEXT_TERMS
@@ -632,6 +704,14 @@ def _dictionary_result(lexeme: DictionaryLexeme) -> WikipediaResult:
         revision_id=None,
         related_titles=(),
         categories=("dictionary",),
+    )
+
+
+def _looks_like_named_media_query(query: str) -> bool:
+    tokens = _match_tokens(query)
+    return bool(
+        any(token.isdigit() for token in tokens)
+        and any(token.isalpha() and 2 <= len(token) <= 8 for token in tokens)
     )
 
 
@@ -679,5 +759,122 @@ def _title_matches_query(query: str, title: str) -> bool:
     if len(query_key.split()) > 1:
         query_words = set(query_key.split())
         title_words = set(title_key.split())
-        return len(query_words & title_words) / max(1, len(query_words)) >= 0.8
+        if len(query_words & title_words) / max(1, len(query_words)) >= 0.8:
+            return True
+    query_tokens = _match_tokens(query)
+    title_tokens = _match_tokens(title)
+    alpha_query = tuple(item for item in query_tokens if item.isalpha())
+    numeric_query = tuple(item for item in query_tokens if item.isdigit())
+    title_words = tuple(
+        item for item in title_tokens if item.isalpha() and len(item) > 1
+    )
+    if len(alpha_query) == 1 and 2 <= len(alpha_query[0]) <= 12 and title_words:
+        query_acronym = normalize_abbreviation(alpha_query[0])
+        query_forms = {query_acronym, _latinize_acronym(query_acronym)}
+        title_acronyms = set(generated_abbreviation_aliases(title))
+        title_acronyms.add("".join(item[0] for item in title_words))
+        title_forms = {
+            form
+            for acronym in title_acronyms
+            for form in (
+                normalize_abbreviation(acronym),
+                _latinize_acronym(normalize_abbreviation(acronym)),
+            )
+        }
+        number_matches = not numeric_query or all(
+            any(_number_equivalent(number, item) for item in title_tokens)
+            for number in numeric_query
+        )
+        if query_forms & title_forms and number_matches:
+            return True
     return False
+
+
+_MATCH_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+")
+_CYRILLIC_ACRONYM_TO_LATIN = {
+    "а": "a",
+    "б": "b",
+    "в": "v",
+    "г": "g",
+    "д": "d",
+    "е": "e",
+    "ж": "z",
+    "з": "z",
+    "и": "i",
+    "к": "k",
+    "л": "l",
+    "м": "m",
+    "н": "n",
+    "о": "o",
+    "п": "p",
+    "р": "r",
+    "с": "s",
+    "т": "t",
+    "у": "u",
+    "ф": "f",
+    "х": "h",
+    "ц": "c",
+    "ч": "c",
+    "ш": "s",
+    "щ": "s",
+    "ы": "y",
+    "э": "e",
+    "ю": "u",
+    "я": "a",
+}
+_ROMAN_NUMBERS = {
+    "i": 1,
+    "ii": 2,
+    "iii": 3,
+    "iv": 4,
+    "v": 5,
+    "vi": 6,
+    "vii": 7,
+    "viii": 8,
+    "ix": 9,
+    "x": 10,
+}
+
+
+def _encyclopedia_query_variants(query: str) -> tuple[str, ...]:
+    normalized = normalize_key(query)
+    tokens = normalized.split()
+    mentioned = frozenset(abbreviation_mentions(query))
+    converted = tuple(
+        _latinize_acronym(token)
+        if (
+            token in mentioned or is_abbreviation_candidate(token)
+        )
+        and token.isalpha()
+        and 2 <= len(token) <= 12
+        else token
+        for token in tokens
+    )
+    latinized = " ".join(converted)
+    return tuple(dict.fromkeys(item for item in (normalized, latinized) if item))
+
+
+def _match_tokens(value: str) -> tuple[str, ...]:
+    return tuple(
+        item.casefold().replace("ё", "е")
+        for item in _MATCH_TOKEN_RE.findall(value)
+    )
+
+
+def _latinize_acronym(value: str) -> str:
+    normalized = value.casefold().replace("ё", "е")
+    if normalized.isascii():
+        return normalized
+    return "".join(
+        _CYRILLIC_ACRONYM_TO_LATIN.get(character, character)
+        for character in normalized
+    )
+
+
+def _number_equivalent(number: str, candidate: str) -> bool:
+    expected = int(number)
+    normalized = candidate.casefold()
+    return (
+        candidate.isdigit() and int(candidate) == expected
+        or _ROMAN_NUMBERS.get(normalized) == expected
+    )

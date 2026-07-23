@@ -58,6 +58,10 @@ _STUDY_PREDICATES = frozenset({"изучить", "исследовать", "уз
 _POSITION_EXPRESSION_PREDICATES = frozenset(
     {"сказать", "высказать", "выразить", "поделиться"}
 )
+_ADDRESSEE_POSSESSIVES = frozenset({"твой", "ваш"})
+_DIALOGUE_REFERENCE_NOUNS = frozenset(
+    {"ответ", "реплика", "сообщение", "слово", "фраза", "вопрос"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +148,10 @@ def analyze_dialogue_act(
         else support_clause
     )
     subject = (
-        _first_lemma(structure, semantic_clause.subject_indices)
+        (
+            _first_lemma(structure, semantic_clause.subject_indices)
+            or semantic_clause.implicit_subject
+        )
         if semantic_clause
         else None
     )
@@ -157,11 +164,20 @@ def analyze_dialogue_act(
     )
     objects = (
         tuple(
-            structure.tokens[index].surface.casefold()
+            dict.fromkeys(
+                structure.tokens[index].surface.casefold()
             for index in (
                 *semantic_clause.direct_object_indices,
                 *semantic_clause.indirect_object_indices,
                 *semantic_clause.predicate_complement_indices,
+                    *(
+                        index
+                        for complement in semantic_clause.complements
+                        for index in complement.object_indices
+                        if structure.tokens[index].semantic_role
+                        == "unassigned_content"
+                    ),
+            )
             )
         )
         if semantic_clause is not None
@@ -175,6 +191,20 @@ def analyze_dialogue_act(
     # than requesting a dictionary fact about its last noun.
     pragmatic_functions = pragmatics.functions
     topical = content_lemmas(structure.text)
+    understanding_challenge = _understanding_challenge(structure)
+    if understanding_challenge:
+        return DialogueActFrame(
+            kind="understanding_challenge",
+            response_obligation="acknowledge_understanding",
+            subject="addressee",
+            predicate="понять",
+            objects=("намёк",),
+            polarity=0.0,
+            register=register,
+            complete=True,
+            confidence=max(0.86, structure.confidence * 0.94),
+            evidence=("construction:do_not_pretend_not_to_understand",),
+        )
     if "rhetorical_challenge" in pragmatic_functions and predicate is not None:
         return DialogueActFrame(
             kind="rhetorical_challenge",
@@ -390,9 +420,37 @@ def analyze_dialogue_act(
             confidence=max(0.70, structure.confidence * 0.78 + negative * 0.22),
             evidence=("negative_social_evidence",),
         )
+    reference = next(
+        (
+            token
+            for token in structure.tokens
+            if token.lemma in _DIALOGUE_REFERENCE_NOUNS
+        ),
+        None,
+    )
+    if (
+        predicate is None
+        and reference is not None
+        and any(token.lemma in _ADDRESSEE_POSSESSIVES for token in structure.tokens)
+    ):
+        return DialogueActFrame(
+            kind="dialogue_reference_fragment",
+            response_obligation="acknowledge_reference",
+            subject="addressee",
+            predicate=None,
+            objects=(reference.surface.casefold(),),
+            polarity=0.0,
+            register=register,
+            complete=True,
+            confidence=max(0.70, structure.confidence * 0.86),
+            evidence=("elliptical_reference_to_agent_utterance",),
+        )
     compound_directive = _compound_study_position_directive(structure, register)
     if compound_directive is not None:
         return compound_directive
+    study_directive = _study_directive(structure, register)
+    if study_directive is not None:
+        return study_directive
     if clause is not None and clause.clause_kind == "command":
         return DialogueActFrame(
             kind="directive",
@@ -489,6 +547,48 @@ def dialogue_act_thought(frame: DialogueActFrame) -> ClauseThought | None:
 
     if not frame.complete:
         return None
+    if frame.response_obligation == "acknowledge_understanding":
+        return ClauseThought(
+            predicate=ConceptLexeme(
+                "понять",
+                "понял",
+                "verb",
+                (("tense", "past"), ("number", "singular"), ("gender", "masculine")),
+            ),
+            dependencies=(
+                SemanticDependency(
+                    "subject",
+                    ConceptArgument(
+                        ConceptLexeme(
+                            "я",
+                            "я",
+                            "pronoun",
+                            (("number", "singular"), ("person", "first")),
+                        )
+                    ),
+                ),
+                SemanticDependency(
+                    "direct_object",
+                    ConceptArgument(
+                        ConceptLexeme(
+                            "намёк",
+                            "намёк",
+                            "noun",
+                            (
+                                ("case", "accusative"),
+                                ("number", "singular"),
+                                ("gender", "masculine"),
+                                ("animacy", "inanimate"),
+                            ),
+                        ),
+                        grammatical_case="accusative",
+                    ),
+                ),
+            ),
+            response_polarity=True,
+            confidence=frame.confidence,
+            evidence=("acknowledge_understanding",),
+        )
     if frame.response_obligation == "acknowledge_evaluation":
         return ClauseThought(
             predicate=ConceptLexeme(
@@ -585,7 +685,89 @@ def dialogue_act_thought(frame: DialogueActFrame) -> ClauseThought | None:
             confidence=frame.confidence,
             evidence=("repair_previous_answer",),
         )
+    if frame.response_obligation in {"continue_topic", "acknowledge_reference"}:
+        return ClauseThought(
+            predicate=ConceptLexeme(
+                "понять",
+                "понял",
+                "verb",
+                (("tense", "past"), ("number", "singular"), ("gender", "masculine")),
+            ),
+            dependencies=(
+                SemanticDependency(
+                    "subject",
+                    ConceptArgument(
+                        ConceptLexeme(
+                            "я",
+                            "я",
+                            "pronoun",
+                            (("number", "singular"), ("person", "first")),
+                        )
+                    ),
+                ),
+                SemanticDependency(
+                    "direct_object",
+                    ConceptArgument(
+                        ConceptLexeme(
+                            "ты",
+                            "тебя",
+                            "pronoun",
+                            (("number", "singular"), ("person", "second")),
+                        ),
+                        grammatical_case="accusative",
+                    ),
+                ),
+            ),
+            confidence=frame.confidence,
+            evidence=(
+                (
+                    "acknowledge_dialogue_reference",
+                )
+                if frame.response_obligation == "acknowledge_reference"
+                else ("continue_understood_topic",)
+            ),
+        )
     return None
+
+
+def _understanding_challenge(structure: StructuredUtterance) -> bool:
+    """Recognize ``не делай вид, что не понял`` as a social correction."""
+
+    clauses = {clause.clause_index: clause for clause in structure.clauses}
+    for link in structure.clause_links:
+        if not link.relation.startswith("ccomp"):
+            continue
+        parent = clauses.get(link.parent_clause_index)
+        child = clauses.get(link.child_clause_index)
+        if parent is None or child is None:
+            continue
+        parent_predicate = (
+            structure.tokens[parent.predicate_index].lemma
+            if parent.predicate_index is not None
+            else parent.implicit_predicate
+        )
+        child_predicate = (
+            structure.tokens[child.predicate_index].lemma
+            if child.predicate_index is not None
+            else child.implicit_predicate
+        )
+        parent_objects = {
+            structure.tokens[index].lemma
+            for index in (
+                *parent.direct_object_indices,
+                *parent.predicate_complement_indices,
+            )
+        }
+        if (
+            parent.clause_kind == "command"
+            and parent.negated
+            and parent_predicate == "делать"
+            and "вид" in parent_objects
+            and child_predicate == "понять"
+            and child.negated
+        ):
+            return True
+    return False
 
 
 def candidate_obligation_fit(
@@ -682,6 +864,23 @@ def candidate_obligation_fit(
             + position_content * 0.12
             + overlap * 0.10,
         )
+    if obligation == "study_and_answer":
+        completed = {
+            str(item).casefold().replace("-", "_")
+            for item in metadata.get("completed_subgoals", ())
+            if isinstance(item, str)
+        }
+        has_study = "study" in completed
+        has_answer = "answer" in completed
+        knowledge_content = bool(metadata.get("knowledge_component"))
+        return min(
+            1.0,
+            0.04
+            + has_study * 0.34
+            + has_answer * 0.34
+            + knowledge_content * 0.18
+            + overlap * 0.10,
+        )
     if obligation == "resolve_self_state":
         if not first_person:
             return 0.08 + (move == "answer") * 0.08
@@ -757,6 +956,7 @@ def candidate_fulfills_obligation(
         "resolve_relation": 0.48,
         "answer_question": 0.54,
         "study_and_express_position": 0.72,
+        "study_and_answer": 0.72,
         "acknowledge_evaluation": 0.48,
         "address_negative_evaluation": 0.48,
     }.get(frame.response_obligation, 0.42)
@@ -863,6 +1063,49 @@ def _compound_study_position_directive(
     )
 
 
+def _study_directive(
+    structure: StructuredUtterance,
+    register: str,
+) -> DialogueActFrame | None:
+    commands = tuple(
+        clause
+        for clause in structure.clauses
+        if clause.clause_kind == "command"
+        and clause.predicate_index is not None
+        and structure.tokens[clause.predicate_index].lemma in _STUDY_PREDICATES
+    )
+    if not commands:
+        return None
+    topics = tuple(
+        dict.fromkeys(
+            structure.tokens[index].surface.casefold()
+            for clause in commands
+            for index in _study_topic_indices(structure, clause.clause_index)
+            if structure.tokens[index].lemma
+            not in {
+                "что",
+                "такой",
+                "ответить",
+                "рассказать",
+                "объяснить",
+                "сказать",
+            }
+        )
+    )
+    return DialogueActFrame(
+        kind="study_directive",
+        response_obligation="study_and_answer",
+        subject="addressee",
+        predicate="изучить",
+        objects=topics,
+        polarity=0.0,
+        register=register,
+        complete=bool(topics),
+        confidence=max(0.86, structure.confidence * 0.94),
+        evidence=("subgoal:study", "subgoal:answer"),
+    )
+
+
 def _study_topic_indices(
     structure: StructuredUtterance,
     study_clause_index: int,
@@ -885,7 +1128,14 @@ def _study_topic_indices(
         )
         if structure.tokens[index].semantic_role not in {"question_target", "function_word"}
     )
-    return tuple(dict.fromkeys((*direct, *subordinate_arguments)))
+    unassigned_content = tuple(
+        token.index
+        for token in structure.tokens[clause.token_start : clause.token_end]
+        if token.semantic_role == "unassigned_content"
+    )
+    return tuple(
+        dict.fromkeys((*direct, *subordinate_arguments, *unassigned_content))
+    )
 
 
 def _first_lemma(structure: StructuredUtterance, indices: tuple[int, ...]) -> str | None:

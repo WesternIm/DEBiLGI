@@ -55,7 +55,11 @@ def assess_response_alignment(
     candidate_terms.update(
         token.casefold().replace("ё", "е")
         for token in tokenize(candidate_text)
-        if token.casefold().replace("ё", "е") in _FIXED_PRONOUN_FOCUS
+        if (
+            token.casefold().replace("ё", "е") in _FIXED_PRONOUN_FOCUS
+            or token.isdigit()
+            or token.isalnum() and len(token) <= 5
+        )
     )
     matched_focus = tuple(
         item
@@ -128,6 +132,11 @@ def _question_focus(
         and (
             token.part_of_speech in _FOCUS_PARTS
             or token.lemma in _FIXED_PRONOUN_FOCUS
+            or token.semantic_role == "unassigned_content"
+            or (
+                token.part_of_speech is None
+                and token.semantic_role.startswith("complement:")
+            )
         )
         and token.semantic_role not in {"function_word", "vocative"}
     )

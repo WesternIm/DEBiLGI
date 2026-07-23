@@ -12,6 +12,14 @@ from debilgi.events.models import Event, EventType
 from debilgi.experience.consolidation import ExperienceConsolidator
 from debilgi.language.context_gate import WorkingMemoryContextGate
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
+from debilgi.language.productive_nlg import (
+    ClauseThought,
+    ConceptArgument,
+    ConceptLexeme,
+    DependencyPattern,
+    SemanticDependency,
+    realize_thought,
+)
 from debilgi.language.tokenizer import canonical_chat_tokens
 from debilgi.storage.database import Database
 
@@ -119,24 +127,251 @@ class ShortActResolution:
     target_content: str | None
     interpretation: str
 
-    def reply_text(self) -> str:
-        if self.kind == "confirmation":
-            return "Понял. Значит, предыдущая формулировка была принята собеседником."
-        if self.kind == "rejection":
-            return "Принял поправку: предыдущая формулировка не подошла. Пересоберу вывод."
-        if self.kind == "continue":
-            if self.target_content:
-                excerpt = " ".join(self.target_content.split())[:180].rstrip(" ,;:—-")
-                return (
-                    f"Продолжу от предыдущей мысли: «{excerpt}». "
-                    "Дальше могу раскрыть причину, пример или последствия."
+    def reply_text(self) -> str | None:
+        """Realize the detected act from semantic roles, without a reply bank."""
+
+        thought = _short_act_thought(self)
+        if thought is None:
+            return None
+        pattern = DependencyPattern(
+            tuple(
+                role
+                for role in ("subject", "predicate", "direct_object", "topic")
+                if role == "predicate"
+                or any(item.role == role for item in thought.dependencies)
+            ),
+            clause_kind=thought.clause_kind,
+            confidence=0.99,
+            evidence_count=1,
+            source="short_act_semantics",
+        )
+        surfaces = realize_thought(thought, (pattern,))
+        selected = next(
+            (item for item in surfaces if item.source == "productive_grammar"),
+            surfaces[0] if surfaces else None,
+        )
+        return selected.text if selected is not None else None
+
+
+def _short_act_thought(resolution: ShortActResolution) -> ClauseThought | None:
+    if resolution.kind == "confirmation":
+        return _first_person_statement(
+            lemma="понять",
+            surface="понял",
+            tense="past",
+            direct_object=ConceptArgument(
+                ConceptLexeme(
+                    "ты",
+                    "тебя",
+                    "pronoun",
+                    (("number", "singular"), ("person", "second")),
+                ),
+                grammatical_case="accusative",
+            ),
+            evidence="accepted_previous_response",
+        )
+    if resolution.kind == "rejection":
+        return _first_person_statement(
+            lemma="пересобрать",
+            surface="пересоберу",
+            tense="future",
+            direct_object=_noun_argument(
+                "ответ",
+                "ответ",
+                grammatical_case="accusative",
+                gender="masculine",
+            ),
+            evidence="revise_rejected_response",
+        )
+    if resolution.kind == "continue":
+        return _first_person_statement(
+            lemma="продолжить",
+            surface="продолжу",
+            tense="future",
+            direct_object=_noun_argument(
+                "мысль",
+                "мысль",
+                grammatical_case="accusative",
+                gender="feminine",
+            ),
+            evidence="continue_bound_topic",
+        )
+    if resolution.kind == "reaction":
+        return _first_person_statement(
+            lemma="услышать",
+            surface="услышал",
+            tense="past",
+            direct_object=ConceptArgument(
+                ConceptLexeme(
+                    "ты",
+                    "тебя",
+                    "pronoun",
+                    (("number", "singular"), ("person", "second")),
+                ),
+                grammatical_case="accusative",
+            ),
+            evidence="acknowledge_reaction",
+        )
+    if resolution.coreference_to_bot and resolution.target_message_id is not None:
+        return ClauseThought(
+            predicate=ConceptLexeme(
+                "относиться",
+                "относится",
+                "verb",
+                (("tense", "present"), ("number", "singular"), ("person", "third")),
+            ),
+            dependencies=(
+                SemanticDependency(
+                    "subject",
+                    ConceptArgument(
+                        ConceptLexeme(
+                            "это",
+                            "это",
+                            "pronoun",
+                            (("case", "nominative"), ("number", "singular")),
+                        )
+                    ),
+                ),
+                SemanticDependency(
+                    "topic",
+                    _noun_argument(
+                        "ответ",
+                        "ответ",
+                        grammatical_case="dative",
+                        preposition="к",
+                        gender="masculine",
+                        modifiers=(
+                            ConceptLexeme(
+                                "мой",
+                                "моему",
+                                "adjective",
+                                (
+                                    ("case", "dative"),
+                                    ("number", "singular"),
+                                    ("gender", "masculine"),
+                                ),
+                            ),
+                            ConceptLexeme(
+                                "предыдущий",
+                                "предыдущему",
+                                "adjective",
+                                (
+                                    ("case", "dative"),
+                                    ("number", "singular"),
+                                    ("gender", "masculine"),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            clause_kind="question",
+            focus_role="topic",
+            confidence=0.80,
+            evidence=("resolve_reference_to_previous_bot_turn",),
+        )
+    return ClauseThought(
+        predicate=ConceptLexeme(
+            "продолжать",
+            "продолжает",
+            "verb",
+            (("tense", "present"), ("number", "singular"), ("person", "third")),
+        ),
+        dependencies=(
+            SemanticDependency(
+                "subject",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "это",
+                        "это",
+                        "pronoun",
+                        (("case", "nominative"), ("number", "singular")),
+                    )
+                ),
+            ),
+            SemanticDependency(
+                "direct_object",
+                _noun_argument(
+                    "мысль",
+                    "мысль",
+                    grammatical_case="accusative",
+                    gender="feminine",
+                    modifiers=(
+                        ConceptLexeme(
+                            "предыдущий",
+                            "предыдущую",
+                            "adjective",
+                            (
+                                ("case", "accusative"),
+                                ("number", "singular"),
+                                ("gender", "feminine"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        clause_kind="question",
+        focus_role="direct_object",
+        confidence=0.68,
+        evidence=("resolve_ambiguous_short_act",),
+    )
+
+
+def _first_person_statement(
+    *,
+    lemma: str,
+    surface: str,
+    tense: str,
+    evidence: str,
+    direct_object: ConceptArgument | None = None,
+) -> ClauseThought:
+    dependencies = [
+        SemanticDependency(
+            "subject",
+            ConceptArgument(
+                ConceptLexeme(
+                    "я",
+                    "я",
+                    "pronoun",
+                    (("case", "nominative"), ("number", "singular"), ("person", "first")),
                 )
-            return "Продолжу, но сначала нужен предыдущий предмет разговора."
-        if self.kind == "reaction":
-            return "Услышал реакцию. Предыдущую мысль пока не меняю."
-        if self.coreference_to_bot and self.target_message_id is not None:
-            return "Ты про мой предыдущий ответ?"
-        return "Это продолжение предыдущей мысли?"
+            ),
+        )
+    ]
+    if direct_object is not None:
+        dependencies.append(SemanticDependency("direct_object", direct_object))
+    return ClauseThought(
+        predicate=ConceptLexeme(
+            lemma,
+            surface,
+            "verb",
+            (("tense", tense), ("number", "singular"), ("person", "first")),
+        ),
+        dependencies=tuple(dependencies),
+        confidence=0.92,
+        evidence=(evidence,),
+    )
+
+
+def _noun_argument(
+    lemma: str,
+    surface: str,
+    *,
+    grammatical_case: str,
+    preposition: str | None = None,
+    gender: str | None = None,
+    modifiers: tuple[ConceptLexeme, ...] = (),
+) -> ConceptArgument:
+    features = [("number", "singular")]
+    if gender is not None:
+        features.append(("gender", gender))
+    return ConceptArgument(
+        ConceptLexeme(lemma, surface, "noun", tuple(features)),
+        modifiers,
+        preposition=preposition,
+        grammatical_case=grammatical_case,
+    )
 
 
 def detect_short_speech_act(text: str, *, maximum_words: int = 3) -> ShortActDetection | None:

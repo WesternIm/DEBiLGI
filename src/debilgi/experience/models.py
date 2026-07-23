@@ -24,10 +24,6 @@ class PreparedReply:
     arbitration_decision_id: str | None = None
     winner_candidate_id: str | None = None
     arbitration_weight_version: int = 0
-    semantic_plan_id: str | None = None
-    processing_outcome_type: str = "replied"
-    failure_stage: str | None = None
-    failure_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

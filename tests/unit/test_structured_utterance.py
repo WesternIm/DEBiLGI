@@ -100,6 +100,15 @@ def test_marks_server_slang_without_turning_it_into_a_response_template() -> Non
     assert "contextual_lexicon:server_slang" in analysis.niche_signals
 
 
+def test_marks_abbreviation_as_a_named_semantic_object() -> None:
+    analysis = analyze_structured_utterance("ИИ анализирует текст")
+    token = analysis.tokens[0]
+
+    assert token.lemma == "ии"
+    assert token.entity_kind == "abbreviation"
+    assert "abbreviation:ии" in analysis.niche_signals
+
+
 def test_detects_attention_ellipsis_and_nominal_copula() -> None:
     attention = analyze_structured_utterance("ауу")
     nominal = analyze_structured_utterance("ну ты гений?")
@@ -188,6 +197,22 @@ def test_preposed_accusative_is_an_object_not_a_second_subject() -> None:
         analysis.tokens[index].lemma for index in frame.direct_object_indices
     ) == ("ты",)
     assert analysis.tokens[frame.predicate_index].lemma == "спрашивать"
+
+
+def test_preposed_instrumental_object_follows_predicate_government() -> None:
+    analysis = analyze_structured_utterance("Ты кусачками пользуешься?")
+    frame = analysis.clauses[0]
+
+    assert tuple(
+        analysis.tokens[index].lemma for index in frame.direct_object_indices
+    ) == ("кусачки",)
+    assert analysis.tokens[frame.predicate_index].lemma == "пользоваться"
+    assert any(
+        analysis.tokens[arc.head_index].lemma == "пользоваться"
+        and analysis.tokens[arc.dependent_index].lemma == "кусачки"
+        and arc.relation == "obj"
+        for arc in analysis.dependencies
+    )
 
 
 def test_subordinate_question_word_does_not_turn_statement_into_question() -> None:
@@ -288,6 +313,66 @@ def test_control_and_modal_infinitives_keep_their_own_objects() -> None:
     assert tuple(
         modal.tokens[index].lemma for index in modal_frame.direct_object_indices
     ) == ("мнение", "позиция")
+
+
+def test_subordinate_content_marker_is_not_an_embedded_question_target() -> None:
+    structure = analyze_structured_utterance(
+        "Ой бля, не делай вид, что ты не понял, ахахахах"
+    )
+
+    child = structure.clauses[1]
+    laughter = next(token for token in structure.tokens if token.surface == "ахахахах")
+    marker = next(token for token in structure.tokens if token.surface == "что")
+
+    assert child.clause_kind == "statement"
+    assert child.question_target_index is None
+    assert marker.semantic_role == "function_word"
+    assert laughter.semantic_role == "pragmatic_marker"
+    assert laughter.index not in child.direct_object_indices
+    assert "amusement" in laughter.pragmatic_functions
+
+
+def test_subordinate_clauses_work_before_and_after_the_matrix_clause() -> None:
+    preposed = analyze_structured_utterance(
+        "Если дождь закончится, мы выйдем."
+    )
+    postposed = analyze_structured_utterance(
+        "Мы остались, потому что шёл дождь."
+    )
+
+    assert any(
+        link.parent_clause_index == 1
+        and link.child_clause_index == 0
+        and link.relation == "advcl:condition"
+        for link in preposed.clause_links
+    )
+    assert preposed.clauses[0].clause_kind == "statement"
+    assert any(
+        link.parent_clause_index == 0
+        and link.child_clause_index == 1
+        and link.relation == "advcl:cause"
+        for link in postposed.clause_links
+    )
+    assert postposed.clauses[1].clause_kind == "statement"
+    assert postposed.clauses[1].question_target_index is None
+
+
+def test_alternative_and_contrastive_conjunctions_link_whole_clauses() -> None:
+    alternative = analyze_structured_utterance(
+        "Ты остаёшься или мы уходим?"
+    )
+    contrast = analyze_structured_utterance(
+        "Я согласился, однако он отказался."
+    )
+
+    assert any(
+        link.relation == "coord:alternative"
+        for link in alternative.clause_links
+    )
+    assert any(
+        link.relation == "coord:contrast"
+        for link in contrast.clause_links
+    )
 
 
 def test_dative_experiencer_and_nominative_stimulus_are_not_swapped() -> None:

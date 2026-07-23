@@ -197,3 +197,87 @@ async def test_lexical_cache_does_not_replace_full_utterance_intent(
 
     assert result is not None
     assert provider.calls == 2
+
+
+async def test_research_lexeme_returns_only_topical_facts(database: Database) -> None:
+    class ResearchConsultant(_Consultant):
+        async def consult(self, request: ConsultationRequest) -> ConsultationResult:
+            self.calls += 1
+            assert request.mode == "lexical"
+            assert request.unknown_terms == ("рэпер",)
+            return ConsultationResult.from_payload(
+                {
+                    "interpretation": "Пользователь просит определить значение понятия.",
+                    "intent": "lexical_definition",
+                    "facts": [
+                        "Рэпер — исполнитель рэпа, работающий с ритмическим речитативом.",
+                        "Небо бывает голубым.",
+                    ],
+                    "confidence": 0.82,
+                },
+                provider="fake-puter",
+                model="fake-model",
+            )
+
+    provider = ResearchConsultant()
+    service = SemanticConsultationService(database, provider, enabled=True)
+
+    facts = await service.research_lexeme(
+        event_id="discord:research",
+        guild_id=1,
+        channel_id=10,
+        term="рэпер",
+    )
+
+    assert facts == (
+        "Рэпер — исполнитель рэпа, работающий с ритмическим речитативом.",
+    )
+    assert provider.calls == 1
+
+
+async def test_research_question_uses_a_distinct_mode_and_returns_answer_facts(
+    database: Database,
+) -> None:
+    class WholeRequestResearchConsultant(_Consultant):
+        async def consult(self, request: ConsultationRequest) -> ConsultationResult:
+            self.calls += 1
+            assert request.mode == "research"
+            assert request.prompt == "Сколько сердец у осьминога?"
+            assert request.unknown_terms == ()
+            return ConsultationResult.from_payload(
+                {
+                    "interpretation": "Фактический вопрос об анатомии осьминога.",
+                    "intent": "fact_question",
+                    "facts": [
+                        "У осьминога три сердца.",
+                        "Небо выглядит голубым.",
+                        "Пользователь просит ответить на вопрос об осьминоге.",
+                    ],
+                    "confidence": 0.84,
+                },
+                provider="fake-puter",
+                model="fake-model",
+            )
+
+    provider = WholeRequestResearchConsultant()
+    service = SemanticConsultationService(database, provider, enabled=True)
+
+    facts = await service.research_question(
+        event_id="discord:whole-request-research",
+        guild_id=1,
+        channel_id=10,
+        prompt="Сколько сердец у осьминога?",
+        subject_terms=("осьминог", "сердце"),
+    )
+
+    assert facts == ("У осьминога три сердца.",)
+    assert provider.calls == 1
+    row = await database.fetchone(
+        """SELECT mode, reason_codes_json
+           FROM language_semantic_consultations
+           WHERE event_id = ?""",
+        ("discord:whole-request-research",),
+    )
+    assert row is not None
+    assert row["mode"] == "research"
+    assert "foreground_answer_research" in str(row["reason_codes_json"])

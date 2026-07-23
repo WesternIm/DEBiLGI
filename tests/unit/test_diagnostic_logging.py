@@ -20,7 +20,6 @@ def test_separate_diagnostic_log_files_are_created(tmp_path: Path) -> None:
         "debilgi.structured_utterance": "structured-utterance.log",
         "debilgi.sense_resolution": "sense-resolution.log",
         "debilgi.meaning_plan": "meaning-plan.log",
-        "debilgi.semantic_reply_plan": "semantic-reply-plan.log",
         "debilgi.dialogue_state": "dialogue-state.log",
     }
     try:

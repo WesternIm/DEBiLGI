@@ -155,7 +155,7 @@ async def test_ambiguous_short_phrase_is_logged_without_false_feedback(tmp_path:
 
         assert resolution is not None
         assert resolution.kind == "ambiguous"
-        assert resolution.reply_text() == "Это продолжение предыдущей мысли?"
+        assert resolution.reply_text() == "Это продолжает предыдущую мысль?"
         assert experience.calls == []
         assert dataset.calls == []
     finally:

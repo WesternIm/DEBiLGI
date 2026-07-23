@@ -32,6 +32,7 @@ from debilgi.knowledge.policy import KnowledgeQueryPolicy
 from debilgi.knowledge.repository import KnowledgeRepository
 from debilgi.knowledge.service import KnowledgeAcquisitionService
 from debilgi.knowledge.wikipedia import WikipediaClient
+from debilgi.language.abstract_reasoning import AbstractReasoningService
 from debilgi.language.arbitration_repository import ArbitrationRepository
 from debilgi.language.archive_importer import ArchiveImporter, ArchiveImportManager
 from debilgi.language.archive_repository import ArchiveRepository
@@ -168,6 +169,7 @@ class DebilgiBot(commands.Bot):
             self.lexicon,
             self.russian_reference_client,
             enabled=settings.russian_reference_enabled,
+            worker_count=settings.russian_reference_workers,
         )
         self.morphology = MorphologyRepository(database)
         self.neologisms = NeologismRepository(
@@ -207,6 +209,7 @@ class DebilgiBot(commands.Bot):
         )
         self.position_repository = PositionRepository(database)
         self.position_reasoning = PositionReasoningService(self.position_repository)
+        self.abstract_reasoning = AbstractReasoningService(database)
         self.lexical_usage_learning = LexicalUsageLearningService(database, self.self_dataset)
         self.utterance_understandings = UtteranceUnderstandingRepository(database)
         self.context_gate = WorkingMemoryContextGate(
@@ -303,6 +306,7 @@ class DebilgiBot(commands.Bot):
             enabled=settings.background_enabled,
             interval=timedelta(seconds=settings.background_interval_seconds),
             words_per_cycle=settings.background_words_per_cycle,
+            study_worker_count=settings.background_study_workers,
             maximum_study_attempts=settings.background_max_study_attempts,
             wikipedia_enabled=settings.wikipedia_enabled,
             # The external teacher may expand abstract constructions only
@@ -310,6 +314,7 @@ class DebilgiBot(commands.Bot):
             # never forwards a generated answer from Puter.
             semantic_consultant=self.semantic_consultant,
             causal_reasoning=self.causal_reasoning,
+            abstract_reasoning=self.abstract_reasoning,
             graph_decay_daily_rate=settings.background_graph_decay_daily_rate,
             self_check_every_cycles=settings.background_self_check_cycles,
             initiative_enabled=(
@@ -320,7 +325,7 @@ class DebilgiBot(commands.Bot):
                 minutes=settings.background_initiative_cooldown_minutes
             ),
         )
-        self.lexicon.set_semantic_study_notifier(
+        self.lexicon.set_study_notifier(
             self.background_learning.wake_for_study
         )
         self.reply_service = SafeMentionReplyService(
@@ -352,11 +357,12 @@ class DebilgiBot(commands.Bot):
             understanding_repository=self.utterance_understandings,
             arbitration_repository=self.arbitration_repository,
             context_gate=self.context_gate,
-            # External analysis is a background teacher only. Live replies
-            # are selected and realized from durable local knowledge.
-            semantic_consultant=None,
+            # The consultant teaches structured facts when local sources are
+            # exhausted. Its ready-made wording is still never surfaced.
+            semantic_consultant=self.semantic_consultant,
             semantic_assimilation=self.semantic_assimilation,
             position_reasoning=self.position_reasoning,
+            abstract_reasoning=self.abstract_reasoning,
             arbitration_mode=settings.arbitration_mode,
             arbitration_minimum_score=settings.arbitration_minimum_score,
             arbitration_max_total_candidates=(

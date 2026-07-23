@@ -22,6 +22,7 @@ from debilgi.autonomy.repository import AutonomyRepository
 from debilgi.dataset.self_dataset import SelfDatasetRepository
 from debilgi.knowledge.policy import media_article_reasons
 from debilgi.knowledge.wikipedia import WikipediaClient
+from debilgi.language.abstract_reasoning import AbstractReasoningService
 from debilgi.language.causal_reasoning import CausalReasoningRepository
 from debilgi.language.character_markov import normalize_word
 from debilgi.language.content import content_lemmas
@@ -71,6 +72,7 @@ class BackgroundCycleStats:
     decayed_edges: int = 0
     memory_items_maintained: int = 0
     conflicts_found: int = 0
+    mental_relations_elaborated: int = 0
     identity_checks: int = 0
     initiative_queued: int = 0
     initiative_sent: int = 0
@@ -106,10 +108,12 @@ class BackgroundLearningService:
         enabled: bool = False,
         interval: timedelta = timedelta(minutes=10),
         words_per_cycle: int = 5,
+        study_worker_count: int = 4,
         maximum_study_attempts: int = 4,
         wikipedia_enabled: bool = False,
         semantic_consultant: SemanticConsultationService | None = None,
         causal_reasoning: CausalReasoningRepository | None = None,
+        abstract_reasoning: AbstractReasoningService | None = None,
         graph_decay_daily_rate: float = 0.015,
         self_check_every_cycles: int = 6,
         initiative_enabled: bool = False,
@@ -119,7 +123,12 @@ class BackgroundLearningService:
     ) -> None:
         if interval.total_seconds() <= 0 or initiative_cooldown.total_seconds() <= 0:
             raise ValueError("background timing values must be positive")
-        if words_per_cycle <= 0 or maximum_study_attempts <= 0 or self_check_every_cycles <= 0:
+        if (
+            words_per_cycle <= 0
+            or study_worker_count <= 0
+            or maximum_study_attempts <= 0
+            or self_check_every_cycles <= 0
+        ):
             raise ValueError("background cycle limits must be positive")
         if not 0.0 <= graph_decay_daily_rate <= 1.0:
             raise ValueError("graph decay rate must be between zero and one")
@@ -137,10 +146,12 @@ class BackgroundLearningService:
         self.enabled = enabled
         self.interval = interval
         self.words_per_cycle = words_per_cycle
+        self.study_worker_count = min(study_worker_count, 16)
         self.maximum_study_attempts = maximum_study_attempts
         self.wikipedia_enabled = wikipedia_enabled
         self._semantic_consultant = semantic_consultant
         self._causal_reasoning = causal_reasoning
+        self._abstract_reasoning = abstract_reasoning
         self.graph_decay_daily_rate = graph_decay_daily_rate
         self.self_check_every_cycles = self_check_every_cycles
         self.initiative_enabled = initiative_enabled
@@ -198,6 +209,14 @@ class BackgroundLearningService:
                     await self._causal_reasoning.rebuild_knowledge(
                         limit=max(100, self.words_per_cycle * 20)
                     )
+                mental_relations = (
+                    await self._abstract_reasoning.background_elaborate(
+                        limit=max(4, self.words_per_cycle * 2),
+                        observed_at=started,
+                    )
+                    if self._abstract_reasoning is not None
+                    else 0
+                )
                 decayed = await self._decay_graph(started)
                 memory_items = await self._long_term_memory.maintain(started)
                 conflicts = await self._find_conflicts(started)
@@ -215,6 +234,7 @@ class BackgroundLearningService:
                     decayed_edges=decayed,
                     memory_items_maintained=memory_items,
                     conflicts_found=conflicts,
+                    mental_relations_elaborated=mental_relations,
                     identity_checks=identity_checks,
                     initiative_queued=queued,
                     initiative_sent=sent,
@@ -223,7 +243,7 @@ class BackgroundLearningService:
                 logger.info(
                     "cycle=%s status=completed processed=%d found=%d missing=%d "
                     "decayed_edges=%d memory_items=%d conflicts=%d identity_checks=%d "
-                    "initiative_queued=%d initiative_sent=%d",
+                    "mental_relations=%d initiative_queued=%d initiative_sent=%d",
                     cycle_id,
                     processed,
                     len(learned),
@@ -232,6 +252,7 @@ class BackgroundLearningService:
                     memory_items,
                     conflicts,
                     identity_checks,
+                    mental_relations,
                     queued,
                     sent,
                 )
@@ -279,9 +300,8 @@ class BackgroundLearningService:
                LIMIT ?""",
             (self.maximum_study_attempts, self.words_per_cycle),
         )
-        learned: list[LearnedConcept] = []
-        missing = 0
-        for row in rows:
+
+        async def study(row: Any) -> tuple[LearnedConcept | None, int]:
             guild_id = int(row["guild_id"])
             channel_id = int(row["channel_id"])
             word = str(row["concept_key"])
@@ -306,7 +326,6 @@ class BackgroundLearningService:
                     channel_id=channel_id,
                     reason="background_lexical_sources_exhausted",
                 )
-                missing += 1
                 provider_unavailable = consulted is None
                 if provider_unavailable:
                     attempts = stored_attempts
@@ -332,7 +351,7 @@ class BackgroundLearningService:
                         cycle_id,
                         word,
                     )
-                continue
+                return None, 1
             lesson = await self._usage_learning.learn(
                 guild_id,
                 result,
@@ -346,17 +365,15 @@ class BackgroundLearningService:
                 (attempts, now.isoformat(), guild_id, channel_id, word),
             )
             pattern_summary = _pattern_summary(lesson.pattern)
-            learned.append(
-                LearnedConcept(
-                    guild_id,
-                    channel_id,
-                    word,
-                    result.definition,
-                    result.source,
-                    len(result.examples),
-                    pattern_summary,
-                    lesson.generated_example,
-                )
+            learned = LearnedConcept(
+                guild_id,
+                channel_id,
+                word,
+                result.definition,
+                result.source,
+                len(result.examples),
+                pattern_summary,
+                lesson.generated_example,
             )
             logger.info(
                 "cycle=%s word=%r guild=%d channel=%d result=learned source=%s attempt=%d "
@@ -372,7 +389,29 @@ class BackgroundLearningService:
                 pattern_summary,
                 lesson.generated_example,
             )
-        return learned, len(rows), missing
+            return learned, 0
+
+        results = await self._run_study_workers(rows, study)
+        return (
+            [learned for learned, _ in results if learned is not None],
+            len(rows),
+            sum(missing for _, missing in results),
+        )
+
+    async def _run_study_workers(
+        self,
+        rows: list[Any],
+        study: Callable[[Any], Awaitable[tuple[LearnedConcept | None, int]]],
+    ) -> list[tuple[LearnedConcept | None, int]]:
+        """Run slow reference/teacher lookups concurrently with a bounded pool."""
+
+        semaphore = asyncio.Semaphore(self.study_worker_count)
+
+        async def bounded(row: Any) -> tuple[LearnedConcept | None, int]:
+            async with semaphore:
+                return await study(row)
+
+        return list(await asyncio.gather(*(bounded(row) for row in rows)))
 
     async def _resolve_concept(self, word: str) -> LexicalStudyMaterial | None:
         if _LEXICAL_STUDY_RE.fullmatch(word) is None:
@@ -465,9 +504,7 @@ class BackgroundLearningService:
                LIMIT ?""",
             (self.maximum_study_attempts, max(1, limit)),
         )
-        learned: list[LearnedConcept] = []
-        missing = 0
-        for row in rows:
+        async def study(row: Any) -> tuple[LearnedConcept | None, int]:
             guild_id = int(row["guild_id"])
             channel_id = int(row["channel_id"])
             word = str(row["concept_key"])
@@ -491,7 +528,6 @@ class BackgroundLearningService:
                     channel_id=channel_id,
                     reason=f"background_semantic_sources_exhausted:{reason}",
                 )
-                missing += 1
                 provider_unavailable = consulted is None
                 if provider_unavailable:
                     attempts = stored_attempts
@@ -517,7 +553,7 @@ class BackgroundLearningService:
                         cycle_id,
                         word,
                     )
-                continue
+                return None, 1
             lesson = await self._usage_learning.learn(
                 guild_id,
                 result,
@@ -530,17 +566,15 @@ class BackgroundLearningService:
                 (attempts, now.isoformat(), guild_id, channel_id, word),
             )
             pattern_summary = _pattern_summary(lesson.pattern)
-            learned.append(
-                LearnedConcept(
-                    guild_id,
-                    channel_id,
-                    word,
-                    result.definition,
-                    result.source,
-                    len(result.examples),
-                    pattern_summary,
-                    lesson.generated_example,
-                )
+            learned = LearnedConcept(
+                guild_id,
+                channel_id,
+                word,
+                result.definition,
+                result.source,
+                len(result.examples),
+                pattern_summary,
+                lesson.generated_example,
             )
             logger.info(
                 "cycle=%s semantic_word=%r reason=%s result=learned source=%s "
@@ -553,7 +587,14 @@ class BackgroundLearningService:
                 lesson.concepts,
                 pattern_summary,
             )
-        return learned, len(rows), missing
+            return learned, 0
+
+        results = await self._run_study_workers(rows, study)
+        return (
+            [learned for learned, _ in results if learned is not None],
+            len(rows),
+            sum(missing for _, missing in results),
+        )
 
     async def _consult_unknown_concept(
         self,
@@ -849,7 +890,7 @@ class BackgroundLearningService:
             )
             if probability_draw > self.initiative_probability:
                 continue
-            text = f"Кстати, разобрался, что значит «{item.word}»: {item.explanation}"
+            text = f"{item.word}: {item.explanation}"
             await self._database.execute(
                 """INSERT INTO background_initiative_queue (
                        initiative_id, cycle_id, guild_id, channel_id, concept_key,

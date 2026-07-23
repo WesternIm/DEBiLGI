@@ -10,6 +10,10 @@ import aiohttp
 from debilgi.knowledge.models import WikipediaResult
 
 
+class WikipediaAPIError(RuntimeError):
+    """The MediaWiki API returned a structured error instead of search results."""
+
+
 class WikipediaClient:
     def __init__(
         self,
@@ -65,7 +69,6 @@ class WikipediaClient:
             "plnamespace": "0",
             "pllimit": "20",
             "rvprop": "ids",
-            "rvlimit": "1",
             "cllimit": "50",
             "redirects": "1",
             "format": "json",
@@ -87,6 +90,11 @@ class WikipediaClient:
     def _parse_candidates(payload: Any) -> tuple[WikipediaResult, ...]:
         if not isinstance(payload, dict):
             return ()
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or "unknown")
+            information = str(error.get("info") or "MediaWiki request failed")
+            raise WikipediaAPIError(f"{code}: {information}")
         query = payload.get("query")
         pages = query.get("pages") if isinstance(query, dict) else None
         if not isinstance(pages, list) or not pages:

@@ -22,6 +22,7 @@ _ARGUMENT_ROLES = frozenset(
         "predicate_complement",
         "action_complement",
         "manner",
+        "cause",
         "location",
         "topic",
     }
@@ -35,6 +36,7 @@ _CORE_ROLE_ORDER = (
     "predicate_complement",
     "action_complement",
     "manner",
+    "cause",
     "location",
     "topic",
 )

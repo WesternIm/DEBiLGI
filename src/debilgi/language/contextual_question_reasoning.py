@@ -45,6 +45,18 @@ _CAUSE_MARKERS = frozenset({"почему", "отчего"})
 _QUESTION_LEMMAS = frozenset(
     {"как", "какой", "когда", "кто", "куда", "откуда", "почему", "сколько", "что", "где", "зачем"}
 )
+_RESPONSE_CAUTION_TERMS = frozenset(
+    {
+        "бояться",
+        "неуверенный",
+        "осторожный",
+        "ответ",
+        "отвечать",
+        "подтверждать",
+        "пугливый",
+        "уверенность",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,16 +254,29 @@ def reason_about_contextual_question(
 
     if question_markers & _CAUSE_MARKERS and (
         _asks_why_epistemic_state(structure)
+        or bool(lemmas & _RESPONSE_CAUTION_TERMS)
         or _antecedent_has_epistemic_gap(antecedent_structure)
     ):
-        evidence = ("cause_follow_up", "evidence_gap")
+        evidence = (
+            "cause_follow_up",
+            "antecedent_epistemic_gap",
+            "overcautious_threshold_identified",
+        )
         return ContextualQuestionResolution(
-            "epistemic_cause",
-            _insufficient_grounds_thought(evidence),
-            0.91,
+            "overcautious_response_cause",
+            _overcautious_response_thought(evidence),
+            0.94,
             evidence,
             antecedent,
             target_terms,
+            (
+                DependencyPattern(
+                    ("subject", "manner", "predicate", "cause"),
+                    confidence=0.98,
+                    evidence_count=10,
+                    source="response_style_cause_explanation",
+                ),
+            ),
         )
     return None
 
@@ -623,6 +648,39 @@ def _non_fabrication_thought(evidence: tuple[str, ...]) -> ClauseThought:
         ),
         negated=True,
         confidence=0.90,
+        evidence=evidence,
+    )
+
+
+def _overcautious_response_thought(evidence: tuple[str, ...]) -> ClauseThought:
+    return ClauseThought(
+        predicate=_verb("отвечать", "отвечаю"),
+        dependencies=(
+            SemanticDependency("subject", _speaker()),
+            SemanticDependency(
+                "manner",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "слишком осторожно",
+                        "слишком осторожно",
+                        "adverb",
+                        entity_kind="fixed_phrase",
+                    )
+                ),
+            ),
+            SemanticDependency(
+                "cause",
+                ConceptArgument(
+                    ConceptLexeme("порог", "порога", "noun"),
+                    modifiers=(
+                        ConceptLexeme("завышенный", "завышенного", "adjective"),
+                    ),
+                    preposition="из-за",
+                    grammatical_case="genitive",
+                ),
+            ),
+        ),
+        confidence=0.94,
         evidence=evidence,
     )
 
@@ -1083,7 +1141,16 @@ def _all_lemmas(structure: StructuredUtterance) -> frozenset[str]:
 
 
 def _is_question(structure: StructuredUtterance) -> bool:
-    return any(clause.clause_kind == "question" for clause in structure.clauses)
+    embedded_clause_indices = {
+        link.child_clause_index
+        for link in structure.clause_links
+        if link.relation.startswith("ccomp")
+    }
+    return any(
+        clause.clause_kind == "question"
+        and clause.clause_index not in embedded_clause_indices
+        for clause in structure.clauses
+    )
 
 
 def _is_elliptical(structure: StructuredUtterance) -> bool:

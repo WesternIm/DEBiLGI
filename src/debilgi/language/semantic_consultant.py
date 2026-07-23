@@ -14,6 +14,8 @@ from uuid import uuid4
 import aiohttp
 
 from debilgi.language.construction_nlg import ConstructionSpec
+from debilgi.language.content import content_lemmas
+from debilgi.language.lexical_matching import same_lexical_family
 from debilgi.language.surface_policy import internal_surface_reason
 from debilgi.storage.database import Database
 
@@ -759,6 +761,97 @@ class SemanticConsultationService:
         )
         return result
 
+    async def research_lexeme(
+        self,
+        *,
+        event_id: str | None,
+        guild_id: int,
+        channel_id: int | None,
+        term: str,
+        context_messages: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        """Ask the teacher for reusable facts after reference sources fail.
+
+        This deliberately uses lexical mode.  The provider still cannot return
+        a ready-made reply: only topical facts or a lexical interpretation are
+        admitted, and the local response pipeline remains responsible for the
+        final surface.
+        """
+
+        normalized = " ".join(term.casefold().replace("ё", "е").split())
+        if not self.enabled or not normalized:
+            return ()
+        result = await self.consult(
+            event_id=event_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            request=ConsultationRequest(
+                prompt=normalized,
+                context_messages=context_messages,
+                known_terms=(),
+                unknown_terms=(normalized,),
+                local_relations=(),
+                local_confidence=0.0,
+                reason_codes=(
+                    "reference_sources_exhausted",
+                    "lexical_research",
+                ),
+                mode="lexical",
+            ),
+        )
+        if result is None:
+            return ()
+        return _topical_research_facts(
+            normalized,
+            (*result.facts, result.interpretation),
+        )
+
+    async def research_question(
+        self,
+        *,
+        event_id: str | None,
+        guild_id: int,
+        channel_id: int | None,
+        prompt: str,
+        context_messages: tuple[str, ...] = (),
+        subject_terms: Sequence[str] = (),
+        local_relations: Sequence[tuple[str, str, str]] = (),
+    ) -> tuple[str, ...]:
+        """Research facts required by an unresolved request before arbitration."""
+
+        normalized_prompt = " ".join(prompt.split())
+        normalized_terms = tuple(
+            dict.fromkeys(
+                term.casefold().replace("ё", "е").strip()
+                for term in subject_terms
+                if term.strip()
+            )
+        )
+        if not self.enabled or not normalized_prompt:
+            return ()
+        result = await self.consult(
+            event_id=event_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            request=ConsultationRequest(
+                prompt=normalized_prompt,
+                context_messages=context_messages,
+                known_terms=normalized_terms,
+                unknown_terms=(),
+                local_relations=tuple(local_relations),
+                local_confidence=0.0,
+                reason_codes=(
+                    "no_reply_bound_local_candidate",
+                    "foreground_answer_research",
+                    "reference_sources_consulted",
+                ),
+                mode="research",
+            ),
+        )
+        if result is None:
+            return ()
+        return _topical_research_facts(normalized_prompt, result.facts)
+
     async def close(self) -> None:
         await self._consultant.close()
 
@@ -782,6 +875,46 @@ def _utterance_requests_lexical_meaning(prompt: str) -> bool:
         "как использовать слово",
     )
     return any(marker in normalized for marker in lexical_markers)
+
+
+def _topical_research_facts(
+    term: str,
+    candidates: Sequence[str],
+) -> tuple[str, ...]:
+    """Keep definitions, not descriptions of the user's request."""
+
+    target_terms = set(content_lemmas(term)) or {term}
+    meta_markers = (
+        "пользователь просит",
+        "пользователь хочет",
+        "определить значение",
+        "объяснить значение",
+        "запрос о",
+        "вопрос о",
+        "the user asks",
+        "define the meaning",
+    )
+    accepted: list[str] = []
+    for candidate in candidates:
+        cleaned = _clean_text(candidate, _MAX_FACT_CHARS)
+        normalized = cleaned.casefold().replace("ё", "е")
+        if (
+            not cleaned
+            or internal_surface_reason(cleaned) is not None
+            or any(marker in normalized for marker in meta_markers)
+        ):
+            continue
+        fact_terms = set(content_lemmas(cleaned))
+        topical = bool(target_terms & fact_terms) or any(
+            same_lexical_family(target, fact)
+            for target in target_terms
+            for fact in fact_terms
+        )
+        if not topical or len(fact_terms) < 2:
+            continue
+        if cleaned not in accepted:
+            accepted.append(cleaned)
+    return tuple(accepted[:4])
 
 
 def _parse_json_object(value: object) -> Mapping[str, Any] | None:

@@ -101,11 +101,32 @@ def test_open_self_reflection_recovers_omitted_second_person_subject() -> None:
     assert result.thought is not None
 
 
+def test_nominal_cognitive_level_question_uses_observable_local_capabilities() -> None:
+    for prompt in (
+        "Какой у тебя уровень мышления?",
+        "Так какой уровень мышления у тебя",
+    ):
+        frame = analyze_self_state(analyze_structured_utterance(prompt))
+
+        assert frame is not None
+        assert frame.state == "cognitive_level"
+        assert frame.experiencer_kind == "self"
+        assert frame.complete
+        result = reason_about_self_state(frame, _understanding("мышление"))
+
+        assert result.thought is not None
+        assert realize_thought(result.thought)[0].text == (
+            "Я считаю своё мышление развивающимся."
+        )
+        assert "learning_process_active" in result.evidence
+
+
 def test_self_location_is_derived_from_runtime_environment() -> None:
     for prompt in (
         "Где ты находишься?",
         "Ты где находишься?",
         "Ладно. А где ты вообще находишься?",
+        "Где ты живёшь?",
     ):
         frame = analyze_self_state(analyze_structured_utterance(prompt))
 
@@ -117,3 +138,18 @@ def test_self_location_is_derived_from_runtime_environment() -> None:
         assert result.thought is not None
         assert realize_thought(result.thought)[0].text == "Я работаю в Discord."
         assert "discord_runtime_environment" in result.evidence
+
+
+def test_affective_state_is_derived_from_active_engagement() -> None:
+    frame = analyze_self_state(analyze_structured_utterance("Что ты чувствуешь?"))
+
+    assert frame is not None
+    assert frame.state == "affective_state"
+    assert frame.complete
+    result = reason_about_self_state(frame, _understanding("чувствовать"))
+
+    assert result.thought is not None
+    assert realize_thought(result.thought)[0].text == (
+        "Я чувствую интерес к разговору."
+    )
+    assert "engagement_state" in result.evidence

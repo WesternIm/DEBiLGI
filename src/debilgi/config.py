@@ -73,6 +73,7 @@ class Settings:
     wikipedia_user_agent: str = "DEBiLGI/0.4 (mailto:local-operator@example.invalid)"
     russian_reference_enabled: bool = False
     russian_reference_timeout_seconds: int = 5
+    russian_reference_workers: int = 4
     russian_reference_user_agent: str = "DEBiLGI/0.6 (mailto:local-operator@example.invalid)"
     language_max_output_tokens: int = 72
     language_max_output_chars: int = 1200
@@ -121,6 +122,7 @@ class Settings:
     background_enabled: bool = False
     background_interval_seconds: int = 600
     background_words_per_cycle: int = 5
+    background_study_workers: int = 4
     background_max_study_attempts: int = 4
     background_graph_decay_daily_rate: float = 0.015
     background_self_check_cycles: int = 6
@@ -261,6 +263,9 @@ class Settings:
             russian_reference_timeout_seconds=_positive_int_from_env(
                 "DEBILGI_RUSSIAN_REFERENCE_TIMEOUT_SECONDS", 5
             ),
+            russian_reference_workers=_positive_int_from_env(
+                "DEBILGI_RUSSIAN_REFERENCE_WORKERS", 4
+            ),
             russian_reference_user_agent=os.getenv(
                 "DEBILGI_RUSSIAN_REFERENCE_USER_AGENT",
                 "DEBiLGI/0.6 (mailto:local-operator@example.invalid)",
@@ -371,6 +376,9 @@ class Settings:
             ),
             background_words_per_cycle=_positive_int_from_env(
                 "DEBILGI_BACKGROUND_WORDS_PER_CYCLE", 5
+            ),
+            background_study_workers=_positive_int_from_env(
+                "DEBILGI_BACKGROUND_STUDY_WORKERS", 4
             ),
             background_max_study_attempts=_positive_int_from_env(
                 "DEBILGI_BACKGROUND_MAX_STUDY_ATTEMPTS", 4

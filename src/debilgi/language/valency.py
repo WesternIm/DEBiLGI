@@ -126,8 +126,6 @@ _PROFILES = {
         _profile("нравиться", _SUBJECT, _INDIRECT),
         _profile("хотеть", _SUBJECT, _DIRECT, _OPTIONAL_ACTION_COMPLEMENT),
         _profile("понять", _SUBJECT, _DIRECT),
-        _profile("предполагать", _SUBJECT, _DIRECT),
-        _profile("предположить", _SUBJECT, _DIRECT),
         _profile(
             "считать",
             _SUBJECT,
@@ -144,6 +142,7 @@ _PROFILES = {
         _profile("бояться", _SUBJECT, _GENITIVE_OBJECT),
         _profile("избегать", _SUBJECT, _GENITIVE_OBJECT),
         _profile("управлять", _SUBJECT, _INSTRUMENTAL_OBJECT),
+        _profile("пользоваться", _SUBJECT, _INSTRUMENTAL_OBJECT),
         _profile("интересоваться", _SUBJECT, _INSTRUMENTAL_OBJECT),
         _profile("удивляться", _SUBJECT, _REQUIRED_INDIRECT),
         _profile("радоваться", _SUBJECT, _REQUIRED_INDIRECT),

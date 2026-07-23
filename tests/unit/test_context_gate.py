@@ -78,7 +78,8 @@ async def test_reactive_candidate_is_passed_or_replaced_by_one_gate() -> None:
     assert relevant.action == "passed"
     assert "байкал" in relevant.matched_concepts
     assert unrelated.action == "replaced"
-    assert unrelated.text is not None and "текущей темой" in unrelated.text
+    assert unrelated.text is not None and unrelated.text.endswith("?")
+    assert any(topic in unrelated.text.casefold() for topic in ("байкал", "озеро"))
     assert "Бухта" not in unrelated.text
 
 

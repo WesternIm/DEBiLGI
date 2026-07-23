@@ -33,6 +33,12 @@ STARTED_AT = datetime(2026, 7, 18, 22, 0, tzinfo=UTC)
 
 
 async def train(*, evaluate_only: bool = False) -> None:
+    if not WARM_START_PAIRS:
+        del evaluate_only
+        print("warm_start_messages=disabled")
+        print("warm_start_pairs=0")
+        print(f"warm_start_skills={len(WARM_START_SKILLS)}")
+        return
     settings = Settings.from_env()
     database_path = settings.database_path.resolve()
     guild_id = settings.dev_guild_id or DEFAULT_GUILD_ID

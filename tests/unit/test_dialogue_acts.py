@@ -76,6 +76,25 @@ def test_complete_question_and_fragment_have_different_obligations() -> None:
     assert fragment.complete is False
 
 
+def test_complete_elliptical_statement_gets_an_acknowledgement() -> None:
+    act = _act("Просто ключи взял бы")
+
+    assert act.kind == "statement"
+    assert act.response_obligation == "continue_topic"
+    assert act.complete is True
+    assert realize_dialogue_act(act) == "Я понял тебя."
+
+
+def test_possessive_dialogue_fragment_is_not_treated_as_a_definition_request() -> None:
+    act = _act("Твой ответ")
+
+    assert act.kind == "dialogue_reference_fragment"
+    assert act.response_obligation == "acknowledge_reference"
+    assert act.objects == ("ответ",)
+    assert act.complete is True
+    assert realize_dialogue_act(act) == "Я понял тебя."
+
+
 def test_external_model_can_only_refine_an_act_not_supply_reply_text() -> None:
     fragment = _act("люто")
     refined = refine_dialogue_act(
@@ -207,6 +226,14 @@ def test_rhetorical_challenge_requests_repair_not_a_literal_fact() -> None:
     assert realize_dialogue_act(act) == "Я понял предыдущий вопрос неправильно."
 
 
+def test_understanding_challenge_is_acknowledged_instead_of_treated_as_question() -> None:
+    act = _act("Ой бля, не делай вид, что ты не понял, ахахахах")
+
+    assert act.kind == "understanding_challenge"
+    assert act.response_obligation == "acknowledge_understanding"
+    assert realize_dialogue_act(act) == "Да, я понял намёк."
+
+
 def test_elliptical_follow_up_keeps_the_previous_answer_as_its_target() -> None:
     act = _act("А что тогда?")
 
@@ -291,6 +318,28 @@ def test_compound_study_and_opinion_directive_requires_both_subgoals() -> None:
             "completed_subgoals": ("study", "express_position"),
             "knowledge_component": "Небо — пространство над Землёй.",
             "position_component": "Да, я люблю небо.",
+        },
+    )
+
+
+def test_plain_study_directive_requires_knowledge_and_an_answer() -> None:
+    act = _act("Изучи что такое гта 5 и ответь")
+
+    assert act.kind == "study_directive"
+    assert act.response_obligation == "study_and_answer"
+    assert act.objects == ("гта", "5")
+    assert not candidate_fulfills_obligation(
+        act,
+        "grounded_surface",
+        text="Ты изучи такое небо.",
+    )
+    assert candidate_fulfills_obligation(
+        act,
+        "knowledge_retrieval",
+        text="Grand Theft Auto V — компьютерная игра.",
+        metadata={
+            "completed_subgoals": ("study", "answer"),
+            "knowledge_component": "Grand Theft Auto V — компьютерная игра.",
         },
     )
 

@@ -178,6 +178,60 @@ class FakeMediaWikipedia:
         )
 
 
+class FakeAcronymWikipedia:
+    language = "ru"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def start(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def search_candidates(
+        self, query: str, *, limit: int = 5
+    ) -> tuple[WikipediaResult, ...]:
+        self.calls.append(query)
+        if query != "gta 5":
+            return ()
+        noise = tuple(
+            WikipediaResult(
+                page_id=400 + index,
+                title=f"Unrelated result {index}",
+                extract=f"Unrelated result {index}.",
+                canonical_url=f"https://ru.wikipedia.org/wiki/Noise_{index}",
+                wikidata_id=None,
+                revision_id=index,
+                related_titles=(),
+                categories=(),
+            )
+            for index in range(5)
+        )
+        results = (
+            *noise,
+            WikipediaResult(
+                page_id=500,
+                title="Grand Theft Auto V",
+                extract=(
+                    "Grand Theft Auto V — компьютерная игра "
+                    "в жанре action-adventure."
+                ),
+                canonical_url="https://ru.wikipedia.org/wiki/Grand_Theft_Auto_V",
+                wikidata_id="Q17452",
+                revision_id=5,
+                related_titles=(),
+                categories=("Категория:Компьютерные игры",),
+            ),
+        )
+        return results[:limit]
+
+    async def search(self, query: str) -> WikipediaResult | None:
+        candidates = await self.search_candidates(query)
+        return candidates[0] if candidates else None
+
+
 async def test_explicit_question_is_learned_and_reused_from_cache(database: Database) -> None:
     repository = KnowledgeRepository(database)
     source = FakeWikipedia()
@@ -241,6 +295,42 @@ async def test_explicit_question_is_learned_and_reused_from_cache(database: Data
         await service.stop()
     assert source.started
     assert source.closed
+
+
+async def test_study_command_resolves_numbered_cyrillic_acronym(
+    database: Database,
+) -> None:
+    repository = KnowledgeRepository(database)
+    source = FakeAcronymWikipedia()
+    service = KnowledgeAcquisitionService(
+        repository,
+        FakeCognitiveRepository(),  # type: ignore[arg-type]
+        KnowledgeQueryPolicy(enabled=True),
+        source,
+        reply_wait_seconds=1.0,
+    )
+    await service.start()
+    try:
+        current = event(50, "Изучи что такое гта 5 и ответь")
+
+        await service.observe(current)
+
+        assert await service.wait_for_event(current.event_id) == "resolved"
+        facts, exact = await service.grounding_for_event(current, "гта 5")
+        assert source.calls == ["гта 5", "gta 5"]
+        assert exact == facts[0]
+        assert "компьютерная игра" in exact
+        row = await database.fetchone(
+            "SELECT query_text FROM knowledge_queries WHERE event_id = ?",
+            (current.event_id,),
+        )
+        assert row is not None
+        assert str(row["query_text"]) == "гта 5"
+        abbreviated = await repository.concepts_for_text("гта")
+        assert len(abbreviated) == 1
+        assert abbreviated[0].title == "Grand Theft Auto V"
+    finally:
+        await service.stop()
 
 
 async def test_lookup_followup_reuses_the_previous_explicit_subject(database: Database) -> None:

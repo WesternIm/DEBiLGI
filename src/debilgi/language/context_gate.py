@@ -11,7 +11,10 @@ from datetime import UTC, datetime, timedelta
 from debilgi.dataset.self_dataset import SelfDatasetRepository
 from debilgi.events.models import Event, EventType
 from debilgi.language.content import content_lemmas
+from debilgi.language.conversational_repair import repair_for_utterance
 from debilgi.language.lexical_matching import same_lexical_family
+from debilgi.language.pragmatics import analyze_pragmatics
+from debilgi.language.structured_utterance import analyze_structured_utterance
 
 logger = logging.getLogger("debilgi.context_gate")
 
@@ -260,11 +263,23 @@ class WorkingMemoryContextGate:
                 "deferred", None, source, candidate, focus_concepts, matched,
                 "initiative_unrelated_to_active_focus",
             )
-        topic = _latest_human_topic(focus) or focus_concepts[-1]
-        replacement = (
-            f"Не могу надёжно связать ответ с текущей темой «{topic}». "
-            "Надо разобраться."
+        prompt = next(
+            (turn.text for turn in reversed(focus.turns) if not turn.is_bot),
+            "",
         )
+        replacement = (
+            repair_for_utterance(
+                analyze_structured_utterance(prompt),
+                analyze_pragmatics(prompt),
+            ).realize()
+            if prompt
+            else None
+        )
+        if replacement is None:
+            return self._decision(
+                "deferred", None, source, candidate, focus_concepts, matched,
+                "reactive_candidate_unrelated_no_semantic_repair",
+            )
         return self._decision(
             "replaced", replacement, source, candidate, focus_concepts, matched,
             "reactive_candidate_unrelated",

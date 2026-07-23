@@ -33,6 +33,21 @@ def test_stretched_chat_interjections_keep_their_pragmatic_function() -> None:
     assert "amusement" in laughter.functions
 
 
+def test_laughter_with_leading_vowel_and_chat_emotions_are_pragmatic() -> None:
+    for text in ("ахахахах", "АХАХА", "hahaha", "лол", "кек"):
+        assert "amusement" in analyze_pragmatics(text).functions
+
+    assert "coarse_emphasis" in analyze_pragmatics("ой бля").functions
+    assert "shock_or_frustration" in analyze_pragmatics("пиздец").functions
+
+
+def test_emoji_and_repeated_punctuation_carry_emotional_force() -> None:
+    analysis = analyze_pragmatics("СЕРЬЁЗНО??? 😂")
+
+    assert {"intense_question", "amusement"} <= analysis.functions
+    assert analysis.emotional_intensity >= 0.85
+
+
 def test_chat_elongation_and_reduplication_keep_social_meaning() -> None:
     greeting = analyze_pragmatics("привеееет")
     realization = analyze_pragmatics("ооо")

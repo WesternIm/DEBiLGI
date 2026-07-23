@@ -12,8 +12,10 @@ from dataclasses import dataclass
 
 from debilgi.language.content import content_lemmas
 from debilgi.language.planning import UtterancePlan
+from debilgi.language.structured_utterance import analyze_structured_utterance
 from debilgi.language.surface_coherence import evaluate_surface
 from debilgi.language.surface_policy import internal_surface_reason
+from debilgi.language.valency import assess_predicate_valency
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +62,8 @@ class GroundedConstructionGenerator:
                 continue
             if surface.hard_issues or surface.score < 0.72:
                 continue
+            if not _is_complete_grounded_fact(text):
+                continue
             seen.add(normalized)
             result.append(GroundedUtterance(text, len(result)))
             if len(result) >= max(1, min(limit, 24)):
@@ -69,3 +73,43 @@ class GroundedConstructionGenerator:
     def generate(self, plan: UtterancePlan) -> str:
         candidates = self.generate_candidates(plan, limit=1)
         return candidates[0].text if candidates else ""
+
+
+def _is_complete_grounded_fact(text: str) -> bool:
+    """Reject memory fragments that only resemble complete propositions."""
+
+    structure = analyze_structured_utterance(text)
+    found_proposition = False
+    for clause in structure.clauses:
+        if clause.predicate_index is None:
+            if (
+                clause.implicit_predicate == "быть"
+                and clause.subject_indices
+                and clause.predicate_complement_indices
+            ):
+                found_proposition = True
+                continue
+            return False
+        found_proposition = True
+        predicate = structure.tokens[clause.predicate_index].lemma
+        present_roles = frozenset(
+            role
+            for indices, role in (
+                (clause.subject_indices, "subject"),
+                (clause.direct_object_indices, "direct_object"),
+                (clause.indirect_object_indices, "indirect_object"),
+                (clause.predicate_complement_indices, "predicate_complement"),
+                (clause.action_complement_indices, "action_complement"),
+            )
+            if indices
+        )
+        valency = assess_predicate_valency(
+            predicate,
+            present_roles=present_roles,
+            complement_roles=frozenset(item.role for item in clause.complements),
+            implicit_subject=clause.implicit_subject is not None,
+            imperative=clause.clause_kind == "command",
+        )
+        if valency.missing_roles or valency.unexpected_roles:
+            return False
+    return found_proposition

@@ -1,4 +1,6 @@
-from debilgi.knowledge.wikipedia import WikipediaClient
+import pytest
+
+from debilgi.knowledge.wikipedia import WikipediaAPIError, WikipediaClient
 
 
 def test_wikipedia_payload_is_parsed_into_a_concept_result() -> None:
@@ -37,3 +39,15 @@ def test_wikipedia_payload_is_parsed_into_a_concept_result() -> None:
 
 def test_wikipedia_payload_without_pages_has_no_result() -> None:
     assert WikipediaClient._parse({"query": {}}) is None
+
+
+def test_wikipedia_api_error_is_not_silently_treated_as_no_result() -> None:
+    with pytest.raises(WikipediaAPIError, match="invalidparammix"):
+        WikipediaClient._parse_candidates(
+            {
+                "error": {
+                    "code": "invalidparammix",
+                    "info": "incompatible parameters",
+                }
+            }
+        )

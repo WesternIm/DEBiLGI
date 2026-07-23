@@ -16,8 +16,26 @@ from debilgi.knowledge.models import (
     WikipediaResult,
 )
 from debilgi.knowledge.text import alias_keys, clean_extract, normalize_key
+from debilgi.language.abbreviations import generated_abbreviation_aliases
 from debilgi.language.content import content_lemmas
 from debilgi.storage.database import Database
+
+
+def _concept_aliases(query: str, title: str) -> tuple[tuple[str, float], ...]:
+    aliases = [(query, 0.82), (title, 0.98)]
+    aliases.extend(
+        (abbreviation, 0.76)
+        for abbreviation in generated_abbreviation_aliases(title)
+    )
+    strongest: dict[str, tuple[str, float]] = {}
+    for alias, confidence in aliases:
+        key = normalize_key(alias)
+        if not key:
+            continue
+        current = strongest.get(key)
+        if current is None or confidence > current[1]:
+            strongest[key] = (alias, confidence)
+    return tuple(strongest.values())
 
 
 class KnowledgeRepository:
@@ -114,9 +132,18 @@ class KnowledgeRepository:
     async def resolved_concept_for_event(self, event_id: str) -> KnowledgeConcept | None:
         """Return the concept deliberately looked up for this exact event."""
 
+        resolved = await self.resolved_lookup_for_event(event_id)
+        return resolved[1] if resolved is not None else None
+
+    async def resolved_lookup_for_event(
+        self, event_id: str
+    ) -> tuple[str, KnowledgeConcept] | None:
+        """Return both the requested subject and the selected concept."""
+
         row = await self._database.fetchone(
             """
-            SELECT concept.* FROM knowledge_queries AS query
+            SELECT query.query_text AS resolved_query_text, concept.*
+            FROM knowledge_queries AS query
             JOIN knowledge_concepts AS concept ON concept.concept_id = query.concept_id
             WHERE query.event_id = ? AND query.status IN ('resolved', 'cached')
               AND query.reason IN ('explicit', 'followup')
@@ -124,7 +151,9 @@ class KnowledgeRepository:
             """,
             (event_id,),
         )
-        return self._concept_from_row(row) if row else None
+        if row is None:
+            return None
+        return str(row["resolved_query_text"]), self._concept_from_row(row)
 
     async def any_resolved_concept_for_event(self, event_id: str) -> KnowledgeConcept | None:
         """Return knowledge learned for an event, including an autonomous uncertainty lookup."""
@@ -357,9 +386,9 @@ class KnowledgeRepository:
                     now,
                 ),
             )
-            aliases = (
-                (str(query_row["query_text"]), 0.82),
-                (result.title, 0.98),
+            aliases = _concept_aliases(
+                str(query_row["query_text"]),
+                result.title,
             )
             for alias, confidence in aliases:
                 alias_key = normalize_key(alias)
@@ -449,6 +478,7 @@ class KnowledgeRepository:
         result: WikipediaResult,
         source: str,
         language: str,
+        confidence: float = 0.88,
         completed_at: datetime | None = None,
     ) -> KnowledgeConcept:
         """Persist background/reasoning study without creating a ready-made answer.
@@ -471,7 +501,7 @@ class KnowledgeRepository:
                     concept_id, source, language, external_id, title, normalized_title,
                     definition, canonical_url, wikidata_id, revision_id, confidence,
                     fetched_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.88, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (concept_id) DO UPDATE SET
                     title = excluded.title,
                     normalized_title = excluded.normalized_title,
@@ -494,11 +524,12 @@ class KnowledgeRepository:
                     result.canonical_url,
                     result.wikidata_id,
                     result.revision_id,
+                    max(0.0, min(1.0, confidence)),
                     now,
                     now,
                 ),
             )
-            for alias, confidence in ((query, 0.82), (result.title, 0.98)):
+            for alias, confidence in _concept_aliases(query, result.title):
                 alias_key = normalize_key(alias)
                 if alias_key:
                     await connection.execute(

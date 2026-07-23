@@ -7,7 +7,7 @@ from typing import Protocol
 
 from debilgi.cognition.models import ActionIntent, ActionType
 from debilgi.language.construction_nlg import ConstructionSpec
-from debilgi.language.dialogue_state import DialogueContextWindow, DialogueStateAnalysis
+from debilgi.language.dialogue_state import DialogueStateAnalysis
 from debilgi.language.productive_nlg import DependencyPattern
 from debilgi.language.social_reasoning import SocialPolicy
 from debilgi.language.usage_learning import UsageGuidance
@@ -54,7 +54,6 @@ class ReplyContext:
     expected_response_acts: tuple[str, ...] = ()
     learned_registers: tuple[str, ...] = ()
     social_policies: tuple[SocialPolicy, ...] = ()
-    dialogue_window: DialogueContextWindow | None = None
     dialogue_state: DialogueStateAnalysis | None = None
 
 

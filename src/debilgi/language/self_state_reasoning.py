@@ -22,9 +22,14 @@ _STATE_PREDICATES = {
     # Open first-person-position requests such as ``что ты думаешь о себе``
     # are states of reflection, not fact questions about the verb ``думать``.
     "self_reflection": frozenset({"думать", "полагать", "оценивать", "оценить"}),
-    "self_location": frozenset({"находиться", "располагаться", "быть"}),
+    "self_location": frozenset({"находиться", "располагаться", "быть", "жить"}),
+    "affective_state": frozenset({"чувствовать", "ощущать"}),
 }
 _NON_ATTESTED_SELF_TRAITS = frozenset({"осознанный", "сознательный"})
+_COGNITIVE_LEVEL_TARGETS = frozenset(
+    {"мышление", "рассуждение", "интеллект", "анализ"}
+)
+_LEVEL_NOUNS = frozenset({"уровень", "качество", "способность"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +70,12 @@ class SelfStateResolution:
 
 def analyze_self_state(structure: StructuredUtterance) -> SelfStateFrame | None:
     frame = max(structure.clauses, key=lambda item: item.confidence, default=None)
-    if frame is None or frame.predicate_index is None:
+    if frame is None:
+        return None
+    nominal_level = _nominal_cognitive_level_frame(structure, frame)
+    if nominal_level is not None:
+        return nominal_level
+    if frame.predicate_index is None:
         return None
     predicate = structure.tokens[frame.predicate_index]
     state = next(
@@ -114,6 +124,7 @@ def analyze_self_state(structure: StructuredUtterance) -> SelfStateFrame | None:
             or state == "understanding"
             or (state == "self_reflection" and reflexive_self)
             or state == "self_location"
+            or state == "affective_state"
         ),
         confidence=min(0.98, frame.confidence * 0.82 + predicate.confidence * 0.18),
     )
@@ -166,6 +177,28 @@ def reason_about_self_state(
             True,
             min(0.92, frame.confidence * 0.84 + 0.10),
             ("local_learning_architecture", "open_self_reflection"),
+        )
+
+    if frame.state == "affective_state":
+        return SelfStateResolution(
+            _affective_state_thought(frame),
+            frame.state,
+            True,
+            min(0.92, frame.confidence * 0.84 + 0.10),
+            ("active_conversation", "engagement_state"),
+        )
+
+    if frame.state == "cognitive_level":
+        return SelfStateResolution(
+            _cognitive_level_thought(frame),
+            frame.state,
+            True,
+            min(0.92, frame.confidence * 0.84 + 0.10),
+            (
+                "local_learning_architecture",
+                "context_reasoning_available",
+                "learning_process_active",
+            ),
         )
 
     if frame.state == "self_assessment":
@@ -398,6 +431,61 @@ def _self_reflection_thought(frame: SelfStateFrame) -> ClauseThought:
     )
 
 
+def _cognitive_level_thought(frame: SelfStateFrame) -> ClauseThought:
+    """Give a calibrated self-assessment from observable local capabilities."""
+
+    return ClauseThought(
+        predicate=ConceptLexeme(
+            "считать",
+            "считаю",
+            "verb",
+            (("tense", "present"), ("number", "singular"), ("person", "first")),
+        ),
+        dependencies=(
+            SemanticDependency(
+                "subject",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "я",
+                        "я",
+                        "pronoun",
+                        (("case", "nominative"), ("number", "singular"), ("person", "first")),
+                    )
+                ),
+            ),
+            SemanticDependency(
+                "direct_object",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "мышление",
+                        "мышление",
+                        "noun",
+                        (("number", "singular"), ("gender", "neuter")),
+                    ),
+                    modifiers=(ConceptLexeme("свой", "своё", "adjective"),),
+                    grammatical_case="accusative",
+                ),
+            ),
+            SemanticDependency(
+                "predicate_complement",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "развивающийся",
+                        "развивающимся",
+                        "participle",
+                        (("number", "singular"), ("gender", "neuter")),
+                    ),
+                    grammatical_case="instrumental",
+                ),
+            ),
+        ),
+        focus_role="predicate_complement",
+        confidence=frame.confidence,
+        evidence=("cognitive_level_from_active_learning",),
+        predicate_class="lexical",
+    )
+
+
 def _self_location_thought(frame: SelfStateFrame) -> ClauseThought:
     """Describe the active runtime environment as a compositional proposition."""
 
@@ -433,6 +521,106 @@ def _self_location_thought(frame: SelfStateFrame) -> ClauseThought:
         confidence=frame.confidence,
         evidence=("self_location_from_runtime_environment",),
         predicate_class="lexical",
+    )
+
+
+def _affective_state_thought(frame: SelfStateFrame) -> ClauseThought:
+    """Express the current engagement state as a compositional proposition."""
+
+    return ClauseThought(
+        predicate=ConceptLexeme(
+            "чувствовать",
+            "чувствую",
+            "verb",
+            (("tense", "present"), ("number", "singular"), ("person", "first")),
+        ),
+        dependencies=(
+            SemanticDependency(
+                "subject",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "я",
+                        "я",
+                        "pronoun",
+                        (("case", "nominative"), ("number", "singular"), ("person", "first")),
+                    )
+                ),
+            ),
+            SemanticDependency(
+                "direct_object",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "интерес",
+                        "интерес",
+                        "noun",
+                        (("number", "singular"), ("gender", "masculine")),
+                    ),
+                    grammatical_case="accusative",
+                ),
+            ),
+            SemanticDependency(
+                "topic",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "разговор",
+                        "разговор",
+                        "noun",
+                        (("number", "singular"), ("gender", "masculine")),
+                    ),
+                    preposition="к",
+                    grammatical_case="dative",
+                ),
+            ),
+        ),
+        focus_role="direct_object",
+        confidence=frame.confidence,
+        evidence=("affective_state_from_active_engagement",),
+        predicate_class="lexical",
+    )
+
+
+def _nominal_cognitive_level_frame(
+    structure: StructuredUtterance,
+    frame: ClauseFrame,
+) -> SelfStateFrame | None:
+    if frame.clause_kind != "question" or frame.implicit_predicate != "быть":
+        return None
+    clause_tokens = structure.tokens[frame.token_start : frame.token_end]
+    lemmas = {token.lemma for token in clause_tokens}
+    target = next(
+        (token for token in clause_tokens if token.lemma in _COGNITIVE_LEVEL_TARGETS),
+        None,
+    )
+    if (
+        target is None
+        or not lemmas & _LEVEL_NOUNS
+        or "ты" not in lemmas
+        or not lemmas & {"какой", "насколько"}
+    ):
+        return None
+    return SelfStateFrame(
+        state="cognitive_level",
+        predicate_lemma="считать",
+        predicate_surface="считаешь",
+        predicate_features=(
+            ("tense", "present"),
+            ("number", "singular"),
+            ("person", "second"),
+        ),
+        experiencer_kind="self",
+        target=ConceptArgument(
+            ConceptLexeme(
+                target.lemma,
+                target.corrected_form or target.surface,
+                target.part_of_speech,
+                target.grammatical_features,
+                target.entity_kind,
+            )
+        ),
+        clause_kind="question",
+        negated=False,
+        complete=True,
+        confidence=min(0.94, frame.confidence * 0.86 + 0.08),
     )
 
 
