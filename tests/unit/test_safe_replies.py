@@ -1420,6 +1420,33 @@ async def test_affective_state_is_composed_without_a_no_data_fallback() -> None:
     assert prepared.response_source == "arbitrated:semantic_thought"
 
 
+async def test_threat_response_never_falls_back_to_missing_monster_data() -> None:
+    service = SafeMentionReplyService(
+        FakeRepository(intent()),
+        FakeMemory(),
+        FakeArchiveRepository(),
+        EXPRESSION_ENGINE,
+        EXPERIENCE,
+        INITIATIVE,
+        FixedGenerator("Достаточных данных нет у меня о монстре."),
+        arbitration_mode="active",
+        arbitration_minimum_score=0.0,
+        enabled=True,
+    )
+
+    prepared = await service.prepare_reply(
+        event(mentioned=True, content="<@123> Не боишься болотного монстра?")
+    )
+
+    assert prepared is not None
+    assert prepared.text in {
+        "Да, я не боюсь болотного монстра.",
+        "Нет, я не боюсь болотного монстра.",
+    }
+    assert "достаточ" not in prepared.text.casefold()
+    assert prepared.response_source == "arbitrated:semantic_thought"
+
+
 async def test_evaluation_of_previous_answer_cannot_leak_definition_through_fallback() -> None:
     definition = (
         "Ответ — реплика, вызванная вопросом или реакция на событие. Если нужно подробнее — уточни."
@@ -1851,6 +1878,98 @@ async def test_any_unbound_question_runs_whole_request_research_before_fallback(
     assert prepared.text == fact
     assert "недостаточ" not in prepared.text.casefold()
     assert prepared.response_source == "arbitrated:semantic_synthesis"
+
+
+async def test_consulted_opinion_reframes_the_contract_instead_of_surfacing_definitions() -> None:
+    class OpinionTeacher:
+        trigger_threshold = 0.72
+
+        def should_consult(self, **kwargs) -> bool:
+            return not kwargs["has_bound_answer"]
+
+        async def consult(self, **kwargs) -> ConsultationResult:
+            del kwargs
+            return ConsultationResult.from_payload(
+                {
+                    "interpretation": "Пользователь просит оценить страну.",
+                    "intent": "opinion_question",
+                    "expected_response_acts": ["answer", "answer_first"],
+                    "social_frame": {
+                        "prompt_act": "question",
+                        "speaker_stance": "neutral",
+                        "emotion": "curious",
+                        "response_obligation": "answer",
+                        "recommended_moves": ["answer_first"],
+                        "avoid_moves": ["define_isolated_word"],
+                        "directness": 1.0,
+                        "warmth": 0.0,
+                        "playfulness": 0.0,
+                    },
+                    "facts": [],
+                    "confidence": 0.82,
+                },
+                provider="fake-puter",
+                model="fake-model",
+            )
+
+        async def research_question(self, **kwargs) -> tuple[str, ...]:
+            del kwargs
+            return (
+                "Германия — государство в Центральной Европе.",
+                "Крутой — разговорное обозначение высокой оценки.",
+            )
+
+    service = SafeMentionReplyService(
+        FakeRepository(intent()),
+        FakeMemory(),
+        FakeArchiveRepository(),
+        EXPRESSION_ENGINE,
+        EXPERIENCE,
+        INITIATIVE,
+        FixedGenerator("У меня недостаточно данных о стране."),
+        semantic_consultant=OpinionTeacher(),  # type: ignore[arg-type]
+        arbitration_mode="active",
+        arbitration_minimum_score=0.0,
+        enabled=True,
+    )
+
+    prepared = await service.prepare_reply(
+        event(mentioned=True, content="<@123> Германия крутая страна?")
+    )
+
+    assert prepared is not None
+    assert prepared.text == "Нет, я пока не считаю Германию крутой."
+    assert "недостаточ" not in prepared.text.casefold()
+    assert "государство" not in prepared.text.casefold()
+    assert "обозначение" not in prepared.text.casefold()
+    assert prepared.response_source == "arbitrated:position_reasoning"
+
+
+async def test_generic_no_data_surface_is_rejected_for_any_unresolved_question() -> None:
+    service = SafeMentionReplyService(
+        FakeRepository(intent()),
+        FakeMemory(),
+        FakeArchiveRepository(),
+        EXPRESSION_ENGINE,
+        EXPERIENCE,
+        INITIATIVE,
+        FixedGenerator("У меня нет достаточных данных о квазаре."),
+        arbitration_mode="active",
+        arbitration_minimum_score=0.0,
+        enabled=True,
+    )
+
+    prepared = await service.prepare_reply(
+        event(mentioned=True, content="<@123> Почему у квазара нет тени?")
+    )
+
+    assert prepared is not None
+    assert prepared.text in {
+        "Причина остаётся загадкой.",
+        "Я не могу ответить на этот вопрос.",
+    }
+    assert "достаточ" not in prepared.text.casefold()
+    assert "данн" not in prepared.text.casefold()
 
 
 async def test_bot_tool_use_question_beats_missing_topic_data_fallback() -> None:

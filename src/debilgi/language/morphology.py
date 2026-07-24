@@ -560,7 +560,14 @@ class RussianMorphology:
         for reading in readings:
             inflected = reading.inflect(grammemes)
             if inflected is not None:
-                return str(inflected.word)
+                result = str(inflected.word)
+                # Pymorphy normalizes every output to lowercase.  That is
+                # correct for lexical comparison but not for realization:
+                # geographical names, people and organizations must retain
+                # the proper-name signal supplied by the semantic layer.
+                if word[:1].isupper():
+                    result = result[:1].upper() + result[1:]
+                return result
         return None
 
     def lemma(self, word: str) -> str:

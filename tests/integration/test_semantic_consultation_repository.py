@@ -281,3 +281,61 @@ async def test_research_question_uses_a_distinct_mode_and_returns_answer_facts(
     assert row is not None
     assert row["mode"] == "research"
     assert "foreground_answer_research" in str(row["reason_codes_json"])
+
+
+async def test_opinion_research_rejects_isolated_component_definitions(
+    database: Database,
+) -> None:
+    class OpinionResearchConsultant(_Consultant):
+        async def consult(self, request: ConsultationRequest) -> ConsultationResult:
+            self.calls += 1
+            assert request.mode == "research"
+            return ConsultationResult.from_payload(
+                {
+                    "interpretation": "Оценка Германии как крутой страны.",
+                    "intent": "opinion_question",
+                    "tokens": [
+                        {
+                            "surface": "Германия",
+                            "lemma": "германия",
+                            "part_of_speech": "noun",
+                            "role": "subject",
+                        },
+                        {
+                            "surface": "крутая",
+                            "lemma": "крутой",
+                            "part_of_speech": "adjective",
+                            "role": "predicate_complement",
+                        },
+                        {
+                            "surface": "страна",
+                            "lemma": "страна",
+                            "part_of_speech": "noun",
+                            "role": "predicate",
+                        },
+                    ],
+                    "facts": [
+                        "Германия — государство в Центральной Европе.",
+                        "Крутой — разговорное обозначение высокой оценки.",
+                        "Германию можно считать крутой из-за разнообразной культуры.",
+                    ],
+                    "confidence": 0.84,
+                },
+                provider="fake-puter",
+                model="fake-model",
+            )
+
+    provider = OpinionResearchConsultant()
+    service = SemanticConsultationService(database, provider, enabled=True)
+
+    facts = await service.research_question(
+        event_id="discord:opinion-research",
+        guild_id=1,
+        channel_id=10,
+        prompt="Германия крутая страна?",
+        subject_terms=("германия", "крутой", "страна"),
+    )
+
+    assert facts == (
+        "Германию можно считать крутой из-за разнообразной культуры.",
+    )

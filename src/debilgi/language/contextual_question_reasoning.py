@@ -183,7 +183,7 @@ def reason_about_contextual_question(
         evidence = ("preference_cause_follow_up", "preference_has_no_grounded_cause")
         return ContextualQuestionResolution(
             "preference_cause_unestablished",
-            _insufficient_grounds_thought(evidence, include_answer_topic=False),
+            _unresolved_reason_thought(evidence),
             0.93,
             evidence,
             antecedent,
@@ -368,8 +368,8 @@ def epistemic_gap_candidates_for_question(
         plans.append(
             AnswerGapPlan(
                 "reason_gap",
-                "state_missing_grounds",
-                _insufficient_grounds_thought(evidence, include_answer_topic=False),
+                "state_unresolved_reason",
+                _unresolved_reason_thought(evidence),
                 0.75,
                 evidence,
                 target_terms,
@@ -401,9 +401,8 @@ def epistemic_gap_candidates_for_question(
         *(
             (
                 (
-                    "name_missing_topic_evidence",
-                    _missing_evidence_thought(
-                        target,
+                    "state_unresolved_answer",
+                    _cannot_answer_current_question_thought(
                         (*base_evidence, "topic_evidence_missing"),
                     ),
                     0.68,
@@ -685,44 +684,43 @@ def _overcautious_response_thought(evidence: tuple[str, ...]) -> ClauseThought:
     )
 
 
-def _insufficient_grounds_thought(
-    evidence: tuple[str, ...],
-    *,
-    include_answer_topic: bool = True,
-) -> ClauseThought:
-    dependencies: list[SemanticDependency] = [
-        SemanticDependency("location", _speaker_location()),
-        SemanticDependency(
-            "subject",
-            ConceptArgument(
-                ConceptLexeme(
-                    "основание",
-                    "оснований",
-                    "noun",
-                    (("number", "plural"),),
+def _unresolved_reason_thought(evidence: tuple[str, ...]) -> ClauseThought:
+    """Represent an unresolved reason without exposing evidence bookkeeping."""
+
+    return ClauseThought(
+        predicate=ConceptLexeme(
+            "оставаться",
+            "остаётся",
+            "verb",
+            (("tense", "present"), ("number", "singular"), ("person", "third")),
+        ),
+        dependencies=(
+            SemanticDependency(
+                "subject",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "причина",
+                        "причина",
+                        "noun",
+                        (("number", "singular"), ("gender", "feminine")),
+                    )
                 ),
-                modifiers=(ConceptLexeme("достаточный", "достаточных", "adjective"),),
-                grammatical_case="genitive",
+            ),
+            SemanticDependency(
+                "predicate_complement",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "загадка",
+                        "загадкой",
+                        "noun",
+                        (("number", "singular"), ("gender", "feminine")),
+                    ),
+                    grammatical_case="instrumental",
+                ),
             ),
         ),
-    ]
-    if include_answer_topic:
-        dependencies.append(
-            SemanticDependency(
-                "topic",
-                ConceptArgument(
-                    ConceptLexeme("ответ", "ответ", "noun"),
-                    preposition="для",
-                    grammatical_case="genitive",
-                ),
-            )
-        )
-    return ClauseThought(
-        predicate=ConceptLexeme("нет", "нет", "predicate"),
-        dependencies=tuple(dependencies),
         confidence=0.91,
         evidence=evidence,
-        predicate_class="existential",
     )
 
 
@@ -849,44 +847,38 @@ def _no_person_attribution_thought(
     )
 
 
-def _missing_evidence_thought(
-    target: ConceptArgument | None,
+def _cannot_answer_current_question_thought(
     evidence: tuple[str, ...],
 ) -> ClauseThought:
-    dependencies: list[SemanticDependency] = [
-        SemanticDependency("location", _speaker_location()),
-        SemanticDependency(
-            "subject",
-            ConceptArgument(
-                ConceptLexeme(
-                    "данные",
-                    "данных",
-                    "noun",
-                    (("number", "plural"),),
+    """Tie the final recovery to the whole question, not an isolated noun."""
+
+    return ClauseThought(
+        predicate=_verb("мочь", "могу"),
+        dependencies=(
+            SemanticDependency("subject", _speaker()),
+            SemanticDependency(
+                "action_complement",
+                ConceptArgument(ConceptLexeme("ответить", "ответить", "verb")),
+            ),
+            SemanticDependency(
+                "location",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "вопрос",
+                        "вопрос",
+                        "noun",
+                        (("number", "singular"), ("gender", "masculine")),
+                    ),
+                    modifiers=(ConceptLexeme("этот", "этот", "adjective"),),
+                    preposition="на",
+                    grammatical_case="accusative",
                 ),
-                modifiers=(ConceptLexeme("достаточный", "достаточных", "adjective"),),
-                grammatical_case="genitive",
             ),
         ),
-    ]
-    if target is not None:
-        dependencies.append(
-            SemanticDependency(
-                "topic",
-                ConceptArgument(
-                    target.head,
-                    (),
-                    preposition="о",
-                    grammatical_case="prepositional",
-                ),
-            )
-        )
-    return ClauseThought(
-        predicate=ConceptLexeme("нет", "нет", "predicate"),
-        dependencies=tuple(dependencies),
-        confidence=0.74 if target is not None else 0.68,
+        negated=True,
+        confidence=0.70,
         evidence=evidence,
-        predicate_class="existential",
+        predicate_class="modal",
     )
 
 

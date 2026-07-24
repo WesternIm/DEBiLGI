@@ -28,6 +28,7 @@ def test_inflects_words_by_named_case() -> None:
     assert morphology.inflect("ключ", case="instrumental") == "ключом"
     assert morphology.inflect("словарь", case="instrumental") == "словарём"
     assert morphology.inflect("друг", case="dative") == "другу"
+    assert morphology.inflect("Германия", case="accusative") == "Германию"
 
 
 def test_normalizes_expressive_spelling_before_morphology() -> None:

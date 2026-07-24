@@ -153,3 +153,21 @@ def test_affective_state_is_derived_from_active_engagement() -> None:
         "Я чувствую интерес к разговору."
     )
     assert "engagement_state" in result.evidence
+
+
+def test_threat_response_is_answered_as_self_state_not_object_knowledge() -> None:
+    frame = analyze_self_state(
+        analyze_structured_utterance("Не боишься болотного монстра?")
+    )
+
+    assert frame is not None
+    assert frame.state == "threat_response"
+    assert frame.complete
+    result = reason_about_self_state(frame, _understanding("бояться", "монстр"))
+
+    assert result.thought is not None
+    assert realize_thought(result.thought)[0].text in {
+        "Да, я не боюсь болотного монстра.",
+        "Нет, я не боюсь болотного монстра.",
+    }
+    assert "no_observed_threat_response" in result.evidence

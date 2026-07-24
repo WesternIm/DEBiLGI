@@ -24,6 +24,7 @@ _STATE_PREDICATES = {
     "self_reflection": frozenset({"думать", "полагать", "оценивать", "оценить"}),
     "self_location": frozenset({"находиться", "располагаться", "быть", "жить"}),
     "affective_state": frozenset({"чувствовать", "ощущать"}),
+    "threat_response": frozenset({"бояться", "пугаться", "страшиться"}),
 }
 _NON_ATTESTED_SELF_TRAITS = frozenset({"осознанный", "сознательный"})
 _COGNITIVE_LEVEL_TARGETS = frozenset(
@@ -186,6 +187,15 @@ def reason_about_self_state(
             True,
             min(0.92, frame.confidence * 0.84 + 0.10),
             ("active_conversation", "engagement_state"),
+        )
+
+    if frame.state == "threat_response":
+        return SelfStateResolution(
+            _answer_thought(frame, False),
+            frame.state,
+            False,
+            min(0.92, frame.confidence * 0.84 + 0.10),
+            ("non_physical_agent", "no_observed_threat_response"),
         )
 
     if frame.state == "cognitive_level":

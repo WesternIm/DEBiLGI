@@ -124,6 +124,21 @@ def test_teacher_can_reclassify_a_complete_but_generic_question() -> None:
     assert "external_intent:position_request" in refined.evidence
 
 
+def test_teacher_reclassification_normalizes_target_and_quality() -> None:
+    generic = _act("Германия крутая страна?")
+    refined = refine_dialogue_act(
+        generic,
+        external_intent="opinion_question",
+        confidence=0.8,
+        external_response_obligation="answer",
+        expected_response_acts=("answer", "answer_first"),
+    )
+
+    assert refined.kind == "opinion_question"
+    assert refined.response_obligation == "express_position"
+    assert refined.objects == ("германия", "крутая")
+
+
 def test_candidate_meaning_not_generator_name_fulfils_the_obligation() -> None:
     praise = _act("Отлично")
     choice = _act("Чай или кофе?")

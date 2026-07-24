@@ -144,7 +144,7 @@ def test_preference_cause_follow_up_does_not_repeat_the_preference_claim() -> No
     assert resolution.kind == "preference_cause_unestablished"
     assert "небо" in resolution.target_terms
     assert realize_thought(resolution.thought, resolution.patterns)[0].text == (
-        "У меня нет достаточных оснований."
+        "Причина остаётся загадкой."
     )
 
 

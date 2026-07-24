@@ -2558,6 +2558,29 @@ class SafeMentionReplyService:
                     expected_response_acts=consultation.expected_response_acts,
                 )
                 if refined_act != dialogue_act:
+                    # The consultation is a semantic correction, not merely
+                    # another candidate generator.  Make the corrected act the
+                    # active response contract so every later gate, renderer
+                    # and persisted plan evaluates the actual user request.
+                    dialogue_act = refined_act
+                    communicative_intention = choose_communicative_intention(
+                        dialogue_act,
+                        utterance.context.social_policies,
+                        grounding_available=bool(internal_facts),
+                    )
+                    reframe_plan = (
+                        getattr(self._response_plans, "reframe", None)
+                        if self._response_plans is not None
+                        else None
+                    )
+                    if stored_plan is not None and callable(reframe_plan):
+                        stored_plan = await reframe_plan(
+                            stored_plan,
+                            message_intent=dialogue_act.kind,
+                            response_goal=dialogue_act.response_obligation,
+                            key_points=dialogue_act.objects,
+                            confidence=dialogue_act.confidence,
+                        )
                     add(
                         realize_dialogue_act(refined_act),
                         source="dialogue_act",
@@ -2581,6 +2604,67 @@ class SafeMentionReplyService:
                     if fact.strip() and internal_surface_reason(fact) is None
                 )
             )
+            if (
+                dialogue_act is not None
+                and dialogue_act.response_obligation == "express_position"
+                and not any(
+                    candidate.source == "position_reasoning"
+                    and not candidate.metadata.get("hard_rejection")
+                    for candidate in candidates
+                )
+            ):
+                # Research supplies evidence; it is not itself the answer to a
+                # subjective request.  Re-run owned position reasoning after
+                # intent refinement and fact collection, then realize a local
+                # first-person stance.  With no decisive evidence this yields
+                # a qualified, revisable position instead of a fake epistemic
+                # failure such as "недостаточно данных".
+                researched_position = await self._position_reasoning.resolve(
+                    event.guild_id,
+                    dialogue_act,
+                    facts=tuple(dict.fromkeys((*internal_facts, *semantic_facts))),
+                    context_messages=utterance.context.dialogue_messages,
+                )
+                researched_position_surfaces = (
+                    realize_position(
+                        researched_position,
+                        utterance.context.dependency_patterns,
+                    )
+                    if researched_position is not None
+                    else ()
+                )
+                for researched_surface in researched_position_surfaces:
+                    add(
+                        researched_surface.text,
+                        source="position_reasoning",
+                        renderer=(
+                            "position_dependencies:"
+                            f"consulted_{researched_surface.source}"
+                        ),
+                        confidence=min(
+                            researched_position.confidence,
+                            researched_surface.confidence,
+                        ),
+                        key_points=(
+                            researched_position.target,
+                            researched_position.quality,
+                        ),
+                        metadata={
+                            "position_key": researched_position.position_key,
+                            "position_stance": researched_position.stance,
+                            "position_score": researched_position.score,
+                            "position_confidence": researched_position.confidence,
+                            "position_evidence": researched_position.evidence,
+                            "expression_mode": researched_position.expression_mode,
+                            "response_move": "state_position",
+                            "role_order": researched_surface.role_order,
+                            "construction_id": researched_surface.construction_id,
+                            "consulted_intent_refinement": True,
+                            "authored_reply_template": False,
+                        },
+                    )
+                if researched_position_surfaces:
+                    position_decision = researched_position
             persist = (
                 getattr(
                     self._knowledge_service,

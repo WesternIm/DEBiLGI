@@ -499,10 +499,24 @@ def refine_dialogue_act(
         or obligation in {"express_position", "decide"}
         or bool(expected & {"express_position", "decide"})
     ):
+        # A generic zero-copula parse keeps the grammatical subject outside
+        # ``objects`` and places all complements there.  Position reasoning,
+        # however, consumes the semantic pair ``(target, quality)``.  Preserve
+        # that contract when the teacher resolves an open-ended adjective as
+        # an evaluation: ``Германия крутая страна?`` becomes
+        # ``(Германия, крутая)``, not ``(крутая, страна)``.
+        position_objects = frame.objects
+        if (
+            frame.subject is not None
+            and frame.subject not in _DEICTIC_SUBJECTS
+            and frame.objects
+        ):
+            position_objects = (frame.subject, frame.objects[0])
         return replace(
             frame,
             kind="opinion_question",
             response_obligation="express_position",
+            objects=position_objects,
             complete=True,
             confidence=min(0.86, max(frame.confidence, confidence * 0.90)),
             evidence=(*frame.evidence, "external_intent:position_request"),

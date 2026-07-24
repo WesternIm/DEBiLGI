@@ -43,3 +43,25 @@ async def test_opinion_wrapper_does_not_replace_a_concrete_capability_reasoner()
     decision = await PositionReasoningService().resolve(1, _frame(predicate="уметь"))
 
     assert decision is None
+
+
+async def test_owned_position_preserves_geographical_name_capitalization() -> None:
+    frame = DialogueActFrame(
+        kind="opinion_question",
+        response_obligation="express_position",
+        subject="германия",
+        predicate="быть",
+        objects=("германия", "крутая"),
+        polarity=0.0,
+        register="neutral",
+        complete=True,
+        confidence=0.84,
+        evidence=("external_intent:position_request",),
+    )
+
+    decision = await PositionReasoningService().resolve(1, frame)
+
+    assert decision is not None
+    assert realize_position(decision)[0].text == (
+        "Нет, я пока не считаю Германию крутой."
+    )

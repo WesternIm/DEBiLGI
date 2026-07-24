@@ -58,3 +58,14 @@ def test_syncretic_pronoun_case_does_not_reject_a_valid_fallback() -> None:
 
     assert "governed_case_mismatch" not in result.hard_issues
     assert result.learnable
+
+
+def test_generic_data_counter_is_never_a_user_facing_answer() -> None:
+    for text in (
+        "У меня недостаточно данных.",
+        "У меня нет достаточных данных о стране.",
+        "Достаточных данных нет у меня о стране.",
+        "У меня нет достаточных оснований.",
+        "В памяти не хватает фактов.",
+    ):
+        assert internal_surface_reason(text) is not None

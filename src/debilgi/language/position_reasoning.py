@@ -488,10 +488,23 @@ def _is_negated(text: str) -> bool:
 def _target_argument(target: str) -> ConceptArgument:
     reading = DEFAULT_MORPHOLOGY.best(target)
     if reading is not None and reading.is_known:
+        is_proper_name = bool(
+            reading.grammemes
+            & {
+                "Name",
+                "Surn",
+                "Patr",
+                "Geox",
+                "Orgn",
+                "Trad",
+            }
+        )
+        lemma = reading.lemma.capitalize() if is_proper_name else reading.lemma
+        surface = target.capitalize() if is_proper_name else target
         return ConceptArgument(
             ConceptLexeme(
-                reading.lemma,
-                target,
+                lemma,
+                surface,
                 reading.part_of_speech,
                 tuple(
                     (name, value)

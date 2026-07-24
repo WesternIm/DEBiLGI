@@ -850,7 +850,12 @@ class SemanticConsultationService:
         )
         if result is None:
             return ()
-        return _topical_research_facts(normalized_prompt, result.facts)
+        facts = _topical_research_facts(normalized_prompt, result.facts)
+        return _facts_fitting_research_intent(
+            result,
+            normalized_terms,
+            facts,
+        )
 
     async def close(self) -> None:
         await self._consultant.close()
@@ -915,6 +920,61 @@ def _topical_research_facts(
         if cleaned not in accepted:
             accepted.append(cleaned)
     return tuple(accepted[:4])
+
+
+def _facts_fitting_research_intent(
+    result: ConsultationResult,
+    subject_terms: Sequence[str],
+    facts: Sequence[str],
+) -> tuple[str, ...]:
+    """Keep whole-proposition evidence for evaluations, not word definitions."""
+
+    intent = result.intent.casefold().replace("-", "_")
+    if not any(marker in intent for marker in ("opinion", "evaluation", "appraisal")):
+        return tuple(facts)
+    normalized_terms = tuple(
+        dict.fromkeys(
+            term.casefold().replace("ё", "е").strip()
+            for term in subject_terms
+            if term.strip()
+        )
+    )
+    quality_terms = {
+        token.lemma.casefold().replace("ё", "е")
+        for token in result.tokens
+        if token.lemma
+        and token.part_of_speech == "adjective"
+        and token.role in {"predicate", "predicate_complement", "modifier"}
+    }
+    target_terms = tuple(term for term in normalized_terms if term not in quality_terms)
+    accepted: list[str] = []
+    for fact in facts:
+        fact_terms = tuple(content_lemmas(fact))
+        matched_quality = any(
+            same_lexical_family(quality, term)
+            for quality in quality_terms
+            for term in fact_terms
+        )
+        matched_target = any(
+            same_lexical_family(target, term)
+            for target in target_terms
+            for term in fact_terms
+        )
+        if quality_terms:
+            fits = matched_quality and matched_target
+        else:
+            matched_subjects = {
+                subject
+                for subject in normalized_terms
+                if any(
+                    same_lexical_family(subject, term)
+                    for term in fact_terms
+                )
+            }
+            fits = len(matched_subjects) >= 2
+        if fits:
+            accepted.append(fact)
+    return tuple(accepted)
 
 
 def _parse_json_object(value: object) -> Mapping[str, Any] | None:
