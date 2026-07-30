@@ -13,7 +13,7 @@ def _resolve(prompt: str, *context: str) -> tuple[str, str]:
         context,
     )
     assert resolution is not None
-    surfaces = realize_thought(resolution.thought)
+    surfaces = realize_thought(resolution.thought, resolution.patterns)
     assert surfaces
     return resolution.kind, surfaces[0].text
 
@@ -26,8 +26,8 @@ def test_epistemic_follow_ups_select_different_semantic_actions() -> None:
         "Я не выдумываю ответ.",
     )
     assert _resolve("Почему же не знаешь?", previous) == (
-        "epistemic_cause",
-        "У меня нет достаточных оснований для ответа.",
+        "overcautious_response_cause",
+        "Я слишком осторожно отвечаю из-за завышенного порога.",
     )
     assert _resolve("А хотел бы знать?", previous) == (
         "epistemic_desire",
@@ -43,6 +43,16 @@ def test_cognitive_method_is_answered_from_actual_local_process() -> None:
 
     assert kind == "cognitive_method"
     assert text == "Я анализирую контекст."
+
+
+def test_reciprocal_intent_question_answers_the_dialogue_goal_not_the_verb_definition() -> None:
+    kind, text = _resolve(
+        "Хз, а ты что хочешь сказать?",
+        "Что ты хочешь сказать про типо?",
+    )
+
+    assert kind == "current_conversational_intent"
+    assert text == "Я хочу понять твою мысль."
 
 
 def test_elliptical_conditional_restores_the_previous_proposition() -> None:
@@ -78,6 +88,16 @@ def test_person_attribution_gap_does_not_turn_a_label_into_missing_data() -> Non
     )
 
 
+def test_embedded_content_clause_does_not_create_an_epistemic_gap() -> None:
+    plans = epistemic_gap_candidates_for_question(
+        analyze_structured_utterance(
+            "Ой бля, не делай вид, что ты не понял, ахахахах"
+        )
+    )
+
+    assert plans == ()
+
+
 def test_contextual_reasoning_does_not_capture_an_independent_cause_question() -> None:
     resolution = reason_about_contextual_question(
         analyze_structured_utterance("Почему небо синее?"),
@@ -111,6 +131,33 @@ def test_reason_follow_up_uses_embodiment_instead_of_generic_evidence_gap() -> N
     assert realize_thought(resolution.thought)[0].text == "У меня нет тела."
 
 
+def test_reason_follow_up_to_self_position_stays_in_the_conversation() -> None:
+    resolution = reason_about_contextual_question(
+        analyze_structured_utterance("А почему так?"),
+        ("Нет, я не считаю себя героем.",),
+    )
+
+    assert resolution is not None
+    assert resolution.kind == "self_assessment_cause"
+    assert realize_thought(resolution.thought, resolution.patterns)[0].text == (
+        "У меня нет оснований для такой оценки."
+    )
+
+
+def test_reason_follow_up_to_old_epistemic_fallback_does_not_repeat_it() -> None:
+    resolution = reason_about_contextual_question(
+        analyze_structured_utterance("А почему так?"),
+        ("Я не могу ответить на этот вопрос.",),
+    )
+
+    assert resolution is not None
+    assert resolution.kind == "overcautious_response_cause"
+    assert "не могу ответить" not in realize_thought(
+        resolution.thought,
+        resolution.patterns,
+    )[0].text.casefold()
+
+
 def test_location_follow_up_exposes_the_missing_slot_instead_of_inventing_it() -> None:
     resolution = reason_about_contextual_question(
         analyze_structured_utterance("Куда орут?"),
@@ -134,7 +181,7 @@ def test_preference_cause_follow_up_does_not_repeat_the_preference_claim() -> No
     assert resolution.kind == "preference_cause_unestablished"
     assert "небо" in resolution.target_terms
     assert realize_thought(resolution.thought, resolution.patterns)[0].text == (
-        "У меня нет достаточных оснований."
+        "Причина остаётся загадкой."
     )
 
 
@@ -145,11 +192,26 @@ def test_epistemic_action_is_not_misclassified_as_bodily_action() -> None:
     )
 
     assert resolution is not None
-    assert resolution.kind == "epistemic_cause"
+    assert resolution.kind == "overcautious_response_cause"
     assert "external_action_requires_body" not in resolution.evidence
     assert realize_thought(resolution.thought, resolution.patterns)[0].text == (
-        "У меня нет достаточных оснований для ответа."
+        "Я слишком осторожно отвечаю из-за завышенного порога."
     )
+
+
+def test_criticism_after_no_data_reply_gets_a_cause_not_another_no_data_reply() -> None:
+    resolution = reason_about_contextual_question(
+        analyze_structured_utterance(
+            "Да почему ты такой пугливый в ответах?"
+        ),
+        ("У меня нет достаточных данных.",),
+    )
+
+    assert resolution is not None
+    assert resolution.kind == "overcautious_response_cause"
+    surface = realize_thought(resolution.thought, resolution.patterns)[0].text
+    assert surface == "Я слишком осторожно отвечаю из-за завышенного порога."
+    assert "недостаточ" not in surface.casefold()
 
 
 def test_counterevidence_revises_a_denied_internal_capability() -> None:

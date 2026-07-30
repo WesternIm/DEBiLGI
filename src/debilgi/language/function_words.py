@@ -31,13 +31,19 @@ CONJUNCTIONS = frozenset(
         "а",
         "но",
         "чтобы",
+        "что",
         "или",
         "либо",
         "если",
         "хотя",
+        "хоть",
         "зато",
         "однако",
+        "ибо",
         "потому",
+        "поскольку",
+        "раз",
+        "ежели",
         "поэтому",
         "когда",
         "пока",
@@ -147,6 +153,8 @@ def service_word_reason(
         return f"part_of_speech:{normalized_part}"
     if normalized in PARTICLES:
         return "particle"
+    if normalized == "что" and role(normalized) == "question" and question_context:
+        return "question_word"
     if normalized in CONJUNCTIONS:
         return "conjunction"
     if normalized in PREPOSITIONS:

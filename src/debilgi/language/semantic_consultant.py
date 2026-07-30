@@ -14,6 +14,8 @@ from uuid import uuid4
 import aiohttp
 
 from debilgi.language.construction_nlg import ConstructionSpec
+from debilgi.language.content import content_lemmas
+from debilgi.language.lexical_matching import same_lexical_family
 from debilgi.language.surface_policy import internal_surface_reason
 from debilgi.storage.database import Database
 
@@ -23,6 +25,33 @@ _MAX_PROMPT_CHARS = 2_000
 _MAX_CONTEXT_MESSAGES = 8
 _MAX_CONTEXT_CHARS = 4_000
 _MAX_FACT_CHARS = 500
+_PLANNING_INSTRUCTION = """
+Ты — семантический планировщик русскоязычного агента DEBiLGI. Ты не пишешь ответ
+пользователю. Верни только JSON по переданной схеме.
+
+Сформируй 2–4 различных response_plans. В них разрешены только:
+- абстрактный move и stance;
+- лемма русского глагола в инфинитиве;
+- аргументы как отдельные словарные леммы с семантическими ролями;
+- грамматические признаки, отрицание и evidence_ids.
+
+Запрещены готовые фразы, surface-текст, порядок слов, цитаты и поля answer/reply/response.
+Каждое утверждение обязано ссылаться на существующий id из grounding_facts.
+Не выдумывай факты и id.
+
+Если grounding fact начинается с
+predicate=...;subject=...;role=...;truth=...,
+перенеси эту пропозицию точно:
+- agent становится subject с lemma=я;
+- каждый указанный role остаётся тем же role;
+- truth=false означает negated=true, truth=true означает negated=false;
+- субъект и объект нельзя переставлять или опускать;
+- predicate должен оставаться глагольной леммой, а не названием темы.
+
+personality_drives влияют только на выбор разных move и stance. Окончательный выбор и
+русскую формулировку делает локальная система. В плане я означает DEBiLGI, ты —
+пользователя. response_polarity используй только для прямого да/нет, иначе null.
+""".strip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +101,35 @@ class ConsultantSocialFrame:
 
 
 @dataclass(frozen=True, slots=True)
+class ConsultantResponseArgument:
+    role: str
+    lemma: str
+    part_of_speech: str
+    grammatical_case: str | None
+    preposition: str | None
+    modifiers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ConsultantResponseProposition:
+    predicate: str
+    predicate_features: tuple[tuple[str, str], ...]
+    arguments: tuple[ConsultantResponseArgument, ...]
+    clause_kind: str
+    negated: bool
+    response_polarity: bool | None
+    evidence_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ConsultantResponsePlan:
+    move: str
+    stance: str
+    propositions: tuple[ConsultantResponseProposition, ...]
+    confidence: float
+
+
+@dataclass(frozen=True, slots=True)
 class ConsultationRequest:
     prompt: str
     context_messages: tuple[str, ...]
@@ -81,6 +139,9 @@ class ConsultationRequest:
     local_confidence: float
     reason_codes: tuple[str, ...]
     mode: str = "utterance"
+    grounding_facts: tuple[tuple[str, str], ...] = ()
+    personality_drives: tuple[tuple[str, float], ...] = ()
+    response_obligation: str = ""
 
     @property
     def input_hash(self) -> str:
@@ -97,6 +158,14 @@ class ConsultationRequest:
             "local_relations": [list(item) for item in self.local_relations[:24]],
             "local_confidence": _clamp(self.local_confidence),
             "reason_codes": list(self.reason_codes[:12]),
+            "grounding_facts": [
+                {"id": fact_id, "value": value} for fact_id, value in self.grounding_facts[:24]
+            ],
+            "personality_drives": {
+                name: _clamp(value) for name, value in self.personality_drives[:24]
+            },
+            "response_obligation": self.response_obligation,
+            "contract_version": 2,
         }
 
 
@@ -113,6 +182,7 @@ class ConsultationResult:
     constructions: tuple[ConstructionSpec, ...]
     expected_response_acts: tuple[str, ...]
     social_frame: ConsultantSocialFrame | None
+    response_plans: tuple[ConsultantResponsePlan, ...]
     register: str
     facts: tuple[str, ...]
     response_text: str | None
@@ -147,8 +217,7 @@ class ConsultationResult:
                 target=_clean_text(item.get("target"), 120),
             )
             for item in _mapping_items(payload.get("relations"), 20)
-            if _clean_text(item.get("source"), 120)
-            and _clean_text(item.get("target"), 120)
+            if _clean_text(item.get("source"), 120) and _clean_text(item.get("target"), 120)
         )
         ambiguities = tuple(
             ConsultantAmbiguity(
@@ -199,12 +268,12 @@ class ConsultationResult:
             if _clean_token(item, "")
         )
         social_frame = _social_frame(payload.get("social_frame"))
+        response_plans = _response_plans(payload.get("response_plans"))
         if not sentence_pattern:
             sentence_pattern = tuple(
                 token.role
                 for token in tokens
-                if token.role
-                not in {"function", "function_word", "address", "punctuation"}
+                if token.role not in {"function", "function_word", "address", "punctuation"}
             )
         if not expected_response_acts and social_frame is not None:
             expected_response_acts = tuple(
@@ -235,6 +304,7 @@ class ConsultationResult:
             constructions=constructions,
             expected_response_acts=expected_response_acts,
             social_frame=social_frame,
+            response_plans=response_plans,
             register=register,
             facts=facts,
             # Compatibility field for stored consultations.  External models
@@ -296,6 +366,36 @@ class ConsultationResult:
                 if self.social_frame is not None
                 else None
             ),
+            "response_plans": [
+                {
+                    "move": plan.move,
+                    "stance": plan.stance,
+                    "confidence": plan.confidence,
+                    "propositions": [
+                        {
+                            "predicate": proposition.predicate,
+                            "predicate_features": dict(proposition.predicate_features),
+                            "arguments": [
+                                {
+                                    "role": argument.role,
+                                    "lemma": argument.lemma,
+                                    "part_of_speech": argument.part_of_speech,
+                                    "grammatical_case": (argument.grammatical_case),
+                                    "preposition": argument.preposition,
+                                    "modifiers": list(argument.modifiers),
+                                }
+                                for argument in proposition.arguments
+                            ],
+                            "clause_kind": proposition.clause_kind,
+                            "negated": proposition.negated,
+                            "response_polarity": (proposition.response_polarity),
+                            "evidence_ids": list(proposition.evidence_ids),
+                        }
+                        for proposition in plan.propositions
+                    ],
+                }
+                for plan in self.response_plans
+            ],
             "register": self.register,
             "facts": list(self.facts),
             "response_text": self.response_text,
@@ -322,99 +422,6 @@ class SemanticAssimilator(Protocol):
     ) -> int: ...
 
 
-class PuterSidecarConsultant:
-    """Call the local Node/Puter bridge and validate its structured response."""
-
-    def __init__(
-        self,
-        endpoint: str,
-        *,
-        model: str,
-        timeout_seconds: int = 12,
-        shared_secret: str | None = None,
-    ) -> None:
-        self.endpoint = endpoint.rstrip("/")
-        self.model = model
-        self.timeout_seconds = timeout_seconds
-        self.shared_secret = shared_secret
-        self._session: aiohttp.ClientSession | None = None
-        self.last_failure_retryable = False
-
-    async def consult(self, request: ConsultationRequest) -> ConsultationResult | None:
-        self.last_failure_retryable = False
-        session = await self._get_session()
-        headers = {"Content-Type": "application/json"}
-        if self.shared_secret:
-            headers["Authorization"] = f"Bearer {self.shared_secret}"
-        try:
-            async with session.post(
-                self.endpoint,
-                json={"model": self.model, "request": request.as_dict()},
-                headers=headers,
-            ) as response:
-                if response.status != 200:
-                    detail = "unknown_error"
-                    try:
-                        error_payload = await response.json(content_type=None)
-                        if isinstance(error_payload, Mapping):
-                            detail = _clean_text(error_payload.get("error"), 240)
-                    except (aiohttp.ClientError, json.JSONDecodeError, TypeError):
-                        pass
-                    logger.warning(
-                        "Puter sidecar returned HTTP %d: %s",
-                        response.status,
-                        detail or "unknown_error",
-                    )
-                    normalized_detail = (detail or "").casefold()
-                    self.last_failure_retryable = response.status in {
-                        408,
-                        429,
-                        502,
-                        503,
-                        504,
-                    } or any(
-                        marker in normalized_detail
-                        for marker in (
-                            "usage left",
-                            "rate limit",
-                            "timeout",
-                            "temporarily",
-                            "unavailable",
-                            "bridge",
-                        )
-                    )
-                    return None
-                envelope = await response.json(content_type=None)
-        except (aiohttp.ClientError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-            self.last_failure_retryable = True
-            logger.warning("Puter semantic consultation failed: %s", type(exc).__name__)
-            return None
-        content = envelope.get("content") if isinstance(envelope, Mapping) else None
-        parsed = _parse_json_object(content)
-        if parsed is None:
-            logger.warning("Puter semantic consultation returned invalid JSON")
-            return None
-        provider = _clean_token(envelope.get("provider"), "puter")
-        model = _clean_token(envelope.get("model"), self.model)
-        try:
-            return ConsultationResult.from_payload(parsed, provider=provider, model=model)
-        except ValueError as exc:
-            logger.warning("Rejected Puter consultation: %s", exc)
-            return None
-
-    async def close(self) -> None:
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout_seconds)
-            )
-        return self._session
-
-
 class CloudflareWorkersAIConsultant:
     """Use Workers AI as a structured teacher, never as a reply generator."""
 
@@ -433,13 +440,17 @@ class CloudflareWorkersAIConsultant:
         self.instruction = instruction.strip()
         self.timeout_seconds = timeout_seconds
         self.endpoint = (
-            "https://api.cloudflare.com/client/v4/accounts/"
-            f"{self.account_id}/ai/run/{self.model}"
+            f"https://api.cloudflare.com/client/v4/accounts/{self.account_id}/ai/run/{self.model}"
         )
         self._session: aiohttp.ClientSession | None = None
         self.last_failure_retryable = False
+        self._quota_blocked_until: datetime | None = None
 
     async def consult(self, request: ConsultationRequest) -> ConsultationResult | None:
+        now = datetime.now(UTC)
+        if self._quota_blocked_until is not None and now < self._quota_blocked_until:
+            self.last_failure_retryable = True
+            return None
         self.last_failure_retryable = False
         session = await self._get_session()
         headers = {
@@ -448,7 +459,12 @@ class CloudflareWorkersAIConsultant:
         }
         payload = {
             "messages": [
-                {"role": "system", "content": self.instruction},
+                {
+                    "role": "system",
+                    "content": (
+                        _PLANNING_INSTRUCTION if request.mode == "planning" else self.instruction
+                    ),
+                },
                 {
                     "role": "user",
                     "content": json.dumps(request.as_dict(), ensure_ascii=False),
@@ -456,10 +472,10 @@ class CloudflareWorkersAIConsultant:
             ],
             "response_format": {
                 "type": "json_schema",
-                "json_schema": _consultation_response_schema(),
+                "json_schema": _consultation_response_schema(planning=request.mode == "planning"),
             },
             "temperature": 0.1,
-            "max_tokens": 2_048,
+            "max_tokens": 1_024 if request.mode == "planning" else 2_048,
         }
         try:
             async with session.post(
@@ -484,6 +500,18 @@ class CloudflareWorkersAIConsultant:
                         503,
                         504,
                     }
+                    lowered_detail = detail.casefold()
+                    if (
+                        response.status == 429
+                        and "daily" in lowered_detail
+                        and ("allocation" in lowered_detail or "quota" in lowered_detail)
+                    ):
+                        tomorrow = (now + timedelta(days=1)).date()
+                        self._quota_blocked_until = datetime.combine(
+                            tomorrow,
+                            datetime.min.time(),
+                            tzinfo=UTC,
+                        ) + timedelta(minutes=5)
                     return None
         except (aiohttp.ClientError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             self.last_failure_retryable = True
@@ -559,8 +587,7 @@ class SemanticConsultationRepository:
         for row in rows:
             try:
                 stored_terms = {
-                    str(item).casefold()
-                    for item in json.loads(str(row["subject_terms_json"]))
+                    str(item).casefold() for item in json.loads(str(row["subject_terms_json"]))
                 }
             except (json.JSONDecodeError, TypeError):
                 continue
@@ -648,6 +675,12 @@ class SemanticConsultationService:
         self._assimilator = assimilator
 
     @property
+    def autonomous_planning(self) -> bool:
+        """Enable planner-only replies only while the provider is configured."""
+
+        return self.enabled
+
+    @property
     def last_failure_retryable(self) -> bool:
         return bool(getattr(self._consultant, "last_failure_retryable", False))
 
@@ -658,9 +691,9 @@ class SemanticConsultationService:
         unknown_terms: Sequence[str],
         has_bound_answer: bool,
     ) -> bool:
-        # A high lexical score alone is not proof that the system knows what to
-        # say: the old pipeline frequently scored every word as known while
-        # failing to construct a reply-bound proposition.
+        # Response planning is invoked separately for every turn.  This gate
+        # remains specific to semantic repair of an unresolved input.
+        del local_confidence, unknown_terms
         return self.enabled and not has_bound_answer
 
     async def consult(
@@ -702,8 +735,7 @@ class SemanticConsultationService:
                         observed_at=now,
                     )
                 logger.info(
-                    "event=%s mode=utterance result=lexical_cache "
-                    "terms=%s confidence=%.3f",
+                    "event=%s mode=utterance result=lexical_cache terms=%s confidence=%.3f",
                     event_id,
                     request.unknown_terms,
                     lexical.confidence,
@@ -721,8 +753,7 @@ class SemanticConsultationService:
             return None
         if result.confidence < self.minimum_result_confidence:
             logger.info(
-                "event=%s mode=%s result=below_confidence confidence=%.3f "
-                "minimum=%.3f intent=%s",
+                "event=%s mode=%s result=below_confidence confidence=%.3f minimum=%.3f intent=%s",
                 event_id,
                 request.mode,
                 result.confidence,
@@ -759,6 +790,141 @@ class SemanticConsultationService:
         )
         return result
 
+    async def research_lexeme(
+        self,
+        *,
+        event_id: str | None,
+        guild_id: int,
+        channel_id: int | None,
+        term: str,
+        context_messages: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        """Ask the teacher for reusable facts after reference sources fail.
+
+        This deliberately uses lexical mode.  The provider still cannot return
+        a ready-made reply: only topical facts or a lexical interpretation are
+        admitted, and the local response pipeline remains responsible for the
+        final surface.
+        """
+
+        normalized = " ".join(term.casefold().replace("ё", "е").split())
+        if not self.enabled or not normalized:
+            return ()
+        result = await self.consult(
+            event_id=event_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            request=ConsultationRequest(
+                prompt=normalized,
+                context_messages=context_messages,
+                known_terms=(),
+                unknown_terms=(normalized,),
+                local_relations=(),
+                local_confidence=0.0,
+                reason_codes=(
+                    "reference_sources_exhausted",
+                    "lexical_research",
+                ),
+                mode="lexical",
+            ),
+        )
+        if result is None:
+            return ()
+        return _topical_research_facts(
+            normalized,
+            (*result.facts, result.interpretation),
+        )
+
+    async def research_question(
+        self,
+        *,
+        event_id: str | None,
+        guild_id: int,
+        channel_id: int | None,
+        prompt: str,
+        context_messages: tuple[str, ...] = (),
+        subject_terms: Sequence[str] = (),
+        local_relations: Sequence[tuple[str, str, str]] = (),
+    ) -> tuple[str, ...]:
+        """Research facts required by an unresolved request before arbitration."""
+
+        normalized_prompt = " ".join(prompt.split())
+        normalized_terms = tuple(
+            dict.fromkeys(
+                term.casefold().replace("ё", "е").strip() for term in subject_terms if term.strip()
+            )
+        )
+        if not self.enabled or not normalized_prompt:
+            return ()
+        result = await self.consult(
+            event_id=event_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            request=ConsultationRequest(
+                prompt=normalized_prompt,
+                context_messages=context_messages,
+                known_terms=normalized_terms,
+                unknown_terms=(),
+                local_relations=tuple(local_relations),
+                local_confidence=0.0,
+                reason_codes=(
+                    "no_reply_bound_local_candidate",
+                    "foreground_answer_research",
+                    "reference_sources_consulted",
+                ),
+                mode="research",
+            ),
+        )
+        if result is None:
+            return ()
+        facts = _topical_research_facts(normalized_prompt, result.facts)
+        return _facts_fitting_research_intent(
+            result,
+            normalized_terms,
+            facts,
+        )
+
+    async def plan_response(
+        self,
+        *,
+        event_id: str | None,
+        guild_id: int,
+        channel_id: int | None,
+        prompt: str,
+        context_messages: tuple[str, ...],
+        known_terms: Sequence[str],
+        local_relations: Sequence[tuple[str, str, str]],
+        grounding_facts: Sequence[tuple[str, str]],
+        personality_drives: Sequence[tuple[str, float]],
+        response_obligation: str,
+        local_confidence: float,
+    ) -> ConsultationResult | None:
+        """Request semantic alternatives without requesting reply wording."""
+
+        if not self.enabled or not prompt.strip():
+            return None
+        return await self.consult(
+            event_id=event_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            request=ConsultationRequest(
+                prompt=" ".join(prompt.split()),
+                context_messages=context_messages,
+                known_terms=tuple(known_terms),
+                unknown_terms=(),
+                local_relations=tuple(local_relations),
+                local_confidence=local_confidence,
+                reason_codes=(
+                    "autonomous_semantic_response_planning",
+                    "no_external_surface_allowed",
+                ),
+                mode="planning",
+                grounding_facts=tuple(grounding_facts),
+                personality_drives=tuple(personality_drives),
+                response_obligation=response_obligation,
+            ),
+        )
+
     async def close(self) -> None:
         await self._consultant.close()
 
@@ -784,6 +950,90 @@ def _utterance_requests_lexical_meaning(prompt: str) -> bool:
     return any(marker in normalized for marker in lexical_markers)
 
 
+def _topical_research_facts(
+    term: str,
+    candidates: Sequence[str],
+) -> tuple[str, ...]:
+    """Keep definitions, not descriptions of the user's request."""
+
+    target_terms = set(content_lemmas(term)) or {term}
+    meta_markers = (
+        "пользователь просит",
+        "пользователь хочет",
+        "определить значение",
+        "объяснить значение",
+        "запрос о",
+        "вопрос о",
+        "the user asks",
+        "define the meaning",
+    )
+    accepted: list[str] = []
+    for candidate in candidates:
+        cleaned = _clean_text(candidate, _MAX_FACT_CHARS)
+        normalized = cleaned.casefold().replace("ё", "е")
+        if (
+            not cleaned
+            or internal_surface_reason(cleaned) is not None
+            or any(marker in normalized for marker in meta_markers)
+        ):
+            continue
+        fact_terms = set(content_lemmas(cleaned))
+        topical = bool(target_terms & fact_terms) or any(
+            same_lexical_family(target, fact) for target in target_terms for fact in fact_terms
+        )
+        if not topical or len(fact_terms) < 2:
+            continue
+        if cleaned not in accepted:
+            accepted.append(cleaned)
+    return tuple(accepted[:4])
+
+
+def _facts_fitting_research_intent(
+    result: ConsultationResult,
+    subject_terms: Sequence[str],
+    facts: Sequence[str],
+) -> tuple[str, ...]:
+    """Keep whole-proposition evidence for evaluations, not word definitions."""
+
+    intent = result.intent.casefold().replace("-", "_")
+    if not any(marker in intent for marker in ("opinion", "evaluation", "appraisal")):
+        return tuple(facts)
+    normalized_terms = tuple(
+        dict.fromkeys(
+            term.casefold().replace("ё", "е").strip() for term in subject_terms if term.strip()
+        )
+    )
+    quality_terms = {
+        token.lemma.casefold().replace("ё", "е")
+        for token in result.tokens
+        if token.lemma
+        and token.part_of_speech == "adjective"
+        and token.role in {"predicate", "predicate_complement", "modifier"}
+    }
+    target_terms = tuple(term for term in normalized_terms if term not in quality_terms)
+    accepted: list[str] = []
+    for fact in facts:
+        fact_terms = tuple(content_lemmas(fact))
+        matched_quality = any(
+            same_lexical_family(quality, term) for quality in quality_terms for term in fact_terms
+        )
+        matched_target = any(
+            same_lexical_family(target, term) for target in target_terms for term in fact_terms
+        )
+        if quality_terms:
+            fits = matched_quality and matched_target
+        else:
+            matched_subjects = {
+                subject
+                for subject in normalized_terms
+                if any(same_lexical_family(subject, term) for term in fact_terms)
+            }
+            fits = len(matched_subjects) >= 2
+        if fits:
+            accepted.append(fact)
+    return tuple(accepted)
+
+
 def _parse_json_object(value: object) -> Mapping[str, Any] | None:
     if isinstance(value, Mapping):
         return value
@@ -806,8 +1056,133 @@ def _parse_json_object(value: object) -> Mapping[str, Any] | None:
     return parsed if isinstance(parsed, Mapping) else None
 
 
-def _consultation_response_schema() -> dict[str, object]:
+def _consultation_response_schema(
+    *,
+    planning: bool = False,
+) -> dict[str, object]:
     string_array = {"type": "array", "items": {"type": "string"}}
+    response_argument = {
+        "type": "object",
+        "properties": {
+            "role": {
+                "type": "string",
+                "enum": [
+                    "subject",
+                    "direct_object",
+                    "indirect_object",
+                    "predicate_complement",
+                    "action_complement",
+                    "manner",
+                    "cause",
+                    "location",
+                    "topic",
+                ],
+            },
+            "lemma": {
+                "type": "string",
+                "description": (
+                    "One Russian dictionary lemma for this argument; "
+                    "never a phrase or inflected surface."
+                ),
+            },
+            "part_of_speech": {
+                "type": "string",
+                "enum": [
+                    "noun",
+                    "verb",
+                    "adjective",
+                    "adverb",
+                    "pronoun",
+                    "numeral",
+                ],
+            },
+            "grammatical_case": {
+                "type": ["string", "null"],
+                "enum": [
+                    "nominative",
+                    "genitive",
+                    "dative",
+                    "accusative",
+                    "instrumental",
+                    "prepositional",
+                    None,
+                ],
+            },
+            "preposition": {
+                "type": ["string", "null"],
+            },
+            "modifiers": string_array,
+        },
+        "required": [
+            "role",
+            "lemma",
+            "part_of_speech",
+            "grammatical_case",
+            "preposition",
+            "modifiers",
+        ],
+    }
+    response_proposition = {
+        "type": "object",
+        "properties": {
+            "predicate": {
+                "type": "string",
+                "description": (
+                    "Exactly one Russian verb lemma in infinitive form, "
+                    "for example видеть, знать, считать, уточнить. "
+                    "Never use a noun or repeat an argument lemma here."
+                ),
+            },
+            "predicate_features": {
+                "type": "object",
+                "properties": {
+                    "tense": {
+                        "type": "string",
+                        "enum": ["present", "past", "future"],
+                    },
+                    "person": {
+                        "type": "string",
+                        "enum": ["first", "second", "third"],
+                    },
+                    "number": {
+                        "type": "string",
+                        "enum": ["singular", "plural"],
+                    },
+                    "gender": {
+                        "type": "string",
+                        "enum": ["masculine", "feminine", "neuter"],
+                    },
+                },
+            },
+            "arguments": {
+                "type": "array",
+                "items": response_argument,
+                "minItems": 1,
+            },
+            "clause_kind": {
+                "type": "string",
+                "enum": ["statement", "question", "command"],
+            },
+            "negated": {"type": "boolean"},
+            "response_polarity": {
+                "type": ["boolean", "null"],
+            },
+            "evidence_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1 if planning else 0,
+            },
+        },
+        "required": [
+            "predicate",
+            "predicate_features",
+            "arguments",
+            "clause_kind",
+            "negated",
+            "response_polarity",
+            "evidence_ids",
+        ],
+    }
     return {
         "type": "object",
         "properties": {
@@ -822,11 +1197,60 @@ def _consultation_response_schema() -> dict[str, object]:
             "constructions": {"type": "array", "items": {"type": "object"}},
             "expected_response_acts": string_array,
             "social_frame": {"type": "object"},
+            "response_plans": {
+                "type": "array",
+                "minItems": 2 if planning else 0,
+                "maxItems": 4 if planning else 0,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "move": {
+                            "type": "string",
+                            "enum": [
+                                "answer",
+                                "acknowledge",
+                                "repair",
+                                "decide",
+                                "engage",
+                                "clarify",
+                            ],
+                        },
+                        "stance": {
+                            "type": "string",
+                            "enum": [
+                                "direct",
+                                "warm",
+                                "playful",
+                                "skeptical",
+                                "curious",
+                                "neutral",
+                            ],
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                        "propositions": {
+                            "type": "array",
+                            "items": response_proposition,
+                            "minItems": 1,
+                            "maxItems": 4,
+                        },
+                    },
+                    "required": [
+                        "move",
+                        "stance",
+                        "propositions",
+                        "confidence",
+                    ],
+                },
+            },
             "register": {"type": "string"},
             "facts": string_array,
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         },
-        "required": ["interpretation", "intent", "confidence"],
+        "required": ["interpretation", "intent", "response_plans", "confidence"],
     }
 
 
@@ -880,22 +1304,131 @@ def _social_frame(value: object) -> ConsultantSocialFrame | None:
     )
 
 
+def _response_plans(value: object) -> tuple[ConsultantResponsePlan, ...]:
+    allowed_roles = {
+        "subject",
+        "direct_object",
+        "indirect_object",
+        "predicate_complement",
+        "action_complement",
+        "manner",
+        "cause",
+        "location",
+        "topic",
+    }
+    allowed_clause_kinds = {"statement", "question", "command"}
+    plans: list[ConsultantResponsePlan] = []
+    for raw_plan in _mapping_items(value, 6):
+        move = _clean_token(raw_plan.get("move"), "")
+        if not move:
+            continue
+        propositions: list[ConsultantResponseProposition] = []
+        for raw_proposition in _mapping_items(
+            raw_plan.get("propositions"),
+            4,
+        ):
+            predicate = _single_lemma(raw_proposition.get("predicate"))
+            if not predicate:
+                continue
+            arguments: list[ConsultantResponseArgument] = []
+            for raw_argument in _mapping_items(
+                raw_proposition.get("arguments"),
+                10,
+            ):
+                role = _clean_token(raw_argument.get("role"), "")
+                lemma = _single_lemma(raw_argument.get("lemma"))
+                if role not in allowed_roles or not lemma:
+                    continue
+                arguments.append(
+                    ConsultantResponseArgument(
+                        role=role,
+                        lemma=lemma,
+                        part_of_speech=_clean_token(
+                            raw_argument.get("part_of_speech"),
+                            "noun",
+                        ),
+                        grammatical_case=_optional_token(raw_argument.get("grammatical_case")),
+                        preposition=_optional_token(raw_argument.get("preposition")),
+                        modifiers=tuple(
+                            lemma
+                            for item in _text_items(
+                                raw_argument.get("modifiers"),
+                                6,
+                                80,
+                            )
+                            if (lemma := _single_lemma(item))
+                        ),
+                    )
+                )
+            clause_kind = _clean_token(
+                raw_proposition.get("clause_kind"),
+                "statement",
+            )
+            if clause_kind not in allowed_clause_kinds:
+                clause_kind = "statement"
+            raw_polarity = raw_proposition.get("response_polarity")
+            response_polarity = raw_polarity if isinstance(raw_polarity, bool) else None
+            propositions.append(
+                ConsultantResponseProposition(
+                    predicate=predicate,
+                    predicate_features=_clean_features(raw_proposition.get("predicate_features")),
+                    arguments=tuple(arguments),
+                    clause_kind=clause_kind,
+                    negated=raw_proposition.get("negated") is True,
+                    response_polarity=response_polarity,
+                    evidence_ids=tuple(
+                        _clean_token(item, "")
+                        for item in _text_items(
+                            raw_proposition.get("evidence_ids"),
+                            12,
+                            120,
+                        )
+                        if _clean_token(item, "")
+                    ),
+                )
+            )
+        if not propositions:
+            continue
+        plans.append(
+            ConsultantResponsePlan(
+                move=move,
+                stance=_clean_token(raw_plan.get("stance"), "engage"),
+                propositions=tuple(propositions),
+                confidence=_safe_number(raw_plan.get("confidence"), 0.5),
+            )
+        )
+    return tuple(plans)
+
+
+def _single_lemma(value: object) -> str:
+    cleaned = _clean_token(value, "")
+    if (
+        not cleaned
+        or len(cleaned) > 64
+        or any(character.isspace() for character in cleaned)
+        or internal_surface_reason(cleaned) is not None
+    ):
+        return ""
+    return cleaned
+
+
+def _optional_token(value: object) -> str | None:
+    cleaned = _clean_token(value, "")
+    return cleaned or None
+
+
 def _stored_result(value: object) -> ConsultationResult | None:
     try:
         payload = json.loads(str(value))
         result = ConsultationResult.from_payload(
             payload,
-            provider=_clean_token(payload.get("provider"), "puter"),
+            provider=_clean_token(payload.get("provider"), "unknown"),
             model=_clean_token(payload.get("model"), "unknown"),
         )
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
     return ConsultationResult(
-        **{
-            name: getattr(result, name)
-            for name in result.__dataclass_fields__
-            if name != "cached"
-        },
+        **{name: getattr(result, name) for name in result.__dataclass_fields__ if name != "cached"},
         cached=True,
     )
 
@@ -918,11 +1451,7 @@ def _text_items(value: object, limit: int, maximum: int) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
     return tuple(
-        dict.fromkeys(
-            cleaned
-            for item in value[:limit]
-            if (cleaned := _clean_text(item, maximum))
-        )
+        dict.fromkeys(cleaned for item in value[:limit] if (cleaned := _clean_text(item, maximum)))
     )
 
 

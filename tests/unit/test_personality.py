@@ -61,4 +61,7 @@ def test_state_and_experience_change_expression_without_changing_genome() -> Non
     assert activated.curiosity > calm.curiosity
     assert activated.memory_attachment > calm.memory_attachment
     assert activated.target_tokens > calm.target_tokens
+    assert activated.assertiveness != calm.assertiveness
+    assert activated.suspicion > calm.suspicion
+    assert activated.playfulness != calm.playfulness
     assert activated.genome_signature == calm.genome_signature == DEBILGI_GENOME.signature

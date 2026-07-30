@@ -38,6 +38,16 @@ _INTERNAL_NARRATION_PATTERNS = (
         r"интересуется|реагирует|сообщает|утверждает|выражает|обращается)\b"
     ),
     re.compile(r"^(?:ответ|реплика)\s+(?:агента|пользователя|собеседника)\b"),
+    # Raw evidence counters are internal diagnostics, not answers.  The
+    # response layer must name the unresolved slot or refer to the question.
+    re.compile(
+        r"\b(?:(?:нет\s+|не\s+хватает\s+|недостаточно\s+)"
+        r"(?:достаточн\w*\s+)?(?:данн|факт|сведен)\w*|"
+        r"достаточн\w*\s+(?:данн|факт|сведен)\w*"
+        r"\s+(?:нет|не\s+хватает)|"
+        r"(?:данн|факт|сведен)\w*\s+недостаточно)\b"
+    ),
+    re.compile(r"\b(?:нет|не\s+хватает)\s+достаточн\w*\s+основан\w*\b"),
 )
 
 

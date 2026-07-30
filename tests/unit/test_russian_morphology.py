@@ -28,6 +28,7 @@ def test_inflects_words_by_named_case() -> None:
     assert morphology.inflect("ключ", case="instrumental") == "ключом"
     assert morphology.inflect("словарь", case="instrumental") == "словарём"
     assert morphology.inflect("друг", case="dative") == "другу"
+    assert morphology.inflect("Германия", case="accusative") == "Германию"
 
 
 def test_normalizes_expressive_spelling_before_morphology() -> None:
@@ -206,3 +207,111 @@ def test_demonstrative_is_disambiguated_by_its_syntactic_position() -> None:
     assert determiner.readings[2].lemma == "этот"
     assert determiner.readings[3] is not None
     assert determiner.readings[3].case == "nominative"
+
+
+def test_numeric_literals_have_a_real_category_and_stay_atomic() -> None:
+    morphology = RussianMorphology()
+
+    integer = morphology.best("42")
+    decimal = morphology.analyze_sentence("Версия 2.0 работает")
+    percentage = morphology.best("10%")
+
+    assert integer is not None
+    assert integer.part_of_speech == "number"
+    assert integer.analysis_kind == "numeric_literal"
+    assert decimal.tokens == ("версия", "2.0", "работает")
+    assert decimal.readings[1] is not None
+    assert decimal.readings[1].part_of_speech == "number"
+    assert percentage is not None
+    assert percentage.part_of_speech == "number"
+    assert "percentage" in percentage.grammemes
+
+
+def test_auxiliary_selects_infinitive_and_its_accusative_object() -> None:
+    morphology = RussianMorphology()
+
+    sentence = morphology.analyze_sentence("Буду печь пирог")
+
+    assert sentence.readings[1] is not None
+    assert sentence.readings[1].part_of_speech == "verb"
+    assert "INFN" in sentence.readings[1].grammemes
+    assert sentence.readings[2] is not None
+    assert sentence.readings[2].case == "accusative"
+
+
+def test_numeral_subject_selects_plural_past_instead_of_imperative() -> None:
+    morphology = RussianMorphology()
+
+    sentence = morphology.analyze_sentence("Два кота пришли")
+    predicate = sentence.readings[2]
+
+    assert predicate is not None
+    assert predicate.lemma == "прийти"
+    assert predicate.number == "plural"
+    assert predicate.tense == "past"
+    assert "impr" not in predicate.grammemes
+
+
+def test_nominal_clause_prefers_nominative_agreement() -> None:
+    morphology = RussianMorphology()
+
+    sentence = morphology.analyze_sentence("Этот замок старый")
+
+    cases = tuple(
+        reading.case if reading is not None else None
+        for reading in sentence.readings
+    )
+
+    assert cases == (
+        "nominative",
+        "nominative",
+        "nominative",
+    )
+
+
+def test_unknown_suffix_guess_is_marked_and_cannot_claim_full_confidence() -> None:
+    morphology = RussianMorphology()
+
+    guessed = morphology.best("мурмякает")
+
+    assert guessed is not None
+    assert guessed.part_of_speech == "verb"
+    assert not guessed.is_known
+    assert guessed.analysis_kind == "guessed"
+    assert guessed.score <= 0.38
+
+
+def test_colloquial_ka_derivative_is_not_corrected_to_base_dative() -> None:
+    morphology = RussianMorphology()
+
+    reading = morphology.best("мусорку")
+    sentence = morphology.analyze_sentence("Мусорку выкинь")
+
+    assert reading is not None
+    assert reading.lemma == "мусорка"
+    assert reading.case == "accusative"
+    assert reading.corrected_form is None
+    assert sentence.readings[0] is not None
+    assert sentence.readings[0].lemma == "мусорка"
+    assert sentence.readings[0].case == "accusative"
+
+
+def test_exposes_derivational_verb_features_and_preserves_full_readings() -> None:
+    morphology = RussianMorphology()
+
+    verb = morphology.best("прочитала")
+    productive_readings = morphology.parse_word("супер-пупер")
+    genitive_genders = {
+        reading.gender
+        for reading in productive_readings
+        if reading.case == "genitive"
+        and reading.part_of_speech == "adjective"
+    }
+
+    assert verb is not None
+    assert verb.features().items() >= {
+        "aspect": "perfective",
+        "mood": "indicative",
+        "transitivity": "transitive",
+    }.items()
+    assert genitive_genders >= {"masculine", "feminine", "neuter"}

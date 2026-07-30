@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -476,6 +476,39 @@ class ResponsePlanRepository:
                 plan.plan_id,
             ),
         )
+
+    async def reframe(
+        self,
+        plan: ResponsePlan,
+        *,
+        message_intent: str,
+        response_goal: str,
+        key_points: tuple[str, ...],
+        confidence: float,
+    ) -> ResponsePlan:
+        """Persist a stronger semantic reading discovered after plan creation."""
+
+        reframed = replace(
+            plan,
+            message_intent=message_intent,
+            response_goal=response_goal,
+            key_points=key_points[:8],
+            confidence=max(plan.confidence, max(0.0, min(1.0, confidence))),
+        )
+        await self._database.execute(
+            """UPDATE language_response_plans
+               SET message_intent = ?, response_goal = ?, key_points_json = ?,
+                   confidence = ?
+               WHERE plan_id = ?""",
+            (
+                reframed.message_intent,
+                reframed.response_goal,
+                json.dumps(reframed.key_points, ensure_ascii=False),
+                reframed.confidence,
+                reframed.plan_id,
+            ),
+        )
+        return reframed
 
     async def cleanup(self, before: datetime) -> int:
         cursor = await self._database.execute(

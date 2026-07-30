@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from debilgi.language.facts import StructuredFact
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
 
 _CASES = frozenset(
@@ -63,6 +64,19 @@ class ResponseContentPlan:
     clauses: tuple[SemanticClause, ...]
     confidence: float
     evidence: tuple[str, ...] = ()
+    response_goal: str = ""
+    target_id: int | None = None
+    topic_ids: tuple[str, ...] = ()
+    key_points: tuple[str, ...] = ()
+    required_facts: tuple[StructuredFact, ...] = ()
+    optional_facts: tuple[StructuredFact, ...] = ()
+    unknowns: tuple[str, ...] = ()
+    tone: str = "neutral"
+    follow_up: str | None = None
+
+    @property
+    def speech_act(self) -> str:
+        return self.response_act
 
 
 @dataclass(frozen=True, slots=True)

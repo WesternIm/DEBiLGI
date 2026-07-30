@@ -416,7 +416,7 @@ class SemanticAssimilationService:
                 )
                 result = ConsultationResult.from_payload(
                     payload,
-                    provider=str(payload.get("provider", "puter")),
+                    provider=str(payload.get("provider", "unknown")),
                     model=str(payload.get("model", "unknown")),
                 )
                 updated_at = datetime.fromisoformat(str(row["updated_at"]))

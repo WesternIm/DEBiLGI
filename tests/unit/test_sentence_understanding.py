@@ -53,6 +53,27 @@ def test_wholly_unknown_fragment_remains_a_phrase_level_gap() -> None:
     assert understanding.unknown_terms == ("фырба", "трошка")
 
 
+def test_dictionary_backed_ambiguity_is_known_instead_of_an_unknown_word() -> None:
+    ambiguous = WordAnalysis(
+        surface_form="лук",
+        normalized_form="лук",
+        lemma="лук",
+        part_of_speech="NOUN",
+        grammatical_features={},
+        dictionary_meanings=("оружие для стрельбы", "огородное растение"),
+        style_labels=(),
+        source="test_dictionary",
+        confidence=ConfidenceProfile(0.9, 0.82, 0.42, 0.75, 0.42),
+        unknown_kind=UnknownKind.AMBIGUOUS_CONTEXT,
+    )
+
+    understanding = understand_utterance("Какой лук ты выбрал?", (ambiguous,))
+
+    assert understanding.unknown_terms == ()
+    assert understanding.known_terms == ("лук",)
+    assert understanding.sufficient is True
+
+
 def test_service_words_are_logged_and_never_become_relation_endpoints(caplog) -> None:
     with caplog.at_level("INFO", logger="debilgi.relation_filter"):
         understanding = understand_utterance(

@@ -13,6 +13,7 @@ def test_separate_diagnostic_log_files_are_created(tmp_path: Path) -> None:
         "debilgi.open_questions": "open-questions.log",
         "debilgi.short_speech_acts": "short-speech-acts.log",
         "debilgi.background": "background-learning.log",
+        "debilgi.continuous_cognition": "continuous-cognition.log",
         "debilgi.relation_filter": "relation-filter.log",
         "debilgi.knowledge_selection": "knowledge-selection.log",
         "debilgi.morphology_disambiguation": "morphology-disambiguation.log",
@@ -20,8 +21,8 @@ def test_separate_diagnostic_log_files_are_created(tmp_path: Path) -> None:
         "debilgi.structured_utterance": "structured-utterance.log",
         "debilgi.sense_resolution": "sense-resolution.log",
         "debilgi.meaning_plan": "meaning-plan.log",
-        "debilgi.semantic_reply_plan": "semantic-reply-plan.log",
         "debilgi.dialogue_state": "dialogue-state.log",
+        "debilgi.response_trace": "response-trace.log",
     }
     try:
         for logger_name in names:

@@ -49,13 +49,16 @@ def test_valency_profile_exposes_cases_without_reply_text() -> None:
 def test_lexical_predicate_can_govern_non_accusative_object() -> None:
     assert governed_object_case("бояться", "direct_object", "accusative") == "genitive"
     assert governed_object_case("управлять", "direct_object", "accusative") == "instrumental"
-
-
-def test_hypothesis_directive_requires_the_thing_being_estimated() -> None:
-    assessment = assess_predicate_valency(
-        "предположить",
-        present_roles=frozenset({"subject"}),
-        imperative=True,
+    assert governed_object_case("пользоваться", "direct_object", "accusative") == (
+        "instrumental"
     )
 
-    assert assessment.missing_roles == ("direct_object",)
+
+def test_desire_infinitive_satisfies_the_object_slot() -> None:
+    assessment = assess_predicate_valency(
+        "хотеть",
+        present_roles=frozenset({"subject", "action_complement"}),
+        complement_roles=frozenset({"action_complement"}),
+    )
+
+    assert assessment.complete

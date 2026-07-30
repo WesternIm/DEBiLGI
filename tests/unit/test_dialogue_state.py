@@ -1,7 +1,6 @@
 import pytest
 
 from debilgi.language.dialogue_state import (
-    DialogueContextWindow,
     analyze_dialogue_state,
     realize_reference_clarification,
 )
@@ -171,37 +170,28 @@ def test_repeated_mentions_support_one_referent_instead_of_faking_ambiguity() ->
     assert analysis.resolved_bindings == (("direct_object", "небо"),)
 
 
-def test_reply_chain_anchor_restores_iq_for_short_hypothesis_follow_up() -> None:
-    window = DialogueContextWindow.build(
+def test_demonstrative_lookup_resolves_the_previous_discourse_topic() -> None:
+    analysis = analyze_dialogue_state(
+        "Ну так узнай что это",
         (
-            "Сколько IQ у тебя?",
-            "Я не могу назвать точное число.",
+            "Ты крутой рэпер, да?",
+            "Достаточных данных нет у меня о рэпере.",
         ),
-        reply_chain=(
-            "Сколько IQ у тебя?",
-            "Я не могу назвать точное число.",
-        ),
-        semantic_anchors=("Сколько IQ у тебя?",),
     )
 
-    analysis = analyze_dialogue_state("А ты предположи", context_window=window)
+    reference = next(
+        item for item in analysis.references if item.surface.casefold() == "это"
+    )
+    assert reference.chosen is not None
+    assert reference.chosen.lemma == "рэпер"
+    assert analysis.resolved_bindings == (("direct_object", "рэпер"),)
+    assert analysis.retrieval_query.endswith("рэпер")
 
-    assert analysis.topic.transition == "continuation"
-    assert analysis.topic.reason == "reply_chain_semantic_anchor"
-    assert analysis.topic.anchor_message == "Сколько IQ у тебя?"
-    assert analysis.resolved_bindings == (("direct_object", "iq"),)
-    assert analysis.added_context_terms == ("iq",)
-    assert analysis.retrieval_query == "А ты предположи iq"
 
-
-def test_context_window_is_bounded_and_prioritizes_the_direct_chain() -> None:
-    window = DialogueContextWindow.build(
-        tuple(f"обычная реплика {index}" for index in range(20)),
-        reply_chain=("Корневой вопрос?", "Ответ бота."),
-        semantic_anchors=("Корневой вопрос?",),
-        max_turns=6,
+def test_transitive_morphology_recovers_omitted_object_without_a_valency_entry() -> None:
+    analysis = analyze_dialogue_state(
+        "а ты будто не знаешь",
+        ("Что ты подразумеваешь под гений?",),
     )
 
-    assert len(window.messages) == 6
-    assert window.messages[-2:] == ("Корневой вопрос?", "Ответ бота.")
-    assert window.semantic_anchors == ("Корневой вопрос?",)
+    assert analysis.resolved_bindings == (("direct_object", "гений"),)

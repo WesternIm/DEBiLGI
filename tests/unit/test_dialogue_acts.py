@@ -76,6 +76,25 @@ def test_complete_question_and_fragment_have_different_obligations() -> None:
     assert fragment.complete is False
 
 
+def test_complete_elliptical_statement_gets_an_acknowledgement() -> None:
+    act = _act("Просто ключи взял бы")
+
+    assert act.kind == "statement"
+    assert act.response_obligation == "continue_topic"
+    assert act.complete is True
+    assert realize_dialogue_act(act) == "Я понял тебя."
+
+
+def test_possessive_dialogue_fragment_is_not_treated_as_a_definition_request() -> None:
+    act = _act("Твой ответ")
+
+    assert act.kind == "dialogue_reference_fragment"
+    assert act.response_obligation == "acknowledge_reference"
+    assert act.objects == ("ответ",)
+    assert act.complete is True
+    assert realize_dialogue_act(act) == "Я понял тебя."
+
+
 def test_external_model_can_only_refine_an_act_not_supply_reply_text() -> None:
     fragment = _act("люто")
     refined = refine_dialogue_act(
@@ -103,6 +122,21 @@ def test_teacher_can_reclassify_a_complete_but_generic_question() -> None:
     assert refined.kind == "opinion_question"
     assert refined.response_obligation == "express_position"
     assert "external_intent:position_request" in refined.evidence
+
+
+def test_teacher_reclassification_normalizes_target_and_quality() -> None:
+    generic = _act("Германия крутая страна?")
+    refined = refine_dialogue_act(
+        generic,
+        external_intent="opinion_question",
+        confidence=0.8,
+        external_response_obligation="answer",
+        expected_response_acts=("answer", "answer_first"),
+    )
+
+    assert refined.kind == "opinion_question"
+    assert refined.response_obligation == "express_position"
+    assert refined.objects == ("германия", "крутая")
 
 
 def test_candidate_meaning_not_generator_name_fulfils_the_obligation() -> None:
@@ -192,6 +226,32 @@ def test_self_assessment_is_a_question_about_the_bots_position() -> None:
     assert act.objects == ("умный",)
 
 
+def test_nominal_self_role_is_conversation_not_an_information_mode() -> None:
+    act = _act("Ты чё герой что-ли?")
+
+    assert act.kind == "self_state_question"
+    assert act.response_obligation == "resolve_self_state"
+    assert act.objects == ("герой",)
+
+
+def test_colloquial_predicative_confirmation_resolves_to_a_self_trait() -> None:
+    act = _act("Ты же круто, да?")
+
+    assert act.kind == "self_state_question"
+    assert act.response_obligation == "resolve_self_state"
+    assert act.objects == ("крутой",)
+    assert act.complete is True
+
+
+def test_unknown_fragment_does_not_choose_its_reply_inside_act_detection() -> None:
+    act = _act("ебануться")
+
+    assert act.kind == "fragment"
+    assert act.response_obligation == "clarify_fragment"
+    assert act.objects == ("ебануться",)
+    assert realize_dialogue_act(act) is None
+
+
 def test_open_self_reflection_is_not_treated_as_a_dictionary_question() -> None:
     act = _act("Что ты думаешь о себе?")
 
@@ -205,6 +265,14 @@ def test_rhetorical_challenge_requests_repair_not_a_literal_fact() -> None:
     assert act.kind == "rhetorical_challenge"
     assert act.response_obligation == "repair_previous_answer"
     assert realize_dialogue_act(act) == "Я понял предыдущий вопрос неправильно."
+
+
+def test_understanding_challenge_is_acknowledged_instead_of_treated_as_question() -> None:
+    act = _act("Ой бля, не делай вид, что ты не понял, ахахахах")
+
+    assert act.kind == "understanding_challenge"
+    assert act.response_obligation == "acknowledge_understanding"
+    assert realize_dialogue_act(act) == "Да, я понял намёк."
 
 
 def test_elliptical_follow_up_keeps_the_previous_answer_as_its_target() -> None:
@@ -295,6 +363,28 @@ def test_compound_study_and_opinion_directive_requires_both_subgoals() -> None:
     )
 
 
+def test_plain_study_directive_requires_knowledge_and_an_answer() -> None:
+    act = _act("Изучи что такое гта 5 и ответь")
+
+    assert act.kind == "study_directive"
+    assert act.response_obligation == "study_and_answer"
+    assert act.objects == ("гта", "5")
+    assert not candidate_fulfills_obligation(
+        act,
+        "grounded_surface",
+        text="Ты изучи такое небо.",
+    )
+    assert candidate_fulfills_obligation(
+        act,
+        "knowledge_retrieval",
+        text="Grand Theft Auto V — компьютерная игра.",
+        metadata={
+            "completed_subgoals": ("study", "answer"),
+            "knowledge_component": "Grand Theft Auto V — компьютерная игра.",
+        },
+    )
+
+
 def test_elliptical_cause_question_keeps_priority_over_following_evidence() -> None:
     act = _act("Почему? Ты сейчас оцениваешь и отвечаешь мне")
 
@@ -311,3 +401,31 @@ def test_elliptical_cause_question_keeps_priority_over_following_evidence() -> N
         "semantic_reasoning",
         text="Потому что я уже оцениваю контекст.",
     )
+
+
+def test_contextual_self_label_becomes_a_complete_evaluation_contract() -> None:
+    structure = analyze_structured_utterance("гений")
+    self_state = analyze_self_state(
+        structure,
+        replied_to_agent=True,
+        context_messages=("Я ответил бессвязно.",),
+    )
+    act = analyze_dialogue_act(structure, self_state=self_state)
+
+    assert act.kind == "self_evaluation"
+    assert act.response_obligation == "respond_to_evaluation"
+    assert act.objects == ("гений",)
+    assert act.complete is True
+
+
+def test_negated_second_person_state_is_not_reduced_to_a_fragment() -> None:
+    structure = analyze_structured_utterance("а ты будто не знаешь")
+    self_state = analyze_self_state(
+        structure,
+        resolved_bindings=(("direct_object", "гений"),),
+    )
+    act = analyze_dialogue_act(structure, self_state=self_state)
+
+    assert act.kind == "self_state_attribution"
+    assert act.response_obligation == "resolve_self_state"
+    assert act.objects == ("гений",)

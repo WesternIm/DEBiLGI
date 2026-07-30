@@ -118,6 +118,65 @@ class Diagnostics(
         )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+    @app_commands.command(
+        name="cognition-runtime",
+        description="Show continuous local cognition heartbeat and durable work",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def cognition_runtime(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        runtime = await self._database.fetchone(
+            "SELECT * FROM continuous_cognition_runtime WHERE runtime_id = 1"
+        )
+        work_rows = await self._database.fetchall(
+            """SELECT status, COUNT(*) AS count
+               FROM continuous_cognition_work_items
+               WHERE guild_id = ? GROUP BY status""",
+            (interaction.guild_id,),
+        )
+        hypothesis_rows = await self._database.fetchall(
+            """SELECT status, COUNT(*) AS count
+               FROM continuous_cognition_hypotheses
+               WHERE guild_id = ? GROUP BY status""",
+            (interaction.guild_id,),
+        )
+        gaps = await self._database.fetchone(
+            """SELECT COUNT(*) AS count
+               FROM continuous_cognition_gaps
+               WHERE guild_id = ? AND status = 'open'""",
+            (interaction.guild_id,),
+        )
+        failures = await self._database.fetchone(
+            """SELECT COUNT(*) AS count
+               FROM continuous_cognition_signals
+               WHERE guild_id = ? AND signal_kind IN ('reply_failed', 'reply_withheld')""",
+            (interaction.guild_id,),
+        )
+        work = {str(row["status"]): int(row["count"]) for row in work_rows}
+        hypotheses = {
+            str(row["status"]): int(row["count"])
+            for row in hypothesis_rows
+        }
+        await interaction.response.send_message(
+            f"runtime: {runtime['status'] if runtime else 'unavailable'}\n"
+            f"heartbeat: {runtime['last_heartbeat_at'] if runtime else '-'}\n"
+            f"pulses: {runtime['total_pulses'] if runtime else 0}\n"
+            f"work processed: {runtime['total_work_processed'] if runtime else 0}\n"
+            f"queue: {work.get('queued', 0)} queued, "
+            f"{work.get('processing', 0)} processing, "
+            f"{work.get('failed', 0)} failed\n"
+            f"hypotheses: {hypotheses.get('working', 0)} working, "
+            f"{hypotheses.get('retained', 0)} retained, "
+            f"{hypotheses.get('rejected', 0)} rejected\n"
+            f"open semantic gaps: {int(gaps['count']) if gaps else 0}\n"
+            f"failed/withheld replies observed: "
+            f"{int(failures['count']) if failures else 0}\n"
+            f"last runtime error: {runtime['last_error'] if runtime else '-'}",
+            ephemeral=True,
+        )
+
     @app_commands.command(name="literacy", description="Show symbolic literacy statistics")
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
@@ -394,6 +453,64 @@ class Diagnostics(
         ]
         await interaction.response.send_message(
             "\n".join(lines) or "No events recorded yet.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="trace",
+        description="Show the response pipeline for the latest or selected message",
+    )
+    @app_commands.describe(message_id="Optional Discord message id")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def trace(
+        self,
+        interaction: discord.Interaction,
+        message_id: str | None = None,
+    ) -> None:
+        assert interaction.guild_id is not None
+        event_id = None
+        if message_id:
+            normalized = message_id.strip()
+            event_id = (
+                normalized
+                if normalized.startswith("discord:message:")
+                else f"discord:message:{normalized}"
+            )
+        result = await self.bot.response_traces.trace_for_guild(
+            interaction.guild_id,
+            event_id=event_id,
+        )
+        if result is None:
+            await interaction.response.send_message(
+                "No response trace found for this server and message.",
+                ephemeral=True,
+            )
+            return
+
+        root, steps = result
+        lines = [
+            f"event: {root['source_event_id']}",
+            f"status: {root['status']}",
+            f"route: {root['selected_route'] or '-'}",
+        ]
+        for step in steps:
+            summary = str(step["summary"]).replace("\n", " ")
+            if len(summary) > 100:
+                summary = f"{summary[:99]}…"
+            lines.append(
+                f"{step['sequence']:02d} {step['stage']} "
+                f"[{step['status']}] {step['component']}: {summary}"
+            )
+        final_text = str(root["final_text"] or "").replace("\n", " ")
+        if final_text:
+            lines.append(f"sent: {final_text}")
+        body = "\n".join(lines)
+        if len(body) > 1_950:
+            body = f"{body[:1_949]}…"
+        await interaction.response.send_message(
+            f"```text\n{body}\n```",
+            ephemeral=True,
         )
 
     @app_commands.command(

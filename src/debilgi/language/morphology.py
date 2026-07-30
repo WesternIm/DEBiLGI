@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -24,6 +25,25 @@ _MESSAGE_TYPES = {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}
 morphology_logger = logging.getLogger("debilgi.morphology_disambiguation")
 spelling_logger = logging.getLogger("debilgi.spelling_correction")
 _RUSSIAN_ALPHABET = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+_NUMERIC_LITERAL_RE = re.compile(
+    r"^[+-]?\d+(?:(?:\.\d+)+|,\d+)?(?:[%‰])?$"
+)
+_INFINITIVE_GOVERNOR_LEMMAS = frozenset(
+    {
+        "быть",
+        "мочь",
+        "хотеть",
+        "должный",
+        "намереваться",
+        "пытаться",
+        "начать",
+        "стать",
+        "продолжить",
+        "перестать",
+        "решить",
+        "любить",
+    }
+)
 CASE_NAMES = {
     "nomn": "nominative",
     "gent": "genitive",
@@ -122,6 +142,10 @@ class MorphologicalReading:
     tense: str | None
     person: str | None
     animacy: str | None
+    aspect: str | None
+    mood: str | None
+    voice: str | None
+    transitivity: str | None
     score: float
     grammemes: frozenset[str]
     corrected_form: str | None = None
@@ -135,8 +159,20 @@ class MorphologicalReading:
             "tense": self.tense,
             "person": self.person,
             "animacy": self.animacy,
+            "aspect": self.aspect,
+            "mood": self.mood,
+            "voice": self.voice,
+            "transitivity": self.transitivity,
         }
         return {name: value for name, value in values.items() if value is not None}
+
+    @property
+    def analysis_kind(self) -> str:
+        if "LITR" in self.grammemes:
+            return "numeric_literal"
+        if self.corrected_form is not None:
+            return "corrected"
+        return "dictionary" if self.is_known else "guessed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +249,11 @@ class RussianMorphology:
     @lru_cache(maxsize=50_000)  # noqa: B019 - process-lifetime singleton/service cache
     def parse_word(self, word: str) -> tuple[MorphologicalReading, ...]:
         normalized = normalize_word(word)
-        if not normalized or self._analyzer is None or not is_word_form(normalized):
+        if not normalized or self._analyzer is None:
+            return ()
+        if _NUMERIC_LITERAL_RE.fullmatch(normalized):
+            return (_numeric_reading(normalized),)
+        if not is_word_form(normalized):
             return ()
         chat_form = normalize_chat_token(
             normalized,
@@ -232,7 +272,14 @@ class RussianMorphology:
                 chat_form.kind,
                 chat_form.intensity,
             )
-        if parsed and not any(item.is_known for item in parsed):
+        if (
+            parsed
+            and not any(item.is_known for item in parsed)
+            and not self._productive_ka_form_is_plausible(
+                analysis_form,
+                parsed,
+            )
+        ):
             spelling_correction = self._spelling_correction(analysis_form)
             if spelling_correction is not None:
                 corrected_form = spelling_correction
@@ -243,14 +290,11 @@ class RussianMorphology:
                     spelling_correction,
                 )
         readings: list[MorphologicalReading] = []
-        seen: set[tuple[str, str | None, str | None, str | None, str | None]] = set()
+        seen: set[tuple[str, frozenset[str]]] = set()
         for item in parsed:
             key = (
                 str(item.normal_form),
-                str(item.tag.POS) if item.tag.POS else None,
-                str(item.tag.case) if item.tag.case else None,
-                str(item.tag.number) if item.tag.number else None,
-                str(item.tag.tense) if item.tag.tense else None,
+                frozenset(str(grammeme) for grammeme in item.tag.grammemes),
             )
             if key in seen:
                 continue
@@ -263,6 +307,29 @@ class RussianMorphology:
         if not readings:
             return None
         normalized = normalize_word(word)
+        if normalized.endswith("ку"):
+            productive_lemma = f"{normalized[:-1]}а"
+            productive = tuple(
+                reading
+                for reading in readings
+                if reading.lemma == productive_lemma
+                and reading.part_of_speech == "noun"
+                and reading.case == "accusative"
+                and reading.gender == "feminine"
+            )
+            if productive:
+                return max(productive, key=lambda reading: reading.score)
+        if normalized.endswith("ка"):
+            feminine_lemma = tuple(
+                reading
+                for reading in readings
+                if reading.lemma == normalized
+                and reading.part_of_speech == "noun"
+                and reading.gender == "feminine"
+                and "Fixd" not in reading.grammemes
+            )
+            if feminine_lemma:
+                return max(feminine_lemma, key=lambda reading: reading.score)
         exact_lemma = tuple(reading for reading in readings if reading.lemma == normalized)
         if exact_lemma and false_friend_group(normalized) is not None:
             return max(exact_lemma, key=lambda reading: reading.score)
@@ -344,6 +411,20 @@ class RussianMorphology:
     ) -> float:
         score = candidate.score
         surface = normalize_word(tokens[index])
+        likely_finite_predicate = _has_likely_finite_predicate(alternatives)
+        infinitive_governor = _infinitive_governor(index, alternatives)
+        has_infinitive_alternative = any(
+            reading.part_of_speech == "verb" and "INFN" in reading.grammemes
+            for reading in alternatives[index]
+        )
+        if "INFN" in candidate.grammemes and infinitive_governor is not None:
+            score += 1.45
+        elif (
+            candidate.part_of_speech == "noun"
+            and has_infinitive_alternative
+            and infinitive_governor is not None
+        ):
+            score -= 0.72
         if surface == "ли":
             if candidate.part_of_speech == "particle":
                 score += 2.20
@@ -461,7 +542,10 @@ class RussianMorphology:
                     start=index + 1,
                     end=verb_index,
                 )
-                implicit_person = verb.person in {"first", "second"}
+                implicit_person = (
+                    verb.person in {"first", "second"}
+                    or "impr" in verb.grammemes
+                )
                 if has_other_subject or implicit_person:
                     if candidate.case == "accusative":
                         score += 0.82
@@ -477,6 +561,8 @@ class RussianMorphology:
                 )
                 if preceding_finite is None or "intr" in preceding_finite[1].grammemes:
                     score += 0.64 if candidate.case == "nominative" else -0.18
+            if not likely_finite_predicate and not expected:
+                score += 0.32 if candidate.case == "nominative" else -0.08
         if (
             candidate.part_of_speech == "pronoun"
             and candidate.case == "accusative"
@@ -490,6 +576,9 @@ class RussianMorphology:
         ):
             score -= 0.52
         if candidate.part_of_speech == "verb":
+            agreement = _subject_agreement_features(index, tokens, alternatives)
+            if "INFN" not in candidate.grammemes and agreement:
+                score += _predicate_agreement_score(candidate, agreement)
             if any(
                 item.part_of_speech == "pronoun" and item.case == "nominative"
                 for item in previous_options
@@ -513,6 +602,8 @@ class RussianMorphology:
                 if not _feature_mismatches(candidate, noun, ("case", "number", "gender")):
                     score += 0.45
                     break
+            if not likely_finite_predicate and not expected and next_has_noun:
+                score += 0.34 if candidate.case == "nominative" else -0.06
         return score
 
     def _spelling_correction(self, word: str) -> str | None:
@@ -535,6 +626,31 @@ class RussianMorphology:
             )
         return None
 
+    def _productive_ka_form_is_plausible(
+        self,
+        word: str,
+        parsed: list[Any],
+    ) -> bool:
+        """Preserve colloquial ``base + ка`` nouns such as ``мусорку``."""
+
+        if (
+            self._analyzer is None
+            or not word.endswith("ку")
+            or len(word) < 5
+        ):
+            return False
+        base = word[:-2]
+        expected_lemma = f"{word[:-1]}а"
+        if not self._analyzer.word_is_known(base):
+            return False
+        return any(
+            str(item.normal_form) == expected_lemma
+            and str(item.tag.POS) == "NOUN"
+            and "femn" in item.tag
+            and "accs" in item.tag
+            for item in parsed
+        )
+
     def inflect(self, word: str, **features: str) -> str | None:
         if self._analyzer is None:
             return None
@@ -550,6 +666,23 @@ class RussianMorphology:
         )
         if lemma_readings:
             readings = lemma_readings
+        if normalized_word.endswith("ка"):
+            productive_feminine = tuple(
+                reading
+                for reading in readings
+                if str(reading.tag.POS) == "NOUN"
+                and "femn" in reading.tag
+                and "Fixd" not in reading.tag
+            )
+            if productive_feminine:
+                readings = (
+                    *productive_feminine,
+                    *(
+                        reading
+                        for reading in readings
+                        if reading not in productive_feminine
+                    ),
+                )
         grammemes: set[str] = set()
         for name, value in features.items():
             normalized = value.casefold()
@@ -560,7 +693,14 @@ class RussianMorphology:
         for reading in readings:
             inflected = reading.inflect(grammemes)
             if inflected is not None:
-                return str(inflected.word)
+                result = str(inflected.word)
+                # Pymorphy normalizes every output to lowercase.  That is
+                # correct for lexical comparison but not for realization:
+                # geographical names, people and organizations must retain
+                # the proper-name signal supplied by the semantic layer.
+                if word[:1].isupper():
+                    result = result[:1].upper() + result[1:]
+                return result
         return None
 
     def lemma(self, word: str) -> str:
@@ -680,12 +820,121 @@ def _nearest_verb(
             reading
             for reading in alternatives[candidate_index]
             if reading.part_of_speech == "verb"
-            and "INFN" not in reading.grammemes
-            and (not require_transitive or "tran" in reading.grammemes)
+            and (
+                ("tran" in reading.grammemes)
+                if require_transitive
+                else ("INFN" not in reading.grammemes)
+            )
         )
         if verbs:
             return candidate_index, max(verbs, key=lambda reading: reading.score)
     return None
+
+
+def _has_likely_finite_predicate(
+    alternatives: tuple[tuple[MorphologicalReading, ...], ...],
+) -> bool:
+    """Ignore low-probability verb guesses when identifying a nominal clause."""
+
+    return any(
+        reading.part_of_speech in {"verb", "predicate"}
+        and "INFN" not in reading.grammemes
+        and (reading.score >= 0.45 or len(options) == 1)
+        for options in alternatives
+        for reading in options
+    )
+
+
+def _infinitive_governor(
+    index: int,
+    alternatives: tuple[tuple[MorphologicalReading, ...], ...],
+) -> tuple[int, MorphologicalReading] | None:
+    for previous in range(index - 1, max(-1, index - 4), -1):
+        candidates = tuple(
+            reading
+            for reading in alternatives[previous]
+            if reading.lemma in _INFINITIVE_GOVERNOR_LEMMAS
+            and (
+                reading.part_of_speech == "predicate"
+                or (
+                    reading.part_of_speech == "verb"
+                    and "INFN" not in reading.grammemes
+                )
+                or reading.lemma == "должный"
+            )
+        )
+        if candidates:
+            return previous, max(candidates, key=lambda reading: reading.score)
+        if any(
+            reading.part_of_speech in {"noun", "pronoun"}
+            for reading in alternatives[previous]
+        ):
+            break
+    return None
+
+
+def _subject_agreement_features(
+    predicate_index: int,
+    tokens: tuple[str, ...],
+    alternatives: tuple[tuple[MorphologicalReading, ...], ...],
+) -> dict[str, str]:
+    """Infer only robust overt-subject features before a predicate candidate."""
+
+    start = max(0, predicate_index - 5)
+    for index in range(predicate_index - 1, start - 1, -1):
+        if RussianMorphology.expected_cases(tokens[index]):
+            continue
+        nominatives = tuple(
+            reading
+            for reading in alternatives[index]
+            if reading.part_of_speech in {"noun", "pronoun"}
+            and reading.case == "nominative"
+            and reading.score >= 0.08
+        )
+        if nominatives:
+            subject = max(nominatives, key=lambda reading: reading.score)
+            return {
+                name: value
+                for name in ("number", "gender", "person")
+                if (value := getattr(subject, name)) is not None
+            }
+
+        # Cardinal numerals govern a genitive nominal but the whole phrase is
+        # normally plural for predicate agreement: ``два кота пришли``.
+        genitives = tuple(
+            reading
+            for reading in alternatives[index]
+            if reading.part_of_speech == "noun" and reading.case == "genitive"
+        )
+        previous_is_cardinal = bool(
+            index > start
+            and any(
+                reading.part_of_speech == "number"
+                for reading in alternatives[index - 1]
+            )
+        )
+        if genitives and previous_is_cardinal:
+            return {"number": "plural"}
+    return {}
+
+
+def _predicate_agreement_score(
+    candidate: MorphologicalReading,
+    subject_features: dict[str, str],
+) -> float:
+    score = 0.0
+    for feature, reward in (("number", 0.64), ("person", 0.42)):
+        subject_value = subject_features.get(feature)
+        predicate_value = getattr(candidate, feature)
+        if subject_value is not None and predicate_value is not None:
+            score += reward if subject_value == predicate_value else -reward
+    if candidate.tense == "past":
+        subject_gender = subject_features.get("gender")
+        if subject_gender is not None and candidate.gender is not None:
+            score += 0.34 if subject_gender == candidate.gender else -0.34
+    if "impr" in candidate.grammemes and subject_features.get("person") not in {None, "second"}:
+        score -= 0.52
+    return score
 
 
 def _governing_preposition_cases(
@@ -835,20 +1084,59 @@ def _reading(
     corrected_form: str | None = None,
 ) -> MorphologicalReading:
     raw_case = str(parsed.tag.case) if parsed.tag.case else None
+    raw_score = float(parsed.score)
     return MorphologicalReading(
         surface_form=surface,
         lemma=str(parsed.normal_form),
-        part_of_speech=POS_NAMES.get(str(parsed.tag.POS)) if parsed.tag.POS else None,
+        part_of_speech=(
+            POS_NAMES.get(str(parsed.tag.POS))
+            if parsed.tag.POS
+            else "number"
+            if "NUMB" in parsed.tag.grammemes
+            else None
+        ),
         case=CASE_NAMES.get(raw_case, raw_case) if raw_case else None,
         number=_feature_name(getattr(parsed.tag, "number", None)),
         gender=_feature_name(getattr(parsed.tag, "gender", None)),
         tense=_feature_name(getattr(parsed.tag, "tense", None)),
         person=_feature_name(getattr(parsed.tag, "person", None)),
         animacy=_feature_name(getattr(parsed.tag, "animacy", None)),
-        score=float(parsed.score),
+        aspect=_feature_name(getattr(parsed.tag, "aspect", None)),
+        mood=_feature_name(getattr(parsed.tag, "mood", None)),
+        voice=_feature_name(getattr(parsed.tag, "voice", None)),
+        transitivity=_feature_name(getattr(parsed.tag, "transitivity", None)),
+        # Pymorphy assigns probabilities to productive guesses too.  A guessed
+        # neologism can therefore receive 1.0 even though only its suffix was
+        # recognized.  Keep the hypothesis, but never expose it as dictionary
+        # certainty to downstream semantic reasoning.
+        score=raw_score if parsed.is_known else min(raw_score, 0.38),
         grammemes=frozenset(str(item) for item in parsed.tag.grammemes),
         corrected_form=corrected_form,
         is_known=bool(parsed.is_known),
+    )
+
+
+def _numeric_reading(surface: str) -> MorphologicalReading:
+    numeric_kind = "percentage" if surface.endswith(("%", "‰")) else (
+        "real" if "." in surface or "," in surface else "integer"
+    )
+    return MorphologicalReading(
+        surface_form=surface,
+        lemma=surface,
+        part_of_speech="number",
+        case=None,
+        number=None,
+        gender=None,
+        tense=None,
+        person=None,
+        animacy=None,
+        aspect=None,
+        mood=None,
+        voice=None,
+        transitivity=None,
+        score=0.99,
+        grammemes=frozenset({"NUMB", "LITR", numeric_kind}),
+        is_known=True,
     )
 
 
@@ -929,6 +1217,14 @@ def _feature_name(value: Any) -> str | None:
         "3per": "third",
         "anim": "animate",
         "inan": "inanimate",
+        "perf": "perfective",
+        "impf": "imperfective",
+        "indc": "indicative",
+        "impr": "imperative",
+        "actv": "active",
+        "pssv": "passive",
+        "tran": "transitive",
+        "intr": "intransitive",
     }
     raw = str(value)
     return aliases.get(raw, raw)

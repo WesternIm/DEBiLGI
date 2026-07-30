@@ -101,7 +101,7 @@ def test_intentional_silence_is_not_a_language_failure() -> None:
     assert failed.failure_stage == "semantic_planning"
 
 
-def test_language_exception_is_recorded_and_uses_semantic_fallback(monkeypatch) -> None:
+def test_language_exception_is_recorded_without_a_canned_reply(monkeypatch) -> None:
     def fail_realization(*args, **kwargs):
         del args, kwargs
         raise RuntimeError("local morphology failure")
@@ -110,10 +110,13 @@ def test_language_exception_is_recorded_and_uses_semantic_fallback(monkeypatch) 
 
     result = realize_clarification_plan(clarification_plan())
 
-    assert result.text == "Не понял. Пояснишь?"
-    assert result.used_fallback is True
-    assert result.validation.is_valid
-    assert result.outcome.outcome_type is ProcessingOutcomeType.REPLIED
+    assert result.text is None
+    assert result.used_fallback is False
+    assert not result.validation.is_valid
+    assert (
+        result.outcome.outcome_type
+        is ProcessingOutcomeType.FAILED_TO_REALIZE_LANGUAGE
+    )
     assert result.outcome.was_intentional is False
     assert result.outcome.failure_stage == "language_realization"
     assert result.outcome.failure_reason == "productive NLG raised RuntimeError"

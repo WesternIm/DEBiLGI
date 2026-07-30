@@ -193,3 +193,51 @@ def test_positive_learned_order_cannot_detach_negation_in_a_negative_thought() -
         == surface.role_order.index("predicate")
         for surface in surfaces
     )
+
+
+def test_explicit_wh_focus_cannot_be_demoted_by_a_learned_order() -> None:
+    thought = ClauseThought(
+        predicate=ConceptLexeme(
+            "думать",
+            "думаешь",
+            "verb",
+            (("tense", "present"), ("number", "singular"), ("person", "second")),
+        ),
+        dependencies=(
+            SemanticDependency(
+                "subject",
+                ConceptArgument(ConceptLexeme("ты", "ты", "pronoun")),
+            ),
+            SemanticDependency(
+                "direct_object",
+                ConceptArgument(
+                    ConceptLexeme("что", "что", "pronoun"),
+                    grammatical_case="accusative",
+                ),
+            ),
+            SemanticDependency(
+                "topic",
+                ConceptArgument(
+                    ConceptLexeme("марс", "Марс", "noun"),
+                    preposition="о",
+                    grammatical_case="prepositional",
+                ),
+            ),
+        ),
+        clause_kind="question",
+        focus_role="direct_object",
+        confidence=0.9,
+    )
+    misplaced = DependencyPattern(
+        ("predicate", "subject", "direct_object", "topic"),
+        clause_kind="question",
+        required_roles=("subject", "predicate", "direct_object", "topic"),
+        focus_role="direct_object",
+        confidence=0.99,
+        evidence_count=100,
+    )
+
+    surfaces = realize_thought(thought, (misplaced,))
+
+    assert len(surfaces) == 1
+    assert surfaces[0].text.casefold() == "что ты думаешь о марсе?"

@@ -101,11 +101,86 @@ def test_open_self_reflection_recovers_omitted_second_person_subject() -> None:
     assert result.thought is not None
 
 
+def test_nominal_cognitive_level_question_uses_observable_local_capabilities() -> None:
+    for prompt in (
+        "Какой у тебя уровень мышления?",
+        "Так какой уровень мышления у тебя",
+    ):
+        frame = analyze_self_state(analyze_structured_utterance(prompt))
+
+        assert frame is not None
+        assert frame.state == "cognitive_level"
+        assert frame.experiencer_kind == "self"
+        assert frame.complete
+        result = reason_about_self_state(frame, _understanding("мышление"))
+
+        assert result.thought is not None
+        assert realize_thought(result.thought)[0].text == (
+            "Я считаю своё мышление развивающимся."
+        )
+        assert "learning_process_active" in result.evidence
+
+
+def test_nominal_self_role_defers_stance_to_contextual_move_planning() -> None:
+    frame = analyze_self_state(
+        analyze_structured_utterance("Ты чё герой что-ли?")
+    )
+
+    assert frame is not None
+    assert frame.state == "self_role_assessment"
+    assert frame.experiencer_kind == "self"
+    result = reason_about_self_state(frame, _understanding("герой"))
+
+    assert result.thought is None
+    assert result.actual is None
+    assert result.evidence == ("requires_contextual_owned_position",)
+
+
+def test_bare_animate_label_in_reply_is_bound_as_contextual_self_evaluation() -> None:
+    frame = analyze_self_state(
+        analyze_structured_utterance("гений"),
+        replied_to_agent=True,
+        context_messages=("Я ответил бессвязно.",),
+    )
+
+    assert frame is not None
+    assert frame.state == "self_role_assessment"
+    assert frame.clause_kind == "statement"
+    assert frame.target_lemmas == ("гений",)
+
+
+def test_bare_topic_answer_is_not_forced_into_a_self_label() -> None:
+    assert (
+        analyze_self_state(
+            analyze_structured_utterance("мусорка"),
+            replied_to_agent=True,
+            context_messages=("Я назвал предмет.",),
+        )
+        is None
+    )
+
+
+def test_negated_self_state_attribution_uses_resolved_discourse_target() -> None:
+    frame = analyze_self_state(
+        analyze_structured_utterance("а ты будто не знаешь"),
+        resolved_bindings=(("direct_object", "гений"),),
+    )
+
+    assert frame is not None
+    assert frame.state == "knowledge"
+    assert frame.complete is True
+    assert frame.target_lemmas == ("гений",)
+    result = reason_about_self_state(frame, _understanding("знать", "гений"))
+    assert result.actual is True
+    assert result.thought is not None
+
+
 def test_self_location_is_derived_from_runtime_environment() -> None:
     for prompt in (
         "Где ты находишься?",
         "Ты где находишься?",
         "Ладно. А где ты вообще находишься?",
+        "Где ты живёшь?",
     ):
         frame = analyze_self_state(analyze_structured_utterance(prompt))
 
@@ -117,3 +192,36 @@ def test_self_location_is_derived_from_runtime_environment() -> None:
         assert result.thought is not None
         assert realize_thought(result.thought)[0].text == "Я работаю в Discord."
         assert "discord_runtime_environment" in result.evidence
+
+
+def test_affective_state_is_derived_from_active_engagement() -> None:
+    frame = analyze_self_state(analyze_structured_utterance("Что ты чувствуешь?"))
+
+    assert frame is not None
+    assert frame.state == "affective_state"
+    assert frame.complete
+    result = reason_about_self_state(frame, _understanding("чувствовать"))
+
+    assert result.thought is not None
+    assert realize_thought(result.thought)[0].text == (
+        "Я чувствую интерес к разговору."
+    )
+    assert "engagement_state" in result.evidence
+
+
+def test_threat_response_is_answered_as_self_state_not_object_knowledge() -> None:
+    frame = analyze_self_state(
+        analyze_structured_utterance("Не боишься болотного монстра?")
+    )
+
+    assert frame is not None
+    assert frame.state == "threat_response"
+    assert frame.complete
+    result = reason_about_self_state(frame, _understanding("бояться", "монстр"))
+
+    assert result.thought is not None
+    assert realize_thought(result.thought)[0].text in {
+        "Да, я не боюсь болотного монстра.",
+        "Нет, я не боюсь болотного монстра.",
+    }
+    assert "no_observed_threat_response" in result.evidence

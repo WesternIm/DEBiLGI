@@ -210,26 +210,37 @@ class RussianReferenceService:
         enabled: bool = False,
         refresh_after: timedelta = timedelta(days=30),
         queue_limit: int = 128,
+        worker_count: int = 4,
     ) -> None:
+        if worker_count <= 0:
+            raise ValueError("reference worker count must be positive")
         self._database = database
         self._lexicon = lexicon
         self._client = client
         self.enabled = enabled
         self.refresh_after = refresh_after
+        self.worker_count = min(worker_count, 16)
         self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=max(1, queue_limit))
         self._queued: set[str] = set()
-        self._worker: asyncio.Task[None] | None = None
+        self._workers: list[asyncio.Task[None]] = []
 
     async def start(self) -> None:
-        if self.enabled and self._worker is None:
+        if self.enabled and not self._workers:
             await self._client.start()
-            self._worker = asyncio.create_task(self._run(), name="russian-reference-worker")
+            self._workers = [
+                asyncio.create_task(
+                    self._run(),
+                    name=f"russian-reference-worker-{index}",
+                )
+                for index in range(self.worker_count)
+            ]
 
     async def stop(self) -> None:
-        if self._worker is not None:
-            self._worker.cancel()
-            await asyncio.gather(self._worker, return_exceptions=True)
-            self._worker = None
+        workers, self._workers = self._workers, []
+        for worker in workers:
+            worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
         await self._client.close()
 
     async def observe(self, event: Event) -> None:

@@ -85,7 +85,7 @@ def _result() -> ConsultationResult:
             "response_text": "Тарелка — предмет посуды, из которого обычно едят.",
             "confidence": 0.94,
         },
-        provider="fake-puter",
+        provider="fake-provider",
         model="fake-gemini",
     )
 
@@ -197,7 +197,7 @@ async def test_teacher_role_order_becomes_a_word_free_dependency_pattern(
             "facts": [],
             "confidence": 0.94,
         },
-        provider="fake-puter",
+        provider="fake-provider",
         model="fake-gemini",
     )
 

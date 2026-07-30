@@ -20,6 +20,13 @@ class PersonalityExpression:
     coherence_drive: float
     target_tokens: int
     candidate_count: int
+    sociability: float = 0.5
+    suspicion: float = 0.5
+    patience: float = 0.5
+    assertiveness: float = 0.5
+    warmth: float = 0.5
+    playfulness: float = 0.5
+    uncertainty: float = 0.0
 
 
 class PersonalityExpressionEngine:
@@ -40,6 +47,40 @@ class PersonalityExpressionEngine:
         memory_attachment = _clamp(self.genome.memory_attachment * 0.75 + familiarity * 0.25)
         novelty = _clamp(self.genome.novelty_seeking * 0.80 + interest * 0.20)
         coherence = _clamp(0.88 - chaos * 0.30 + familiarity * 0.08)
+        sociability = _clamp(
+            self.genome.sociability * 0.76
+            + familiarity * 0.18
+            + interest * 0.10
+            - tension * 0.08
+        )
+        suspicion = _clamp(
+            self.genome.suspicion * 0.72
+            + uncertainty * 0.20
+            + tension * 0.12
+            - familiarity * 0.12
+        )
+        patience = _clamp(
+            self.genome.patience * 0.78
+            + coherence * 0.16
+            - activation * 0.10
+        )
+        assertiveness = _clamp(
+            impulsivity * 0.28
+            + expressiveness * 0.32
+            + (1.0 - suspicion) * 0.18
+            + self.genome.initiative * 0.22
+        )
+        warmth = _clamp(
+            sociability * 0.52
+            + (1.0 - suspicion) * 0.20
+            + familiarity * 0.28
+        )
+        playfulness = _clamp(
+            chaos * 0.34
+            + novelty * 0.32
+            + expressiveness * 0.24
+            - tension * 0.10
+        )
         target_tokens = round(
             8
             + self.genome.verbosity * 22
@@ -59,6 +100,13 @@ class PersonalityExpressionEngine:
             coherence_drive=coherence,
             target_tokens=max(8, min(target_tokens, 48)),
             candidate_count=max(20, min(candidate_count, 80)),
+            sociability=sociability,
+            suspicion=suspicion,
+            patience=patience,
+            assertiveness=assertiveness,
+            warmth=warmth,
+            playfulness=playfulness,
+            uncertainty=uncertainty,
         )
 
 

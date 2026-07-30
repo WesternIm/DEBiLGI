@@ -46,7 +46,12 @@ class PragmaticAnalysis:
     @property
     def emotional_intensity(self) -> float:
         return max(
-            (cue.intensity for cue in self.cues if cue.category == "interjection"),
+            (
+                cue.intensity
+                for cue in self.cues
+                if cue.category
+                in {"interjection", "emoji", "expressive_punctuation"}
+            ),
             default=0.0,
         )
 
@@ -85,6 +90,7 @@ _PARTICLE_PHRASES: dict[tuple[str, ...], tuple[str, float]] = {
 _INTERJECTIONS: dict[str, tuple[str, float]] = {
     "ой": ("surprise_pain_or_alarm", 0.72),
     "ах": ("surprise_delight_or_regret", 0.70),
+    "эх": ("regret_or_disappointment", 0.72),
     "увы": ("regret", 0.74),
     "фу": ("aversion", 0.86),
     "ух": ("strong_impression", 0.72),
@@ -94,6 +100,13 @@ _INTERJECTIONS: dict[str, tuple[str, float]] = {
     "хм": ("hesitation", 0.66),
     "мда": ("skepticism_or_disappointment", 0.74),
     "блин": ("annoyance", 0.58),
+    "бля": ("coarse_emphasis", 0.78),
+    "блять": ("coarse_emphasis", 0.82),
+    "епт": ("annoyance_or_surprise", 0.72),
+    "ёпт": ("annoyance_or_surprise", 0.72),
+    "пиздец": ("shock_or_frustration", 0.90),
+    "лол": ("amusement", 0.74),
+    "кек": ("amusement", 0.70),
     "ура": ("joy", 0.86),
 }
 
@@ -128,6 +141,52 @@ _ELONGATED_VOCALIZATIONS: dict[str, tuple[str, float]] = {
     "у": ("strong_impression", 0.72),
     "э": ("hesitation", 0.70),
 }
+_LAUGHTER_RE = re.compile(
+    r"(?=[ахеahe]{4,}$)(?=.*[хh])(?=.*[аеae])[ахеahe]+",
+    re.IGNORECASE,
+)
+_EMOJI_CUES: dict[str, tuple[str, float]] = {
+    "😂": ("amusement", 0.90),
+    "🤣": ("amusement", 0.94),
+    "😹": ("amusement", 0.88),
+    "😈": ("playful_mischief", 0.78),
+    "😉": ("playful_mischief", 0.68),
+    "😏": ("playful_mischief", 0.72),
+    "🤬": ("anger", 0.94),
+    "😡": ("anger", 0.90),
+    "😠": ("anger", 0.84),
+    "😭": ("sadness", 0.92),
+    "😢": ("sadness", 0.84),
+    "🥲": ("bittersweet_emotion", 0.72),
+    "🥰": ("affection", 0.86),
+    "😍": ("affection", 0.88),
+    "❤️": ("affection", 0.84),
+    "🤔": ("reflection_or_doubt", 0.68),
+    "🙄": ("skepticism_or_disappointment", 0.78),
+    "🤮": ("aversion", 0.92),
+    "🤢": ("aversion", 0.86),
+}
+
+
+def _symbolic_cues(text: str) -> tuple[PragmaticCue, ...]:
+    cues = [
+        PragmaticCue(symbol, "emoji", function, 0.94, intensity)
+        for symbol, (function, intensity) in _EMOJI_CUES.items()
+        if symbol in text
+    ]
+    punctuation = tuple(re.finditer(r"([!?])\1{1,}", text))
+    for match in punctuation:
+        mark = match.group(1)
+        cues.append(
+            PragmaticCue(
+                match.group(0),
+                "expressive_punctuation",
+                "intense_question" if mark == "?" else "emphatic_exclamation",
+                0.90,
+                min(1.0, 0.64 + len(match.group(0)) * 0.07),
+            )
+        )
+    return tuple(cues)
 
 
 def _construction_cues(words: tuple[str, ...]) -> tuple[PragmaticCue, ...]:
@@ -239,8 +298,15 @@ def _expressive_cue(
             return PragmaticCue(word, "particle", "emphatic_rejection", 0.92, 0.82)
     if re.fullmatch(r"хм+", word):
         return PragmaticCue(word, "interjection", "hesitation", 0.86, 0.68)
-    if re.fullmatch(r"х[ахе]{3,}", word):
-        return PragmaticCue(word, "interjection", "amusement", 0.88, 0.76)
+    if _LAUGHTER_RE.fullmatch(word):
+        repetitions = max(2, len(word) // 2)
+        return PragmaticCue(
+            word,
+            "interjection",
+            "amusement",
+            0.94,
+            min(1.0, 0.62 + repetitions * 0.055),
+        )
     if re.fullmatch(r"мда+", word):
         return PragmaticCue(word, "interjection", "skepticism_or_disappointment", 0.86, 0.74)
     if re.fullmatch(r"о+го+", word):
@@ -256,7 +322,10 @@ def analyze_pragmatics(text: str) -> PragmaticAnalysis:
     )
     normalized_words = tuple(normalize_chat_token(word) for word in raw_words)
     words = tuple(item.canonical for item in normalized_words)
-    cues: list[PragmaticCue] = list(_construction_cues(words))
+    cues: list[PragmaticCue] = [
+        *_construction_cues(words),
+        *_symbolic_cues(text),
+    ]
     occupied: set[int] = set()
     for phrase, (function, intensity) in sorted(
         _PARTICLE_PHRASES.items(), key=lambda item: -len(item[0])

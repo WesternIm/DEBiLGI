@@ -13,6 +13,7 @@ _DIAGNOSTIC_LOGGERS = {
     "debilgi.open_questions": "open-questions.log",
     "debilgi.short_speech_acts": "short-speech-acts.log",
     "debilgi.background": "background-learning.log",
+    "debilgi.continuous_cognition": "continuous-cognition.log",
     "debilgi.context_gate": "context-gate.log",
     "debilgi.response_arbitration": "response-arbitration.log",
     "debilgi.relation_filter": "relation-filter.log",
@@ -22,9 +23,10 @@ _DIAGNOSTIC_LOGGERS = {
     "debilgi.structured_utterance": "structured-utterance.log",
     "debilgi.sense_resolution": "sense-resolution.log",
     "debilgi.meaning_plan": "meaning-plan.log",
-    "debilgi.semantic_reply_plan": "semantic-reply-plan.log",
     "debilgi.dialogue_state": "dialogue-state.log",
     "debilgi.contextual_question_reasoning": "contextual-question-reasoning.log",
+    "debilgi.semantic_reply_plan": "semantic-reply-plan.log",
+    "debilgi.response_trace": "response-trace.log",
 }
 
 

@@ -98,3 +98,39 @@ async def test_response_plan_requires_all_key_points(database: Database) -> None
     assert not incomplete.valid
     assert incomplete.missing_points == ("личная интерпретация хранится отдельно",)
     assert complete.valid
+
+
+async def test_response_plan_persists_a_later_semantic_reframe(database: Database) -> None:
+    plans = ResponsePlanRepository(database)
+    original = await plans.create(
+        source_event_id="event:semantic-reframe",
+        author_id=1,
+        conversation_id=None,
+        topic_ids=("германия", "крутой", "страна"),
+        message_intent="information_question",
+        response_goal="answer_question",
+        key_points=("крутая", "страна"),
+        tone="interested",
+        unknowns=(),
+        confidence=0.72,
+        now=NOW,
+    )
+
+    reframed = await plans.reframe(
+        original,
+        message_intent="opinion_question",
+        response_goal="express_position",
+        key_points=("германия", "крутая"),
+        confidence=0.84,
+    )
+
+    row = await database.fetchone(
+        """SELECT message_intent, response_goal, key_points_json, confidence
+           FROM language_response_plans WHERE plan_id = ?""",
+        (original.plan_id,),
+    )
+    assert row is not None
+    assert reframed.message_intent == row["message_intent"] == "opinion_question"
+    assert reframed.response_goal == row["response_goal"] == "express_position"
+    assert str(row["key_points_json"]) == '["германия", "крутая"]'
+    assert float(row["confidence"]) == pytest.approx(0.84)

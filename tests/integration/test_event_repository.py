@@ -46,7 +46,7 @@ async def test_migration_and_round_trip(database: Database) -> None:
     duplicate_inserted = await repository.append(original)
     restored = (await repository.recent(10))[0]
 
-    assert await database.schema_version() == 37
+    assert await database.schema_version() == 44
     assert inserted is True
     assert duplicate_inserted is False
     assert restored == original
@@ -103,7 +103,7 @@ async def test_existing_v1_database_is_backfilled_by_processing_migration(
     await upgraded_database.initialize()
     upgraded_repository = EventRepository(upgraded_database)
     try:
-        assert await upgraded_database.schema_version() == 37
+        assert await upgraded_database.schema_version() == 44
         assert (
             await upgraded_repository.processing_status("before-upgrade")
             is ProcessingStatus.PENDING
@@ -132,7 +132,7 @@ async def test_existing_v4_database_upgrades_to_cognitive_core_without_data_loss
     upgraded = Database(db_path, MIGRATIONS)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 37
+        assert await upgraded.schema_version() == 44
         assert await EventRepository(upgraded).get("preserved-v4-event") is not None
         tables = await upgraded.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
         table_names = {str(row["name"]) for row in tables}
@@ -200,18 +200,22 @@ async def test_service_word_cleanup_removes_old_graph_noise(tmp_path: Path) -> N
         CREATE TABLE knowledge_relations (
             relation_id TEXT PRIMARY KEY, normalized_object_title TEXT NOT NULL
         );
-        CREATE TABLE learning_instruction_examples (
-            example_id TEXT PRIMARY KEY, answer_text TEXT NOT NULL,
-            status TEXT NOT NULL, quality_score REAL NOT NULL,
-            updated_at TEXT NOT NULL
-        );
+            CREATE TABLE learning_instruction_examples (
+                example_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL DEFAULT '',
+                answer_text TEXT NOT NULL,
+                status TEXT NOT NULL, quality_score REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         CREATE TABLE memory_long_term_capsules (
             capsule_id TEXT PRIMARY KEY, summary TEXT NOT NULL
         );
-        CREATE TABLE language_conversation_sessions (
-            conversation_id TEXT PRIMARY KEY, current_summary TEXT NOT NULL
-        );
-        INSERT INTO learning_graph_nodes VALUES
+            CREATE TABLE language_conversation_sessions (
+                conversation_id TEXT PRIMARY KEY, current_summary TEXT NOT NULL
+            );
+            CREATE TABLE archive_messages (
+                message_id INTEGER PRIMARY KEY
+            );
+            INSERT INTO learning_graph_nodes VALUES
             ('node:tipa', 1, 'concept', 'типо', 'типо'),
             ('node:person', 1, 'concept', 'человек', 'человек');
         INSERT INTO learning_graph_edges VALUES (
@@ -240,7 +244,7 @@ async def test_service_word_cleanup_removes_old_graph_noise(tmp_path: Path) -> N
     upgraded = Database(db_path, MIGRATIONS)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 37
+        assert await upgraded.schema_version() == 44
         assert await upgraded.fetchone(
             "SELECT 1 FROM learning_graph_nodes WHERE node_id = 'node:tipa'"
         ) is None
@@ -338,7 +342,7 @@ async def test_internal_surface_cleanup_preserves_raw_history_and_rejects_deriva
     upgraded = Database(db_path, MIGRATIONS)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 37
+        assert await upgraded.schema_version() == 44
         assert await EventRepository(upgraded).get("raw-event-survives-cleanup") is not None
         example = await upgraded.fetchone(
             "SELECT status, quality_score FROM learning_instruction_examples "
@@ -360,6 +364,75 @@ async def test_internal_surface_cleanup_preserves_raw_history_and_rejects_deriva
         )
         assert session is not None
         assert session["current_summary"] == ""
+    finally:
+        await upgraded.close()
+
+
+async def test_authored_warm_start_replies_are_removed_on_upgrade(tmp_path: Path) -> None:
+    v38_migrations = tmp_path / "v38_migrations"
+    v38_migrations.mkdir()
+    for source in sorted(MIGRATIONS.glob("*.sql")):
+        if int(source.name.split("_", 1)[0]) >= 39:
+            continue
+        (v38_migrations / source.name).write_text(
+            source.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    db_path = tmp_path / "upgrade-v38.sqlite3"
+    old_database = Database(db_path, v38_migrations)
+    await old_database.initialize()
+    timestamp = datetime(2026, 7, 23, 12, 0, tzinfo=UTC).isoformat()
+    prompt_message_id = 8_700_000_000_000_000_000
+    response_message_id = prompt_message_id + 1
+    for message_id, content, reply_to, author_is_bot in (
+        (prompt_message_id, "Кто твоя мама?", None, 0),
+        (
+            response_message_id,
+            "В человеческом смысле мамы у меня нет.",
+            prompt_message_id,
+            1,
+        ),
+    ):
+        await old_database.execute(
+            """
+            INSERT INTO archive_messages (
+                message_id, guild_id, channel_id, author_id, created_at,
+                content, reply_to_message_id, author_is_bot
+            ) VALUES (?, 1, 2, 3, ?, ?, ?, ?)
+            """,
+            (message_id, timestamp, content, reply_to, author_is_bot),
+        )
+    await old_database.execute(
+        """
+        INSERT INTO learning_instruction_examples (
+            example_id, guild_id, channel_id, user_id, source_event_id,
+            response_message_id, instruction_text, answer_text, prompt_hash,
+            answer_hash, quality_score, status, created_at, updated_at
+        ) VALUES (
+            'warm-start-example', 1, 2, 3, 'curriculum:warm-start:0',
+            ?, 'Кто твоя мама?', 'В человеческом смысле мамы у меня нет.',
+            'warm-prompt', 'warm-answer', 0.95, 'accepted', ?, ?
+        )
+        """,
+        (response_message_id, timestamp, timestamp),
+    )
+    await old_database.close()
+
+    upgraded = Database(db_path, MIGRATIONS)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 44
+        archived = await upgraded.fetchone(
+            "SELECT 1 FROM archive_messages WHERE message_id IN (?, ?)",
+            (prompt_message_id, response_message_id),
+        )
+        assert archived is None
+        example = await upgraded.fetchone(
+            "SELECT status, quality_score FROM learning_instruction_examples "
+            "WHERE example_id = 'warm-start-example'"
+        )
+        assert example is not None
+        assert example["status"] == "rejected"
+        assert float(example["quality_score"]) == 0.0
     finally:
         await upgraded.close()
 

@@ -12,6 +12,12 @@ from typing import Any
 from uuid import uuid4
 
 from debilgi.events.models import Event, EventType
+from debilgi.language.abbreviations import (
+    abbreviation_meanings,
+    common_abbreviations,
+    extract_explicit_abbreviation_definition,
+    is_abbreviation_candidate,
+)
 from debilgi.language.character_markov import (
     CharacterMarkovRepository,
     normalize_word,
@@ -29,7 +35,7 @@ except ImportError:  # pragma: no cover - depends on deployment extras
 
 _MESSAGE_TYPES = {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}
 _EXPLICIT_DEFINITION_RE = re.compile(
-    r"(?:^|[\s,;:])[«\"']?([А-Яа-яЁё-]{2,48})[»\"']?\s*"
+    r"(?:^|[\s,;:])[«\"']?([A-Za-zА-Яа-яЁё-]{2,48})[»\"']?\s*"
     r"(?:[—–-]\s*(?:это\s+)?|(?:это|означает|значит)\s+)(.+)$",
     re.IGNORECASE,
 )
@@ -152,12 +158,39 @@ class WordAnalysis:
                 "dictionary_cache",
                 "ru_wiktionary",
                 "ru_wiktionary_derived",
+                "builtin_abbreviation",
             }
         )
 
     @property
     def response_confidence(self) -> float:
         return self.confidence.response
+
+    @property
+    def has_usable_meaning(self) -> bool:
+        """Whether generation has grounded semantics instead of only a known form."""
+
+        return bool(
+            self.selected_meaning
+            or self.personal_interpretation
+            or self.local_meaning
+            or self.dictionary_meanings
+        )
+
+    @property
+    def requires_lexical_study(self) -> bool:
+        """Reserve the unknown-word queue for genuine lexical gaps.
+
+        Ambiguity and low confidence are reasoning problems, not proof that the
+        word is unknown.  In particular, a dictionary-backed ambiguous word
+        must not be reported to the user as something the bot does not know.
+        """
+
+        return (
+            self.unknown_kind
+            in {UnknownKind.UNKNOWN_FORM, UnknownKind.UNKNOWN_MEANING}
+            and not self.has_usable_meaning
+        )
 
     def uncertainty_message(self) -> str | None:
         messages = {
@@ -267,12 +300,17 @@ class LexiconService:
         self.curiosity_question_cooldown = curiosity_question_cooldown
         self.curiosity_max_consecutive_questions = curiosity_max_consecutive_questions
         self._morph = pymorphy3.MorphAnalyzer() if pymorphy3 is not None else None
-        self._semantic_study_notifier: Callable[[], None] | None = None
+        self._study_notifier: Callable[[], None] | None = None
+
+    def set_study_notifier(self, notifier: Callable[[], None] | None) -> None:
+        """Wake the autonomous learner whenever durable study work is queued."""
+
+        self._study_notifier = notifier
 
     def set_semantic_study_notifier(self, notifier: Callable[[], None] | None) -> None:
-        """Wake the autonomous learner when semantic work is queued."""
+        """Compatibility alias for callers configured before lexical wakeups."""
 
-        self._semantic_study_notifier = notifier
+        self.set_study_notifier(notifier)
 
     async def observe(self, event: Event) -> None:
         if event.event_type not in _MESSAGE_TYPES or event.payload.get("author_is_bot") is True:
@@ -283,7 +321,15 @@ class LexiconService:
         if not isinstance(content, str) or not content.strip():
             return
         observed_at = event.utc_timestamp.isoformat()
-        explicit_definition = extract_explicit_definition(content)
+        abbreviation_definition = extract_explicit_abbreviation_definition(content)
+        explicit_definition = (
+            (
+                abbreviation_definition[0],
+                f"сокращение от «{abbreviation_definition[1]}»",
+            )
+            if abbreviation_definition is not None
+            else extract_explicit_definition(content)
+        )
         if explicit_definition is not None:
             concept, definition = explicit_definition
             await self.teach_personal_interpretation(
@@ -305,7 +351,7 @@ class LexiconService:
                 context=content,
             )
             await self._remember_personal(event, analysis, observed_at)
-            if analysis.unknown_kind is not None:
+            if analysis.requires_lexical_study:
                 await self._record_unknown(event, analysis, observed_at)
 
     async def analyze_word(
@@ -317,7 +363,11 @@ class LexiconService:
         context: str | None = None,
     ) -> WordAnalysis:
         surface = word
-        original_normalized = normalize_word(word)
+        original_normalized = (
+            re.sub(r"[\s._-]+", "", normalize_word(word))
+            if is_abbreviation_candidate(word)
+            else normalize_word(word)
+        )
         normalized = original_normalized
         morphological = DEFAULT_MORPHOLOGY.best(original_normalized)
         if morphological is not None and morphological.corrected_form:
@@ -357,6 +407,48 @@ class LexiconService:
                 ),
                 associations=self._associations(personal),
                 is_neologism=neologism is not None,
+            )
+
+        if personal is not None and is_abbreviation_candidate(surface):
+            interpretation = (
+                str(personal["interpretation"]) if personal["interpretation"] else None
+            )
+            memory = float(personal["confidence"])
+            return WordAnalysis(
+                surface,
+                normalized,
+                normalized,
+                "NOUN",
+                {"abbreviation": "yes"},
+                (interpretation,) if interpretation else (),
+                ("abbreviation", "learned_in_conversation"),
+                "personal_abbreviation",
+                ConfidenceProfile(0.96, memory, 0.9, memory, min(0.94, memory)),
+                selected_meaning=interpretation,
+                personal_interpretation=interpretation,
+                associations=self._associations(personal),
+                unknown_kind=(
+                    UnknownKind.UNKNOWN_MEANING if interpretation is None else None
+                ),
+                is_neologism=neologism is not None,
+            )
+
+        dotted_expansions = abbreviation_meanings(surface) if "." in surface else ()
+        if dotted_expansions:
+            meanings = tuple(
+                f"сокращение от «{expansion}»" for expansion in dotted_expansions
+            )
+            return WordAnalysis(
+                surface,
+                normalized,
+                normalized,
+                "NOUN",
+                {"abbreviation": "yes"},
+                meanings,
+                ("abbreviation",),
+                "builtin_abbreviation",
+                ConfidenceProfile(0.98, 0.96, 0.9, 0.9, 0.9),
+                selected_meaning=meanings[0],
             )
 
         if reference is not None:
@@ -733,7 +825,9 @@ class LexiconService:
         rows = await self._database.fetchall(
             "SELECT lemma FROM language_dictionary_entries ORDER BY lemma LIMIT 20000"
         )
-        choices = set(_BUILTIN) | {str(row["lemma"]) for row in rows}
+        choices = set(_BUILTIN) | set(common_abbreviations()) | {
+            str(row["lemma"]) for row in rows
+        }
         corrected = DEFAULT_MORPHOLOGY.best(normalized)
         standard_candidate = corrected.corrected_form if corrected is not None else None
         matches = get_close_matches(
@@ -978,7 +1072,7 @@ class LexiconService:
     async def ensure_study_queue(self, event: Event, analysis: WordAnalysis) -> bool:
         """Ensure an unresolved word is visible in the persistent study queue."""
 
-        if analysis.unknown_kind is None or not analysis.normalized_form:
+        if not analysis.requires_lexical_study or not analysis.normalized_form:
             return False
         await self._upsert_unknown(
             event,
@@ -1052,8 +1146,8 @@ class LexiconService:
                 ),
             )
             queued += int(cursor.rowcount > 0)
-        if queued and self._semantic_study_notifier is not None:
-            self._semantic_study_notifier()
+        if queued and self._study_notifier is not None:
+            self._study_notifier()
         return queued
 
     async def resolve_unknown(self, guild_id: int, channel_id: int, word: str) -> int:
@@ -1085,7 +1179,7 @@ class LexiconService:
         *,
         increment_occurrence: bool,
     ) -> None:
-        if analysis.unknown_kind is None:
+        if not analysis.requires_lexical_study:
             return
         relevance = 0.8 if event.payload.get("bot_mentioned") is True else 0.25
         await self._database.execute(
@@ -1142,6 +1236,8 @@ class LexiconService:
                     event.channel_id,
                 ),
             )
+        if self._study_notifier is not None:
+            self._study_notifier()
 
     async def _slang(self, guild_id: int, channel_id: int | None, normalized: str):
         return await self._database.fetchone(
@@ -1318,6 +1414,30 @@ class LexiconService:
                 labels,
                 "builtin",
                 0.96,
+            )
+        abbreviation_expansions = abbreviation_meanings(normalized)
+        if abbreviation_expansions:
+            meanings = tuple(
+                f"сокращение от «{expansion}»" for expansion in abbreviation_expansions
+            )
+            return (
+                normalized,
+                "NOUN",
+                {"abbreviation": "yes"},
+                meanings,
+                ("abbreviation",),
+                "builtin_abbreviation",
+                0.98,
+            )
+        if reading is not None and reading.analysis_kind == "numeric_literal":
+            return (
+                reading.lemma,
+                "NUMR",
+                reading.features(),
+                (),
+                ("numeric_literal",),
+                "numeric_literal",
+                0.99,
             )
         if self._morph is None:
             return None

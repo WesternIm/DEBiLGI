@@ -130,6 +130,16 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
         )
         if valency.unexpected_roles:
             issues.append("unexpected_valency_role")
+        for index in range(clause.token_start, clause.token_end):
+            object_token = structure.tokens[index]
+            if (
+                index != clause.predicate_index
+                and
+                object_token.part_of_speech == "participle"
+                and object_token.lemma.casefold().replace("ё", "е")
+                == predicate.casefold().replace("ё", "е")
+            ):
+                issues.append("predicate_participle_as_object")
         for action_index in clause.action_complement_indices:
             action = structure.tokens[action_index].lemma
             action_objects = tuple(
@@ -192,6 +202,12 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
         for sentence in _SENTENCE_SPLIT_RE.split(stripped)
         if sentence.strip()
     ) or (stripped,)
+    normalized_sentences = tuple(
+        " ".join(sentence.casefold().strip(" .!?…").split())
+        for sentence in sentences
+    )
+    if len(set(normalized_sentences)) != len(normalized_sentences):
+        issues.append("duplicate_sentence")
     completeness: list[float] = []
     agreement_scores: list[float] = []
     for sentence in sentences:

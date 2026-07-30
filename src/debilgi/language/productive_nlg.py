@@ -22,6 +22,7 @@ _ARGUMENT_ROLES = frozenset(
         "predicate_complement",
         "action_complement",
         "manner",
+        "cause",
         "location",
         "topic",
     }
@@ -35,8 +36,24 @@ _CORE_ROLE_ORDER = (
     "predicate_complement",
     "action_complement",
     "manner",
+    "cause",
     "location",
     "topic",
+)
+_QUESTION_FOCUS_LEMMAS = frozenset(
+    {
+        "где",
+        "зачем",
+        "как",
+        "какой",
+        "когда",
+        "кто",
+        "куда",
+        "откуда",
+        "почему",
+        "сколько",
+        "что",
+    }
 )
 
 
@@ -55,6 +72,7 @@ class ConceptArgument:
     modifiers: tuple[ConceptLexeme, ...] = ()
     preposition: str | None = None
     grammatical_case: str | None = None
+    postmodifiers: tuple[ConceptLexeme, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -527,6 +545,26 @@ def realize_thought(
                 None,
             )
         )
+    focused_argument = (
+        role_values.get(thought.focus_role)
+        if thought.focus_role is not None
+        else None
+    )
+    requires_fronted_question_focus = bool(
+        thought.clause_kind == "question"
+        and thought.focus_role in present_roles
+        and focused_argument is not None
+        and focused_argument.head.lemma in _QUESTION_FOCUS_LEMMAS
+    )
+    if requires_fronted_question_focus:
+        # ``focus_role`` is an explicit information-structure instruction.
+        # A learned order may not demote its WH argument into an unlicensed
+        # in-situ position such as ``думаешь ты что о ...``.
+        orders = [
+            item
+            for item in orders
+            if item[0] and item[0][0] == thought.focus_role
+        ]
 
     surfaces: list[ProductiveSurface] = []
     seen_orders: set[tuple[str, ...]] = set()
@@ -601,11 +639,9 @@ def _realize_order(
         if role == "negation":
             words.append("не")
         elif role == "predicate":
-            predicate = (
-                DEFAULT_MORPHOLOGY.inflect(thought.predicate.lemma, **predicate_features)
-                or thought.predicate.surface
-                if thought.predicate.part_of_speech == "verb"
-                else thought.predicate.surface
+            predicate = _realize_predicate(
+                thought.predicate,
+                predicate_features,
             )
             words.append(predicate)
         else:
@@ -628,6 +664,32 @@ def _realize_order(
     return body[:1].upper() + body[1:] + punctuation if body else ""
 
 
+def _realize_predicate(
+    predicate: ConceptLexeme,
+    features: dict[str, str],
+) -> str:
+    if predicate.part_of_speech != "verb":
+        return predicate.surface
+    inflected = DEFAULT_MORPHOLOGY.inflect(predicate.lemma, **features)
+    if inflected:
+        return inflected
+    reading = DEFAULT_MORPHOLOGY.best(predicate.lemma)
+    if (
+        features.get("tense") == "future"
+        and reading is not None
+        and reading.aspect == "imperfective"
+    ):
+        auxiliary = DEFAULT_MORPHOLOGY.inflect(
+            "быть",
+            tense="future",
+            person=features.get("person", "third"),
+            number=features.get("number", "singular"),
+        )
+        if auxiliary:
+            return f"{auxiliary} {reading.lemma}"
+    return predicate.surface
+
+
 def _predicate_features(
     predicate: ConceptLexeme,
     subject: ConceptArgument | None,
@@ -639,7 +701,7 @@ def _predicate_features(
     }
     if subject is None:
         return features
-    subject_features = dict(subject.head.features)
+    subject_features = _inferred_head_features(subject.head)
     if subject.head.lemma == "я":
         features["number"] = "singular"
         if features.get("tense") != "past":
@@ -648,10 +710,27 @@ def _predicate_features(
         features["number"] = "singular"
         if features.get("tense") != "past":
             features["person"] = "second"
+    elif subject.head.lemma == "мы":
+        features["number"] = "plural"
+        if features.get("tense") != "past":
+            features["person"] = "first"
+    elif subject.head.lemma == "вы":
+        features["number"] = "plural"
+        if features.get("tense") != "past":
+            features["person"] = "second"
+    elif features.get("tense") != "past":
+        features["person"] = "third"
     if features.get("tense") == "past":
         features.pop("person", None)
+        for name in ("number", "gender"):
+            if subject_features.get(name):
+                features[name] = subject_features[name]
     else:
-        for name in ("person", "number", "gender"):
+        # Russian present/future forms agree in person and number.  A gender
+        # grammeme is incompatible here and can make the morphology backend
+        # fall back to a gerund such as ``приходя``.
+        features.pop("gender", None)
+        for name in ("person", "number"):
             if subject_features.get(name):
                 features[name] = subject_features[name]
     return features
@@ -705,13 +784,21 @@ def _render_argument(argument: ConceptArgument, *, case: str | None) -> str:
     # it together with instrumental or prepositional grammemes makes
     # pymorphy reject an otherwise valid inflection and leaks the nominative
     # modifier (``обучающийся собеседником``).
-    if case == "accusative" and head_features.get("animacy"):
+    if (
+        case == "accusative"
+        and head_features.get("animacy")
+        and (
+            head_features.get("number") == "plural"
+            or head_features.get("gender") == "masculine"
+        )
+    ):
         modifier_features["animacy"] = head_features["animacy"]
     modifiers = tuple(
         DEFAULT_MORPHOLOGY.inflect(item.lemma, **modifier_features) or item.surface
         for item in argument.modifiers
     )
-    phrase = " ".join((*modifiers, head)).strip()
+    postmodifiers = tuple(item.surface for item in argument.postmodifiers)
+    phrase = " ".join((*modifiers, head, *postmodifiers)).strip()
     return f"{argument.preposition} {phrase}" if argument.preposition else phrase
 
 

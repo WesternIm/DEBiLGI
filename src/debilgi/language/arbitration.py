@@ -5,12 +5,17 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from types import MappingProxyType
 from uuid import uuid4
 
+from debilgi.language.construction_nlg import ResponseContentPlan
 from debilgi.language.content import content_lemmas
+from debilgi.language.facts import (
+    StructuredFact,
+    covers_structured_fact,
+)
 from debilgi.language.structural_learning import (
     learned_structural_bonus,
     structural_response_features,
@@ -26,14 +31,59 @@ _UNCERTAINTY_MARKERS = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class ResponseCandidate:
+class ContentProposal:
+    proposal_id: str
+    source: str
+    plan: ResponseContentPlan
+    applicability: float | None
+    source_confidence: float
+    evidence_ids: tuple[str, ...]
+    metadata: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        event_id: str,
+        source: str,
+        plan: ResponseContentPlan,
+        source_confidence: float,
+        applicability: float | None = None,
+        evidence_ids: tuple[str, ...] = (),
+        metadata: Mapping[str, object] | None = None,
+    ) -> ContentProposal:
+        material = "\x1f".join(
+            (
+                event_id,
+                source,
+                plan.speech_act,
+                plan.response_goal or plan.response_act,
+                "|".join(fact.text for fact in plan.required_facts),
+                "|".join(plan.key_points),
+            )
+        )
+        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+        return cls(
+            proposal_id=f"proposal:{digest}",
+            source=source,
+            plan=plan,
+            applicability=_clamp(applicability) if applicability is not None else None,
+            source_confidence=_clamp(source_confidence),
+            evidence_ids=tuple(dict.fromkeys(evidence_ids)),
+            metadata=MappingProxyType(dict(metadata or {})),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SurfaceCandidate:
     candidate_id: str
+    proposal: ContentProposal
     source: str
     renderer: str
     text: str
     speech_act: str
     source_confidence: float
-    required_facts: tuple[str, ...] = ()
+    required_facts: tuple[StructuredFact, ...] = ()
     key_points: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
 
@@ -47,52 +97,123 @@ class ResponseCandidate:
         text: str,
         speech_act: str,
         source_confidence: float,
-        required_facts: tuple[str, ...] = (),
+        required_facts: tuple[str | StructuredFact, ...] = (),
         key_points: tuple[str, ...] = (),
         metadata: Mapping[str, object] | None = None,
-    ) -> ResponseCandidate:
+        content_plan: ResponseContentPlan | None = None,
+        proposal: ContentProposal | None = None,
+    ) -> SurfaceCandidate:
+        candidate_metadata = MappingProxyType(dict(metadata or {}))
+        fact_target = (
+            f"user:{candidate_metadata['target_id']}"
+            if isinstance(candidate_metadata.get("target_id"), int)
+            and not isinstance(candidate_metadata.get("target_id"), bool)
+            else None
+        )
+        structured_facts = tuple(
+            fact
+            if isinstance(fact, StructuredFact)
+            else StructuredFact.from_text(
+                fact,
+                certainty=source_confidence,
+                target=fact_target,
+                provenance=(event_id, source),
+            )
+            for fact in required_facts
+        )
+        if proposal is None:
+            measured_applicability = candidate_metadata.get("applicability")
+            applicability = (
+                float(measured_applicability)
+                if isinstance(measured_applicability, int | float)
+                and not isinstance(measured_applicability, bool)
+                else None
+            )
+            plan = content_plan or ResponseContentPlan(
+                response_act=speech_act,
+                answer_polarity=None,
+                clauses=(),
+                confidence=_clamp(source_confidence),
+                response_goal=str(candidate_metadata.get("response_obligation", speech_act)),
+                target_id=(
+                    int(candidate_metadata["target_id"])
+                    if isinstance(candidate_metadata.get("target_id"), int)
+                    and not isinstance(candidate_metadata.get("target_id"), bool)
+                    else None
+                ),
+                topic_ids=tuple(
+                    dict.fromkeys(
+                        term
+                        for value in (*key_points, *(fact.text for fact in structured_facts))
+                        for term in content_lemmas(value)
+                    )
+                ),
+                key_points=key_points,
+                required_facts=structured_facts,
+                evidence=(event_id, source),
+            )
+            proposal = ContentProposal.create(
+                event_id=event_id,
+                source=source,
+                plan=plan,
+                source_confidence=source_confidence,
+                applicability=applicability,
+                evidence_ids=tuple(
+                    evidence for fact in structured_facts for evidence in fact.provenance
+                ),
+                metadata=candidate_metadata,
+            )
         material = "\x1f".join((event_id, source, renderer, " ".join(text.split())))
         digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
         return cls(
             candidate_id=f"candidate:{digest}",
+            proposal=proposal,
             source=source,
             renderer=renderer,
             text=text.strip(),
             speech_act=speech_act,
             source_confidence=_clamp(source_confidence),
-            required_facts=required_facts,
+            required_facts=structured_facts,
             key_points=key_points,
-            metadata=MappingProxyType(dict(metadata or {})),
+            metadata=candidate_metadata,
         )
+
+
+# Compatibility name for integrations built before the content/surface split.
+ResponseCandidate = SurfaceCandidate
 
 
 @dataclass(frozen=True, slots=True)
 class CandidateFeatures:
-    applicability: float
+    applicability: float | None
     context_relevance: float
     source_confidence: float
-    reply_binding: float
+    reply_binding: float | None
     speech_act_fit: float
     plan_coverage: float
-    fact_grounding: float
+    fact_grounding: float | None
     topic_continuity: float
     grammar_fit: float
     specificity: float
     length_fit: float
     non_repetition: float
     uncertainty_calibration: float
-    truth_grounding: float
-    stance_consistency: float
+    truth_grounding: float | None
+    stance_consistency: float | None
     semantic_frame_fit: float
-    social_coherence: float
+    social_coherence: float | None
     prompt_echo_penalty: float
     reference_copy_penalty: float
     retrieval_dump_penalty: float
     repetition_penalty: float
     broken_surface_penalty: float
 
-    def as_dict(self) -> dict[str, float]:
-        return {name: float(getattr(self, name)) for name in self.__dataclass_fields__}
+    def as_dict(self) -> dict[str, float | None]:
+        return {
+            name: float(value) if value is not None else None
+            for name in self.__dataclass_fields__
+            for value in (getattr(self, name),)
+        }
 
 
 DEFAULT_WEIGHTS: Mapping[str, float] = MappingProxyType(
@@ -125,6 +246,7 @@ DEFAULT_WEIGHTS: Mapping[str, float] = MappingProxyType(
 DEFAULT_SOURCE_BIASES: Mapping[str, float] = MappingProxyType(
     {
         "discord_identity": 0.45,
+        "autonomous_semantic_plan": 0.48,
         "contextual_learning": 0.35,
         "short_act": 0.30,
         "exact_archive": 0.25,
@@ -132,8 +254,12 @@ DEFAULT_SOURCE_BIASES: Mapping[str, float] = MappingProxyType(
         "knowledge_retrieval": 0.20,
         "meaning_plan": 0.22,
         "dialogue_context": 0.24,
+        "personal_action": 0.30,
         "semantic_reasoning": 0.23,
+        "semantic_inquiry": 0.31,
+        "abstract_reasoning": 0.32,
         "relation_reasoning": 0.28,
+        "runtime_state": 0.34,
         "causal_reasoning": 0.30,
         "dialogue_act": 0.26,
         "semantic_synthesis": 0.08,
@@ -178,7 +304,7 @@ class ArbitrationProfile:
 
 @dataclass(frozen=True, slots=True)
 class ScoredCandidate:
-    candidate: ResponseCandidate
+    candidate: SurfaceCandidate
     features: CandidateFeatures
     weighted_components: Mapping[str, float]
     total: float
@@ -190,14 +316,55 @@ class ScoredCandidate:
 class ArbitrationDecision:
     decision_id: str
     event_id: str
-    winner: ResponseCandidate | None
+    winner: SurfaceCandidate | None
     scores: tuple[ScoredCandidate, ...]
     profile_id: str
     weight_version: int
     minimum_score: float
     used_fallback: bool
     selection_reason: str
+    content_scores: tuple[ScoredContentProposal, ...] = ()
+    selected_proposal_ids: tuple[str, ...] = ()
     latency_ms: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class ScoredContentProposal:
+    proposal: ContentProposal
+    total: float
+    eligible: bool
+    rejection_reasons: tuple[str, ...]
+    components: Mapping[str, float]
+
+
+def merge_recovery_decision(
+    primary: ArbitrationDecision,
+    recovery: ArbitrationDecision,
+    *,
+    selection_reason: str = "semantic_recovery_after_below_threshold",
+) -> ArbitrationDecision:
+    """Attach rejected primary surfaces without orphaning their content proposals."""
+
+    scores = {item.candidate.candidate_id: item for item in (*recovery.scores, *primary.scores)}
+    content_scores = {
+        item.proposal.proposal_id: item
+        for item in (*recovery.content_scores, *primary.content_scores)
+    }
+    return replace(
+        recovery,
+        scores=tuple(scores.values()),
+        content_scores=tuple(content_scores.values()),
+        selected_proposal_ids=tuple(
+            dict.fromkeys(
+                (
+                    *recovery.selected_proposal_ids,
+                    *primary.selected_proposal_ids,
+                )
+            )
+        ),
+        used_fallback=True,
+        selection_reason=selection_reason,
+    )
 
 
 class ResponseArbitrator:
@@ -217,6 +384,29 @@ class ResponseArbitrator:
         used_fallback: bool = False,
     ) -> ArbitrationDecision:
         unique = self._deduplicate(candidates)
+        proposals = {candidate.proposal.proposal_id: candidate.proposal for candidate in unique}
+        content_scores = tuple(
+            sorted(
+                (self._score_content(proposal, profile=profile) for proposal in proposals.values()),
+                key=lambda item: (
+                    item.total,
+                    _stable_number(f"{event_id}|{item.proposal.proposal_id}"),
+                ),
+                reverse=True,
+            )
+        )
+        selected_proposal_ids = tuple(
+            item.proposal.proposal_id for item in content_scores if item.eligible
+        )[:12]
+        surface_pool = (
+            tuple(
+                candidate
+                for candidate in unique
+                if candidate.proposal.proposal_id in selected_proposal_ids
+            )
+            if selected_proposal_ids
+            else unique
+        )
         scores = tuple(
             self._score(
                 candidate,
@@ -226,7 +416,7 @@ class ResponseArbitrator:
                 profile=profile,
                 structural_weights=structural_weights or {},
             )
-            for candidate in unique
+            for candidate in surface_pool
         )
         eligible = tuple(item for item in scores if item.eligible)
         winner_score = max(
@@ -259,6 +449,51 @@ class ResponseArbitrator:
             minimum_score=self.minimum_score,
             used_fallback=used_fallback,
             selection_reason=reason,
+            content_scores=content_scores,
+            selected_proposal_ids=selected_proposal_ids,
+        )
+
+    @staticmethod
+    def _score_content(
+        proposal: ContentProposal,
+        *,
+        profile: ArbitrationProfile,
+    ) -> ScoredContentProposal:
+        reasons: list[str] = []
+        if proposal.applicability is not None and proposal.applicability <= 0.0:
+            reasons.append("not_applicable")
+        plan = proposal.plan
+        response_goal = plan.response_goal or plan.response_act
+        if not response_goal.strip():
+            reasons.append("missing_response_goal")
+        components = {
+            "source_confidence": proposal.source_confidence * 1.15,
+            "semantic_specificity": min(
+                1.0,
+                (len(plan.required_facts) * 2 + len(plan.key_points)) / 4.0,
+            )
+            * 0.85,
+            "goal_specificity": float(response_goal not in {"", "statement", "question"}) * 0.55,
+            "source_bias": float(
+                profile.source_biases.get(
+                    proposal.source,
+                    DEFAULT_SOURCE_BIASES.get(proposal.source, 0.0),
+                )
+            ),
+        }
+        denominator = 3.55
+        if proposal.applicability is not None:
+            components["applicability"] = proposal.applicability * 1.40
+            denominator += 1.40
+        total = sum(components.values()) / denominator
+        if reasons:
+            total = min(total, -10.0)
+        return ScoredContentProposal(
+            proposal=proposal,
+            total=total,
+            eligible=not reasons,
+            rejection_reasons=tuple(reasons),
+            components=MappingProxyType(components),
         )
 
     def _score(
@@ -279,7 +514,11 @@ class ResponseArbitrator:
             recent_replies=recent_replies,
         )
         components: dict[str, float] = {}
-        for name, value in features.as_dict().items():
+        measured_features = {
+            name: value for name, value in features.as_dict().items() if value is not None
+        }
+        for name, value in measured_features.items():
+            assert value is not None
             weight = float(profile.weights.get(name, DEFAULT_WEIGHTS.get(name, 0.0)))
             components[name] = -weight * value if name in _PENALTY_NAMES else weight * value
         source_bias = float(
@@ -292,7 +531,7 @@ class ResponseArbitrator:
         maximum = (
             sum(
                 float(profile.weights.get(name, DEFAULT_WEIGHTS.get(name, 0.0)))
-                for name in features.as_dict()
+                for name in measured_features
                 if name not in _PENALTY_NAMES
             )
             + 1.0
@@ -333,7 +572,16 @@ class ResponseArbitrator:
         if internal_surface_reason(normalized) is not None:
             reasons.append("internal_diagnostic_leak")
         surface = evaluate_surface(text)
-        reasons.extend(f"surface:{issue}" for issue in surface.hard_issues)
+        researched_fact_surface = bool(
+            candidate.metadata.get("foreground_research") is True
+            and candidate.required_facts
+            and all(_covers_fact(text, fact) for fact in candidate.required_facts)
+        )
+        reasons.extend(
+            f"surface:{issue}"
+            for issue in surface.hard_issues
+            if not (researched_fact_surface and issue == "unexpected_valency_role")
+        )
         explicit_rejection = candidate.metadata.get("hard_rejection")
         if isinstance(explicit_rejection, str) and explicit_rejection:
             reasons.append(explicit_rejection)
@@ -384,13 +632,13 @@ def extract_features(
         float(measured_applicability)
         if isinstance(measured_applicability, int | float)
         and not isinstance(measured_applicability, bool)
-        else 1.0
+        else None
     )
     measured_binding = candidate.metadata.get("reply_binding")
     reply_binding = (
         float(measured_binding)
         if isinstance(measured_binding, int | float) and not isinstance(measured_binding, bool)
-        else 0.5
+        else None
     )
     context_relevance = (
         float(measured_relevance)
@@ -398,11 +646,14 @@ def extract_features(
         else _overlap(candidate_terms, active_terms)
     )
     topic_continuity = _overlap(candidate_terms, prompt_terms or focus_terms)
-    required = tuple((*candidate.required_facts, *candidate.key_points))
-    covered = sum(_covers_fact(text, fact) for fact in required)
-    plan_coverage = covered / max(1, len(required)) if required else context_relevance
-    required_terms = {term for fact in candidate.required_facts for term in content_lemmas(fact)}
-    fact_grounding = _overlap(candidate_terms, required_terms) if required_terms else 0.5
+    covered = sum(_covers_fact(text, fact) for fact in candidate.required_facts)
+    covered += sum(_covers_key_point(text, point) for point in candidate.key_points)
+    required_count = len(candidate.required_facts) + len(candidate.key_points)
+    plan_coverage = covered / required_count if required_count else context_relevance
+    required_terms = {
+        term for fact in candidate.required_facts for term in content_lemmas(fact.text)
+    }
+    fact_grounding = _overlap(candidate_terms, required_terms) if required_terms else None
     tokens = tokenize(text)
     words = tuple(token for token in tokens if token[:1].isalnum())
     surface = evaluate_surface(text)
@@ -428,9 +679,9 @@ def extract_features(
         else 0.55
     )
     truth_grounding = _metadata_score(candidate, "truth_grounding", fact_grounding)
-    stance_consistency = _metadata_score(candidate, "stance_consistency", 0.65)
+    stance_consistency = _metadata_score(candidate, "stance_consistency", None)
     semantic_frame_fit = _metadata_score(candidate, "semantic_frame_fit", speech_act_fit)
-    social_coherence = _metadata_score(candidate, "social_coherence", 0.60)
+    social_coherence = _metadata_score(candidate, "social_coherence", None)
     prompt_similarity = SequenceMatcher(None, " ".join(tokenize(prompt)), " ".join(tokens)).ratio()
     prompt_echo_penalty = max(0.0, (prompt_similarity - 0.62) / 0.38)
     reference_copy_penalty = _metadata_score(candidate, "reference_copy_penalty", 0.0)
@@ -442,23 +693,23 @@ def extract_features(
     repetition_penalty = 1.0 - len(set(words)) / max(1, len(words))
     broken_surface_penalty = float(bool(surface.hard_issues))
     return CandidateFeatures(
-        applicability=_clamp(applicability),
+        applicability=_clamp(applicability) if applicability is not None else None,
         context_relevance=_clamp(context_relevance),
         source_confidence=candidate.source_confidence,
-        reply_binding=_clamp(reply_binding),
+        reply_binding=_clamp(reply_binding) if reply_binding is not None else None,
         speech_act_fit=_clamp(speech_act_fit),
         plan_coverage=_clamp(plan_coverage),
-        fact_grounding=_clamp(fact_grounding),
+        fact_grounding=_clamp(fact_grounding) if fact_grounding is not None else None,
         topic_continuity=_clamp(topic_continuity),
         grammar_fit=_clamp(grammar_fit),
         specificity=_clamp(specificity),
         length_fit=_clamp(length_fit),
         non_repetition=_clamp(non_repetition),
         uncertainty_calibration=_clamp(uncertainty_calibration),
-        truth_grounding=_clamp(truth_grounding),
-        stance_consistency=_clamp(stance_consistency),
+        truth_grounding=_clamp(truth_grounding) if truth_grounding is not None else None,
+        stance_consistency=(_clamp(stance_consistency) if stance_consistency is not None else None),
         semantic_frame_fit=_clamp(semantic_frame_fit),
-        social_coherence=_clamp(social_coherence),
+        social_coherence=_clamp(social_coherence) if social_coherence is not None else None,
         prompt_echo_penalty=_clamp(prompt_echo_penalty),
         reference_copy_penalty=_clamp(reference_copy_penalty),
         retrieval_dump_penalty=_clamp(retrieval_dump_penalty),
@@ -474,31 +725,31 @@ def _speech_act_fit(speech_act: str, text: str) -> float:
     return 0.85 if not is_question else 0.55
 
 
-def _metadata_score(candidate: ResponseCandidate, name: str, default: float) -> float:
+def _metadata_score(
+    candidate: ResponseCandidate,
+    name: str,
+    default: float | None,
+) -> float | None:
     value = candidate.metadata.get(name)
     return (
-        float(value)
-        if isinstance(value, int | float) and not isinstance(value, bool)
-        else default
+        float(value) if isinstance(value, int | float) and not isinstance(value, bool) else default
     )
 
 
-def _covers_fact(text: str, fact: str) -> bool:
-    normalized_text = " ".join(text.casefold().replace("ё", "е").split())
-    normalized_fact = " ".join(fact.casefold().replace("ё", "е").split())
-    if normalized_fact and normalized_fact in normalized_text:
-        return True
-    fact_terms = set(content_lemmas(fact))
-    if not fact_terms:
+def _covers_fact(text: str, fact: StructuredFact) -> bool:
+    return covers_structured_fact(text, fact)
+
+
+def _covers_key_point(text: str, point: str) -> bool:
+    point_terms = set(content_lemmas(point))
+    if not point_terms:
         return False
     text_terms = set(content_lemmas(text))
-    # Required-fact coverage is directional: other grounded sentences in the
-    # same answer must not make an otherwise covered fact look less complete.
-    return len(text_terms & fact_terms) / len(fact_terms) >= 0.72
+    return len(text_terms & point_terms) / len(point_terms) >= 0.72
 
 
-def _fact_key(fact: str) -> str:
-    return hashlib.sha256(fact.encode("utf-8")).hexdigest()[:10]
+def _fact_key(fact: StructuredFact) -> str:
+    return hashlib.sha256(fact.text.encode("utf-8")).hexdigest()[:10]
 
 
 def _overlap(left: set[str], right: set[str]) -> float:

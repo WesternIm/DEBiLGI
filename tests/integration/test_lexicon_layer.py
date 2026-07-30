@@ -6,6 +6,7 @@ import pytest
 
 from debilgi.events.normalizer import normalize_message_created
 from debilgi.language.lexicon import LexiconService, NeologismRepository, UnknownKind
+from debilgi.language.recovery import RecoveryEvidence, compose_recovery
 from debilgi.storage.database import Database
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +53,70 @@ async def test_builtin_meaning_is_available_through_an_inflected_form(
     assert analysis.lemma == "обманщик"
     assert analysis.selected_meaning == (
         "человек, который намеренно вводит других в заблуждение"
+    )
+
+
+async def test_common_abbreviation_is_understood_without_unknown_fallback(
+    database: Database,
+) -> None:
+    analysis = await LexiconService(database).analyze_word(
+        "ИИ",
+        context="Что значит ИИ?",
+    )
+
+    assert analysis.source == "builtin_abbreviation"
+    assert analysis.selected_meaning == "сокращение от «искусственный интеллект»"
+    assert analysis.unknown_kind is None
+    assert compose_recovery(
+        RecoveryEvidence("Что значит ИИ?", analyses=(analysis,))
+    ) == "«ИИ» здесь означает: сокращение от «искусственный интеллект»."
+
+    dotted = await LexiconService(database).analyze_word(
+        "т.е.",
+        context="Что значит т.е.?",
+    )
+    assert dotted.selected_meaning == "сокращение от «то есть»"
+    assert dotted.unknown_kind is None
+
+
+async def test_numeric_literal_does_not_pollute_unknown_word_learning(
+    database: Database,
+) -> None:
+    analysis = await LexiconService(database).analyze_word(
+        "2.0",
+        context="Версия 2.0 работает",
+    )
+
+    assert analysis.lemma == "2.0"
+    assert analysis.part_of_speech == "NUMR"
+    assert analysis.source == "numeric_literal"
+    assert analysis.unknown_kind is None
+
+
+async def test_conversation_can_teach_a_new_abbreviation(database: Database) -> None:
+    service = LexiconService(database)
+    teaching = normalize_message_created(
+        message_id=151,
+        guild_id=1,
+        channel_id=10,
+        author_id=20,
+        created_at=NOW,
+        content="СУБД расшифровывается как система управления базами данных.",
+        author_is_bot=False,
+        bot_mentioned=False,
+    )
+
+    await service.observe(teaching)
+
+    analysis = await service.analyze_word(
+        "СУБД",
+        guild_id=1,
+        channel_id=10,
+        context="Что значит СУБД?",
+    )
+    assert analysis.source == "personal_abbreviation"
+    assert analysis.selected_meaning == (
+        "сокращение от «система управления базами данных»"
     )
 
 

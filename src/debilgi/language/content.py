@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 
+from debilgi.language.abbreviations import (
+    abbreviation_mentions,
+    is_abbreviation_candidate,
+    normalize_abbreviation,
+)
 from debilgi.language.function_words import is_service_word
 from debilgi.language.grammar import role
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
@@ -55,7 +59,6 @@ _NON_TOPICAL_LEMMAS = frozenset(
 _GRAMMATICAL_PARTS = frozenset(
     {"pronoun", "preposition", "conjunction", "particle", "interjection"}
 )
-_ACRONYM_RE = re.compile(r"(?<![\w-])[A-ZА-ЯЁ]{2,10}(?![\w-])")
 
 
 def content_tokens(value: str | Iterable[str]) -> tuple[str, ...]:
@@ -76,20 +79,16 @@ def _content_items(value: str | Iterable[str]) -> tuple[tuple[str, str], ...]:
     if isinstance(value, str):
         tokens = tokenize(value)
         pragmatic_text = value
-        acronym_lemmas = {
-            match.group(0).casefold().replace("ё", "е")
-            for match in _ACRONYM_RE.finditer(value)
-        }
     else:
         tokens = tuple(value)
         pragmatic_text = " ".join(tokens)
-        acronym_lemmas = set()
     cue_words = {
         normalize_chat_token(word.casefold().replace("ё", "е")).canonical
         for cue in analyze_pragmatics(pragmatic_text).cues
         for word in tokenize(cue.surface)
         if word[:1].isalnum()
     }
+    abbreviations = frozenset(abbreviation_mentions(pragmatic_text))
     sentence = DEFAULT_MORPHOLOGY.analyze_sentence(pragmatic_text)
     readings = sentence.readings
     if sentence.tokens != tokens:
@@ -97,34 +96,48 @@ def _content_items(value: str | Iterable[str]) -> tuple[tuple[str, str], ...]:
     selected: list[tuple[str, str]] = []
     for token, reading in zip(tokens, readings, strict=True):
         raw_normalized = token.casefold().replace("ё", "е")
-        is_acronym = raw_normalized in acronym_lemmas or (
-            token.isascii()
-            and token.isalpha()
-            and len(token) == 2
-            and reading is not None
-            and not reading.is_known
-        )
+        abbreviation = is_abbreviation_candidate(token)
         normalized = (
-            reading.corrected_form
+            normalize_abbreviation(token)
+            if abbreviation
+            else reading.corrected_form
             if reading is not None and reading.corrected_form
             else normalize_chat_token(raw_normalized).canonical
         )
-        if not normalized[:1].isalnum() or (len(normalized) <= 2 and not is_acronym):
+        if (
+            not normalized[:1].isalnum()
+            or len(normalized) <= 2
+            and normalized not in abbreviations
+        ):
             continue
         if normalized in cue_words:
             continue
-        if is_service_word(
+        if not abbreviation and is_service_word(
             reading.lemma if reading is not None else normalized,
             part_of_speech=reading.part_of_speech if reading is not None else None,
             question_context="?" in pragmatic_text,
         ):
             continue
-        if reading is not None and reading.part_of_speech in _GRAMMATICAL_PARTS:
+        if (
+            not abbreviation
+            and reading is not None
+            and reading.part_of_speech in _GRAMMATICAL_PARTS
+        ):
             continue
-        if reading is None and role(normalized) not in _CONTENT_ROLES and not is_acronym:
+        if (
+            not abbreviation
+            and reading is None
+            and role(normalized) not in _CONTENT_ROLES
+        ):
             continue
-        lemma = reading.lemma if reading is not None else DEFAULT_MORPHOLOGY.lemma(normalized)
+        lemma = (
+            normalized
+            if abbreviation
+            else reading.lemma
+            if reading is not None
+            else DEFAULT_MORPHOLOGY.lemma(normalized)
+        )
         if lemma in _NON_TOPICAL_LEMMAS:
             continue
-        selected.append((normalized, lemma))
+        selected.append((token if abbreviation and "." in token else normalized, lemma))
     return tuple(dict.fromkeys(selected))

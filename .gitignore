@@ -1,6 +1,9 @@
 .env
-.env.local
+.env.*
+!.env.example
+!.env.local.example
 .venv/
+.venv-admin/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -12,6 +15,9 @@ dist/
 node_modules/
 *.egg-info/
 data/
+runtime-logs/
+.debilgi-secrets.vault
+.debilgi-secrets.vault.*
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal

@@ -2,6 +2,8 @@ from debilgi.language.arbitration import (
     ArbitrationProfile,
     ResponseArbitrator,
     ResponseCandidate,
+    extract_features,
+    merge_recovery_decision,
 )
 
 
@@ -153,3 +155,156 @@ def test_logged_incoherent_graph_surface_is_rejected_instead_of_scoring_as_gramm
     assert not decision.scores[0].eligible
     assert decision.scores[0].features.grammar_fit <= 0.20
     assert "surface:malformed_punctuation" in decision.scores[0].rejection_reasons
+
+
+def test_duplicate_sentences_are_a_hard_surface_failure() -> None:
+    broken = candidate(
+        "Я отвечаю. Я отвечаю.",
+        source="autonomous_semantic_plan",
+    )
+
+    decision = decide(broken)
+
+    assert decision.winner is None
+    assert "surface:duplicate_sentence" in decision.scores[0].rejection_reasons
+
+
+def test_predicate_participle_cannot_pass_as_its_object() -> None:
+    broken = candidate(
+        "Я отвечаю отвечающую.",
+        source="autonomous_semantic_plan",
+    )
+
+    decision = decide(broken)
+
+    assert decision.winner is None
+    assert (
+        "surface:predicate_participle_as_object"
+        in decision.scores[0].rejection_reasons
+    )
+
+
+def test_unknown_features_stay_unknown_instead_of_becoming_middle_scores() -> None:
+    features = extract_features(
+        candidate("Поняла тебя.", source="graph"),
+        prompt="Расскажи подробнее",
+        focus_concepts=(),
+        recent_replies=(),
+    )
+
+    assert features.applicability is None
+    assert features.reply_binding is None
+    assert features.fact_grounding is None
+    assert features.stance_consistency is None
+    assert features.social_coherence is None
+
+
+def test_required_fact_polarity_is_a_hard_invariant() -> None:
+    contradicted = ResponseCandidate.create(
+        event_id="event:polarity",
+        source="semantic_reasoning",
+        renderer="test",
+        text="Макс не любит футбол.",
+        speech_act="statement",
+        source_confidence=0.9,
+        required_facts=("Макс любит футбол.",),
+    )
+
+    decision = ResponseArbitrator(minimum_score=0.0).decide(
+        event_id="event:polarity",
+        prompt="Макс любит футбол?",
+        focus_concepts=("макс", "футбол"),
+        candidates=(contradicted,),
+        recent_replies=(),
+        profile=ArbitrationProfile.baseline(1),
+    )
+
+    assert decision.winner is None
+    assert not decision.scores[0].eligible
+    assert any(
+        reason.startswith("missing_required_fact:")
+        for reason in decision.scores[0].rejection_reasons
+    )
+
+
+def test_structured_required_fact_is_persistable_metadata() -> None:
+    grounded = ResponseCandidate.create(
+        event_id="event:structured",
+        source="semantic_reasoning",
+        renderer="test",
+        text="Макс не любит футбол.",
+        speech_act="statement",
+        source_confidence=0.9,
+        required_facts=("Макс не любит футбол.",),
+    )
+
+    fact = grounded.required_facts[0]
+    assert fact.subject
+    assert fact.predicate == "любить"
+    assert fact.object
+    assert fact.polarity == "negative"
+
+
+def test_content_is_ranked_before_its_surface_wording() -> None:
+    first = candidate(
+        "Футбол мне интересен.",
+        source="dialogue_rule",
+        metadata={"response_obligation": "express_position"},
+    )
+    second = candidate(
+        "Да, мне интересен футбол.",
+        source="dialogue_rule",
+        renderer="alternative",
+        metadata={"response_obligation": "express_position"},
+    )
+
+    decision = decide(first, second)
+
+    assert len(decision.content_scores) == 1
+    assert decision.selected_proposal_ids == (
+        first.proposal.proposal_id,
+    )
+    assert first.proposal == second.proposal
+    assert not hasattr(first.proposal.plan, "text")
+
+
+def test_recovery_merge_keeps_content_for_every_persisted_surface() -> None:
+    primary_candidate = candidate(
+        "Собачки умеют бегать.",
+        source="semantic_reasoning",
+    )
+    primary = ResponseArbitrator(minimum_score=100.0).decide(
+        event_id="event:one",
+        prompt="Собачки умеют бегать?",
+        focus_concepts=("собачка", "бегать"),
+        candidates=(primary_candidate,),
+        recent_replies=(),
+        profile=ArbitrationProfile.baseline(1),
+    )
+    recovery_candidate = candidate(
+        "Уточни, о каких собачках речь?",
+        source="fallback",
+        renderer="conversational_repair",
+    )
+    recovery = ResponseArbitrator(minimum_score=-100.0).decide(
+        event_id="event:one",
+        prompt="Собачки умеют бегать?",
+        focus_concepts=("собачка", "бегать"),
+        candidates=(recovery_candidate,),
+        recent_replies=(),
+        profile=ArbitrationProfile.baseline(1),
+        used_fallback=True,
+    )
+
+    merged = merge_recovery_decision(primary, recovery)
+    persisted_proposals = {
+        item.proposal.proposal_id for item in merged.content_scores
+    }
+    referenced_proposals = {
+        item.candidate.proposal.proposal_id for item in merged.scores
+    }
+
+    assert merged.winner == recovery.winner
+    assert merged.used_fallback
+    assert len(merged.scores) == 2
+    assert referenced_proposals <= persisted_proposals

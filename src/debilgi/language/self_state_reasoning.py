@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from debilgi.language.content import content_lemmas
+from debilgi.language.morphology import DEFAULT_MORPHOLOGY
 from debilgi.language.productive_nlg import (
     ClauseThought,
     ConceptArgument,
@@ -22,9 +23,18 @@ _STATE_PREDICATES = {
     # Open first-person-position requests such as ``что ты думаешь о себе``
     # are states of reflection, not fact questions about the verb ``думать``.
     "self_reflection": frozenset({"думать", "полагать", "оценивать", "оценить"}),
-    "self_location": frozenset({"находиться", "располагаться", "быть"}),
+    "self_location": frozenset({"находиться", "располагаться", "быть", "жить"}),
+    "affective_state": frozenset({"чувствовать", "ощущать"}),
+    "threat_response": frozenset({"бояться", "пугаться", "страшиться"}),
 }
 _NON_ATTESTED_SELF_TRAITS = frozenset({"осознанный", "сознательный"})
+_COGNITIVE_LEVEL_TARGETS = frozenset(
+    {"мышление", "рассуждение", "интеллект", "анализ"}
+)
+_LEVEL_NOUNS = frozenset({"уровень", "качество", "способность"})
+_PREDICATIVE_CONFIRMATION_MARKERS = frozenset(
+    {"да", "верно", "ведь", "же", "правда"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,9 +73,31 @@ class SelfStateResolution:
     evidence: tuple[str, ...]
 
 
-def analyze_self_state(structure: StructuredUtterance) -> SelfStateFrame | None:
+def analyze_self_state(
+    structure: StructuredUtterance,
+    *,
+    resolved_bindings: tuple[tuple[str, str], ...] = (),
+    replied_to_agent: bool = False,
+    context_messages: tuple[str, ...] = (),
+) -> SelfStateFrame | None:
     frame = max(structure.clauses, key=lambda item: item.confidence, default=None)
-    if frame is None or frame.predicate_index is None:
+    if frame is None:
+        return None
+    nominal_level = _nominal_cognitive_level_frame(structure, frame)
+    if nominal_level is not None:
+        return nominal_level
+    nominal_role = _nominal_self_role_frame(structure, frame)
+    if nominal_role is not None:
+        return nominal_role
+    contextual_role = _contextual_self_role_frame(
+        structure,
+        frame,
+        replied_to_agent=replied_to_agent,
+        context_messages=context_messages,
+    )
+    if contextual_role is not None:
+        return contextual_role
+    if frame.predicate_index is None:
         return None
     predicate = structure.tokens[frame.predicate_index]
     state = next(
@@ -95,6 +127,8 @@ def analyze_self_state(structure: StructuredUtterance) -> SelfStateFrame | None:
         if state == "self_assessment"
         else _target_argument(structure, frame)
     )
+    if target is None:
+        target = _bound_target(resolved_bindings)
     reflexive_self = any(
         token.lemma == "себя"
         for token in structure.tokens[frame.token_start : frame.token_end]
@@ -114,6 +148,7 @@ def analyze_self_state(structure: StructuredUtterance) -> SelfStateFrame | None:
             or state == "understanding"
             or (state == "self_reflection" and reflexive_self)
             or state == "self_location"
+            or state == "affective_state"
         ),
         confidence=min(0.98, frame.confidence * 0.82 + predicate.confidence * 0.18),
     )
@@ -140,7 +175,11 @@ def reason_about_self_state(
                 min(0.94, frame.confidence),
                 ("speaker_reported_misunderstanding",),
             )
-        return SelfStateResolution(None, frame.state, None, frame.confidence * 0.6, ())
+        if not (
+            frame.experiencer_kind == "self"
+            and frame.state in {"understanding", "knowledge", "memory"}
+        ):
+            return SelfStateResolution(None, frame.state, None, frame.confidence * 0.6, ())
     if frame.experiencer_kind != "self":
         return SelfStateResolution(
             None,
@@ -166,6 +205,50 @@ def reason_about_self_state(
             True,
             min(0.92, frame.confidence * 0.84 + 0.10),
             ("local_learning_architecture", "open_self_reflection"),
+        )
+
+    if frame.state == "affective_state":
+        return SelfStateResolution(
+            _affective_state_thought(frame),
+            frame.state,
+            True,
+            min(0.92, frame.confidence * 0.84 + 0.10),
+            ("active_conversation", "engagement_state"),
+        )
+
+    if frame.state == "threat_response":
+        return SelfStateResolution(
+            _answer_thought(frame, False),
+            frame.state,
+            False,
+            min(0.92, frame.confidence * 0.84 + 0.10),
+            ("non_physical_agent", "no_observed_threat_response"),
+        )
+
+    if frame.state == "cognitive_level":
+        return SelfStateResolution(
+            _cognitive_level_thought(frame),
+            frame.state,
+            True,
+            min(0.92, frame.confidence * 0.84 + 0.10),
+            (
+                "local_learning_architecture",
+                "context_reasoning_available",
+                "learning_process_active",
+            ),
+        )
+
+    if frame.state == "self_role_assessment":
+        # A conversational label is a request for an owned position, not an
+        # objectively false fact.  Its stance depends on social reaction,
+        # personality and dialogue history, which are available only to the
+        # dialogue-move planner.
+        return SelfStateResolution(
+            None,
+            frame.state,
+            None,
+            min(0.82, frame.confidence * 0.76 + 0.08),
+            ("requires_contextual_owned_position",),
         )
 
     if frame.state == "self_assessment":
@@ -398,6 +481,61 @@ def _self_reflection_thought(frame: SelfStateFrame) -> ClauseThought:
     )
 
 
+def _cognitive_level_thought(frame: SelfStateFrame) -> ClauseThought:
+    """Give a calibrated self-assessment from observable local capabilities."""
+
+    return ClauseThought(
+        predicate=ConceptLexeme(
+            "считать",
+            "считаю",
+            "verb",
+            (("tense", "present"), ("number", "singular"), ("person", "first")),
+        ),
+        dependencies=(
+            SemanticDependency(
+                "subject",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "я",
+                        "я",
+                        "pronoun",
+                        (("case", "nominative"), ("number", "singular"), ("person", "first")),
+                    )
+                ),
+            ),
+            SemanticDependency(
+                "direct_object",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "мышление",
+                        "мышление",
+                        "noun",
+                        (("number", "singular"), ("gender", "neuter")),
+                    ),
+                    modifiers=(ConceptLexeme("свой", "своё", "adjective"),),
+                    grammatical_case="accusative",
+                ),
+            ),
+            SemanticDependency(
+                "predicate_complement",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "развивающийся",
+                        "развивающимся",
+                        "participle",
+                        (("number", "singular"), ("gender", "neuter")),
+                    ),
+                    grammatical_case="instrumental",
+                ),
+            ),
+        ),
+        focus_role="predicate_complement",
+        confidence=frame.confidence,
+        evidence=("cognitive_level_from_active_learning",),
+        predicate_class="lexical",
+    )
+
+
 def _self_location_thought(frame: SelfStateFrame) -> ClauseThought:
     """Describe the active runtime environment as a compositional proposition."""
 
@@ -433,6 +571,303 @@ def _self_location_thought(frame: SelfStateFrame) -> ClauseThought:
         confidence=frame.confidence,
         evidence=("self_location_from_runtime_environment",),
         predicate_class="lexical",
+    )
+
+
+def _affective_state_thought(frame: SelfStateFrame) -> ClauseThought:
+    """Express the current engagement state as a compositional proposition."""
+
+    return ClauseThought(
+        predicate=ConceptLexeme(
+            "чувствовать",
+            "чувствую",
+            "verb",
+            (("tense", "present"), ("number", "singular"), ("person", "first")),
+        ),
+        dependencies=(
+            SemanticDependency(
+                "subject",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "я",
+                        "я",
+                        "pronoun",
+                        (("case", "nominative"), ("number", "singular"), ("person", "first")),
+                    )
+                ),
+            ),
+            SemanticDependency(
+                "direct_object",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "интерес",
+                        "интерес",
+                        "noun",
+                        (("number", "singular"), ("gender", "masculine")),
+                    ),
+                    grammatical_case="accusative",
+                ),
+            ),
+            SemanticDependency(
+                "topic",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "разговор",
+                        "разговор",
+                        "noun",
+                        (("number", "singular"), ("gender", "masculine")),
+                    ),
+                    preposition="к",
+                    grammatical_case="dative",
+                ),
+            ),
+        ),
+        focus_role="direct_object",
+        confidence=frame.confidence,
+        evidence=("affective_state_from_active_engagement",),
+        predicate_class="lexical",
+    )
+
+
+def _nominal_cognitive_level_frame(
+    structure: StructuredUtterance,
+    frame: ClauseFrame,
+) -> SelfStateFrame | None:
+    if frame.clause_kind != "question" or frame.implicit_predicate != "быть":
+        return None
+    clause_tokens = structure.tokens[frame.token_start : frame.token_end]
+    lemmas = {token.lemma for token in clause_tokens}
+    target = next(
+        (token for token in clause_tokens if token.lemma in _COGNITIVE_LEVEL_TARGETS),
+        None,
+    )
+    if (
+        target is None
+        or not lemmas & _LEVEL_NOUNS
+        or "ты" not in lemmas
+        or not lemmas & {"какой", "насколько"}
+    ):
+        return None
+    return SelfStateFrame(
+        state="cognitive_level",
+        predicate_lemma="считать",
+        predicate_surface="считаешь",
+        predicate_features=(
+            ("tense", "present"),
+            ("number", "singular"),
+            ("person", "second"),
+        ),
+        experiencer_kind="self",
+        target=ConceptArgument(
+            ConceptLexeme(
+                target.lemma,
+                target.corrected_form or target.surface,
+                target.part_of_speech,
+                target.grammatical_features,
+                target.entity_kind,
+            )
+        ),
+        clause_kind="question",
+        negated=False,
+        complete=True,
+        confidence=min(0.94, frame.confidence * 0.86 + 0.08),
+    )
+
+
+def _nominal_self_role_frame(
+    structure: StructuredUtterance,
+    frame: ClauseFrame,
+) -> SelfStateFrame | None:
+    if (
+        frame.clause_kind != "question"
+        or frame.implicit_predicate != "быть"
+        or not frame.subject_indices
+        or not frame.predicate_complement_indices
+        or structure.tokens[frame.subject_indices[0]].lemma not in {"ты", "вы"}
+    ):
+        return None
+    if (
+        frame.question_target_index is not None
+        and structure.tokens[frame.question_target_index].lemma != "что"
+    ):
+        return None
+    target = _nominal_self_role_target(structure, frame)
+    if target is None:
+        return None
+    return SelfStateFrame(
+        state="self_role_assessment",
+        predicate_lemma="считать",
+        predicate_surface="считаешь",
+        predicate_features=(
+            ("tense", "present"),
+            ("number", "singular"),
+            ("person", "second"),
+        ),
+        experiencer_kind="self",
+        target=ConceptArgument(
+            target.head,
+            target.modifiers,
+            grammatical_case="instrumental",
+        ),
+        clause_kind="question",
+        negated=frame.negated,
+        complete=True,
+        confidence=min(0.94, frame.confidence * 0.88 + 0.08),
+    )
+
+
+def _contextual_self_role_frame(
+    structure: StructuredUtterance,
+    frame: ClauseFrame,
+    *,
+    replied_to_agent: bool,
+    context_messages: tuple[str, ...],
+) -> SelfStateFrame | None:
+    """Bind a bare predicative label to the replied-to agent.
+
+    This is discourse ellipsis, not a lexeme list: an adjective, participle,
+    or animate nominative noun can stand for ``ты [такой/X]`` when it directly
+    answers an agent-authored statement.  Repetitions of the parent's topic
+    and answers to questions stay ordinary fragments.
+    """
+
+    if (
+        not replied_to_agent
+        or frame.clause_kind != "fragment"
+        or frame.predicate_index is not None
+        or not context_messages
+    ):
+        return None
+    parent = context_messages[-1].strip()
+    if not parent or parent.endswith("?"):
+        return None
+    candidates = tuple(
+        token
+        for token in structure.tokens[frame.token_start : frame.token_end]
+        if token.surface[:1].isalnum()
+        and token.semantic_role not in {
+            "function_word",
+            "pragmatic_marker",
+            "vocative",
+        }
+    )
+    if len(candidates) != 1:
+        return None
+    target = candidates[0]
+    features = dict(target.grammatical_features)
+    nominal_label = (
+        target.part_of_speech in {"adjective", "participle"}
+        or (
+            target.part_of_speech == "noun"
+            and features.get("animacy") == "animate"
+        )
+    )
+    if not nominal_label:
+        return None
+    if features.get("case") not in {None, "nominative"}:
+        return None
+    if target.lemma in set(content_lemmas(parent)):
+        return None
+    return SelfStateFrame(
+        state="self_role_assessment",
+        predicate_lemma="считать",
+        predicate_surface="считаешь",
+        predicate_features=(
+            ("tense", "present"),
+            ("number", "singular"),
+            ("person", "second"),
+        ),
+        experiencer_kind="self",
+        target=ConceptArgument(
+            ConceptLexeme(
+                target.lemma,
+                target.corrected_form or target.surface,
+                target.part_of_speech,
+                target.grammatical_features,
+                target.entity_kind,
+            ),
+            grammatical_case="instrumental",
+        ),
+        clause_kind="statement",
+        negated=False,
+        complete=True,
+        confidence=min(0.90, frame.confidence * 0.74 + target.confidence * 0.18 + 0.12),
+    )
+
+
+def _bound_target(
+    resolved_bindings: tuple[tuple[str, str], ...],
+) -> ConceptArgument | None:
+    """Turn a discourse-resolved omitted argument into a semantic target."""
+
+    lemma = next(
+        (
+            value
+            for role, value in resolved_bindings
+            if role in {"direct_object", "predicate_complement", "topic"} and value
+        ),
+        None,
+    )
+    if lemma is None:
+        return None
+    reading = next(
+        (
+            item
+            for item in DEFAULT_MORPHOLOGY.parse_word(lemma)
+            if item.part_of_speech in {"noun", "pronoun", "adjective", "participle"}
+        ),
+        None,
+    )
+    return ConceptArgument(
+        ConceptLexeme(
+            reading.lemma if reading is not None else lemma,
+            lemma,
+            reading.part_of_speech if reading is not None else "noun",
+            tuple(reading.features().items()) if reading is not None else (),
+        ),
+        grammatical_case="accusative",
+    )
+
+
+def _nominal_self_role_target(
+    structure: StructuredUtterance,
+    frame: ClauseFrame,
+) -> ConceptArgument | None:
+    """Resolve a nominal or colloquial predicative into a reusable trait.
+
+    A form such as ``круто`` is normally tagged as an adverb, but pymorphy
+    also exposes its short-adjective reading and full lemma ``крутой``.
+    We use that alternative only in an explicitly addressed confirmation
+    construction, never as a global adverb-to-adjective rewrite.
+    """
+
+    target = _target_argument(structure, frame)
+    if target is None:
+        return None
+    if target.head.part_of_speech in {"adjective", "noun", "participle"}:
+        return target
+    if target.head.part_of_speech != "adverb" or not any(
+        token.lemma in _PREDICATIVE_CONFIRMATION_MARKERS
+        for token in structure.tokens[frame.token_start : frame.token_end]
+    ):
+        return None
+    adjective = next(
+        (
+            reading
+            for reading in DEFAULT_MORPHOLOGY.parse_word(target.head.surface)
+            if reading.part_of_speech == "adjective"
+        ),
+        None,
+    )
+    if adjective is None:
+        return None
+    return ConceptArgument(
+        ConceptLexeme(
+            adjective.lemma,
+            adjective.lemma,
+            "adjective",
+            tuple(adjective.features().items()),
+        )
     )
 
 

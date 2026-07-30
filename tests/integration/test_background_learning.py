@@ -10,6 +10,7 @@ from debilgi.background import BackgroundLearningService
 from debilgi.dataset.self_dataset import SelfDatasetRepository
 from debilgi.events.models import Event, EventType
 from debilgi.knowledge.models import WikipediaResult
+from debilgi.language.abstract_reasoning import AbstractReasoningService
 from debilgi.language.context_gate import ContextGateDeferred
 from debilgi.language.lexicon import LexiconService
 from debilgi.language.russian_reference import RemoteLexeme
@@ -105,7 +106,7 @@ class _SemanticConsultant:
                 "response_text": None,
                 "confidence": 0.72,
             },
-            provider="fake-puter",
+            provider="fake-provider",
             model="fake-model",
         )
 
@@ -149,7 +150,7 @@ class _ConstructionProvider:
                 ],
                 "confidence": 0.86,
             },
-            provider="fake-puter",
+            provider="fake-provider",
             model="fake-model",
         )
 
@@ -166,6 +167,8 @@ def _service(
     wikipedia: Any | None = None,
     wikipedia_enabled: bool = False,
     semantic_consultant: Any | None = None,
+    abstract_reasoning: AbstractReasoningService | None = None,
+    study_workers: int = 4,
 ) -> BackgroundLearningService:
     return BackgroundLearningService(
         database,
@@ -178,14 +181,52 @@ def _service(
         sender=sender,
         enabled=True,
         interval=timedelta(minutes=10),
+        study_worker_count=study_workers,
         maximum_study_attempts=attempts,
         wikipedia_enabled=wikipedia_enabled,
         semantic_consultant=semantic_consultant,
+        abstract_reasoning=abstract_reasoning,
         self_check_every_cycles=1,
         initiative_enabled=sender is not None,
         initiative_probability=1.0,
         clock=lambda: NOW,
     )
+
+
+async def test_background_cycle_elaborates_working_mental_models(
+    database: Database,
+) -> None:
+    abstract = AbstractReasoningService(database)
+    model = await abstract.observe_turn(
+        guild_id=1,
+        channel_id=10,
+        source_event_id="discord:background-imagination",
+        prompt=(
+            "Представь: дом слева от башни, "
+            "а башня слева от реки. Где дом?"
+        ),
+        observed_at=NOW,
+    )
+    assert model is not None
+    await database.execute(
+        """DELETE FROM language_mental_relations
+           WHERE model_id = ? AND inferred = 1""",
+        (model.model_id,),
+    )
+    service = _service(
+        database,
+        _Reference({}),
+        abstract_reasoning=abstract,
+    )
+
+    stats = await service.run_once(NOW)
+
+    assert stats.mental_relations_elaborated > 0
+    assert await database.fetchone(
+        """SELECT 1 FROM background_cycle_runs
+           WHERE cycle_id = ? AND status = 'completed'""",
+        (stats.cycle_id,),
+    ) is not None
 
 
 async def _unknown(database: Database, word: str, *, channel_id: int = 10) -> None:
@@ -281,6 +322,42 @@ async def test_cycle_learns_unknown_grows_graph_and_sends_one_initiative(
            WHERE guild_id = 1 AND node_type = 'concept' AND node_key = 'стромба'"""
     )
     assert concept is not None
+
+
+async def test_cycle_resolves_multiple_unknowns_with_parallel_workers(
+    database: Database,
+) -> None:
+    class ConcurrentReference(_Reference):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.active = 0
+            self.maximum_active = 0
+
+        async def refresh_word(self, word: str) -> RemoteLexeme:
+            self.lookups.append(word)
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            try:
+                await asyncio.sleep(0.03)
+                return RemoteLexeme(
+                    word,
+                    "NOUN",
+                    (f"изученное значение слова {word}",),
+                    f"https://example.test/{word}",
+                )
+            finally:
+                self.active -= 1
+
+    for word in ("стромба", "фырба", "трошка", "шушпан"):
+        await _unknown(database, word)
+    reference = ConcurrentReference()
+    service = _service(database, reference, study_workers=3)
+
+    stats = await service.run_once(NOW)
+
+    assert stats.words_processed == 4
+    assert stats.words_found == 4
+    assert reference.maximum_active == 3
 
 
 async def test_missing_word_is_exhausted_after_bounded_attempts(database: Database) -> None:
@@ -508,6 +585,68 @@ async def test_idle_worker_wakes_immediately_for_semantic_study(
         assert row is not None
         assert str(row["study_status"]) == "learned"
         assert reference.lookups == ["робот"]
+    finally:
+        await service.stop()
+
+
+async def test_idle_worker_wakes_immediately_for_unknown_word(
+    database: Database,
+) -> None:
+    reference = _Reference(
+        {
+            "стромба": RemoteLexeme(
+                "стромба",
+                "NOUN",
+                ("разговорное название вымышленного предмета",),
+                "https://example.test/стромба",
+            )
+        }
+    )
+    service = _service(database, reference)
+    service._lexicon.set_semantic_study_notifier(service.wake_for_study)
+    await service.start()
+    try:
+        async def completed_cycles() -> int:
+            row = await database.fetchone(
+                "SELECT COUNT(*) AS count FROM background_cycle_runs WHERE status = 'completed'"
+            )
+            return int(row["count"]) if row is not None else 0
+
+        async def wait_for_cycles(minimum: int) -> None:
+            async def poll() -> None:
+                while await completed_cycles() < minimum:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(poll(), timeout=2.0)
+
+        await wait_for_cycles(1)
+        current = Event(
+            event_id="discord:idle-unknown",
+            guild_id=1,
+            channel_id=10,
+            actor_id=20,
+            target_id=None,
+            event_type=EventType.MESSAGE_CREATED,
+            timestamp=NOW,
+            payload={"content": "стромба", "bot_mentioned": True},
+            source="discord",
+        )
+        analysis = await service._lexicon.analyze_word(
+            "стромба",
+            guild_id=1,
+            channel_id=10,
+            context="стромба",
+        )
+        assert await service._lexicon.ensure_study_queue(current, analysis)
+
+        await wait_for_cycles(2)
+
+        row = await database.fetchone(
+            """SELECT study_status FROM language_unknown_concepts
+               WHERE concept_key = 'стромба'"""
+        )
+        assert row is not None
+        assert str(row["study_status"]) == "learned"
     finally:
         await service.stop()
 

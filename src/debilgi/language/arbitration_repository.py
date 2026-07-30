@@ -6,7 +6,8 @@ import json
 from datetime import datetime
 from types import MappingProxyType
 
-from debilgi.events.models import Event, EventType
+from debilgi.events.models import Event
+from debilgi.experience.feedback import DEFAULT_FEEDBACK_ATTRIBUTOR
 from debilgi.language.arbitration import (
     DEFAULT_SOURCE_BIASES,
     DEFAULT_WEIGHTS,
@@ -14,12 +15,8 @@ from debilgi.language.arbitration import (
     ArbitrationProfile,
 )
 from debilgi.language.structural_learning import structural_response_features
-from debilgi.language.tokenizer import tokenize
-from debilgi.social.signals import AFFIRMATION, APPROVAL, AVERSION, DISAPPROVAL, REFUSAL
 from debilgi.storage.database import Database
 
-_POSITIVE_REACTIONS = {"❤️", "❤", "👍", "✅", "🔥", "💯", "🥰", "😍", "🤩"}
-_NEGATIVE_REACTIONS = {"👎", "🤮", "💩", "❌", "🤢"}
 _PENALTY_FEATURES = {
     "prompt_echo_penalty",
     "reference_copy_penalty",
@@ -47,10 +44,21 @@ class ArbitrationRepository:
 
     async def profile(self, guild_id: int) -> ArbitrationProfile:
         row = await self._database.fetchone(
-            """SELECT * FROM language_arbitration_weight_profiles
-               WHERE guild_id = ? AND stage = 'surface'""",
+            """SELECT version.*
+               FROM language_arbitration_profile_pointers AS pointer
+               JOIN language_arbitration_profile_versions AS version
+                 ON version.guild_id = pointer.guild_id
+                AND version.stage = pointer.stage
+                AND version.version = pointer.active_version
+               WHERE pointer.guild_id = ? AND pointer.stage = 'surface'""",
             (guild_id,),
         )
+        if row is None:
+            row = await self._database.fetchone(
+                """SELECT * FROM language_arbitration_weight_profiles
+                   WHERE guild_id = ? AND stage = 'surface'""",
+                (guild_id,),
+            )
         if row is None:
             return ArbitrationProfile.baseline(guild_id)
         return ArbitrationProfile(
@@ -69,6 +77,27 @@ class ArbitrationRepository:
             confidence=float(row["confidence"]),
             version=int(row["version"]),
         )
+
+    async def activate_profile_version(self, guild_id: int, version: int) -> bool:
+        """Atomically roll surface arbitration back to an immutable snapshot."""
+
+        row = await self._database.fetchone(
+            """SELECT 1 FROM language_arbitration_profile_versions
+               WHERE guild_id = ? AND stage = 'surface' AND version = ?""",
+            (guild_id, version),
+        )
+        if row is None:
+            return False
+        await self._database.execute(
+            """INSERT INTO language_arbitration_profile_pointers (
+                   guild_id, stage, active_version, updated_at
+               ) VALUES (?, 'surface', ?, CURRENT_TIMESTAMP)
+               ON CONFLICT (guild_id, stage) DO UPDATE SET
+                   active_version = excluded.active_version,
+                   updated_at = excluded.updated_at""",
+            (guild_id, version),
+        )
+        return True
 
     async def structural_weights(self, guild_id: int) -> dict[str, float]:
         """Load sparse learned form weights for the current community."""
@@ -132,6 +161,57 @@ class ArbitrationRepository:
                 "DELETE FROM language_response_candidates WHERE decision_id = ?",
                 (decision.decision_id,),
             )
+            await connection.execute(
+                "DELETE FROM language_content_proposals WHERE decision_id = ?",
+                (decision.decision_id,),
+            )
+            for scored in decision.content_scores:
+                proposal = scored.proposal
+                await connection.execute(
+                    """INSERT INTO language_content_proposals (
+                           proposal_id, decision_id, source, speech_act, response_goal,
+                           plan_json, source_confidence, applicability, content_score,
+                           eligible, rejection_reasons_json, selected_for_surface,
+                           created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        proposal.proposal_id,
+                        decision.decision_id,
+                        proposal.source,
+                        proposal.plan.speech_act,
+                        proposal.plan.response_goal or proposal.plan.response_act,
+                        _json(
+                            {
+                                "target_id": proposal.plan.target_id,
+                                "topic_ids": proposal.plan.topic_ids,
+                                "key_points": proposal.plan.key_points,
+                                "required_facts": tuple(
+                                    fact.as_dict()
+                                    for fact in proposal.plan.required_facts
+                                ),
+                                "optional_facts": tuple(
+                                    fact.as_dict()
+                                    for fact in proposal.plan.optional_facts
+                                ),
+                                "unknowns": proposal.plan.unknowns,
+                                "tone": proposal.plan.tone,
+                                "certainty": proposal.plan.confidence,
+                                "follow_up": proposal.plan.follow_up,
+                                "components": dict(scored.components),
+                            }
+                        ),
+                        proposal.source_confidence,
+                        proposal.applicability,
+                        scored.total,
+                        int(scored.eligible),
+                        _json(scored.rejection_reasons),
+                        int(
+                            proposal.proposal_id
+                            in decision.selected_proposal_ids
+                        ),
+                        now,
+                    ),
+                )
             for order, scored in enumerate(decision.scores):
                 candidate = scored.candidate
                 await connection.execute(
@@ -150,7 +230,7 @@ class ArbitrationRepository:
                         candidate.speech_act,
                         candidate.text[:4000],
                         _digest(candidate.text),
-                        _json(candidate.required_facts),
+                        _json(tuple(fact.as_dict() for fact in candidate.required_facts)),
                         _json(scored.features.as_dict()),
                         _json(dict(scored.weighted_components)),
                         candidate.source_confidence,
@@ -163,6 +243,16 @@ class ArbitrationRepository:
                         ),
                         order,
                         now,
+                    ),
+                )
+                await connection.execute(
+                    """INSERT OR REPLACE INTO language_surface_proposals (
+                           candidate_id, decision_id, proposal_id
+                       ) VALUES (?, ?, ?)""",
+                    (
+                        candidate.candidate_id,
+                        decision.decision_id,
+                        candidate.proposal.proposal_id,
                     ),
                 )
                 construction_id = candidate.metadata.get("construction_id")
@@ -204,7 +294,8 @@ class ArbitrationRepository:
         )
 
     async def observe_feedback(self, event: Event) -> None:
-        target = _feedback_target(event)
+        feedback = DEFAULT_FEEDBACK_ATTRIBUTOR.attribute(event)
+        target = feedback.target_message_id
         if target is None:
             return
         row = await self._database.fetchone(
@@ -214,9 +305,11 @@ class ArbitrationRepository:
         )
         if row is None:
             return
-        reward, kind, attribution = _feedback_signal(event)
-        if reward == 0.0 or attribution < 0.60:
+        if not feedback.is_learnable():
             return
+        reward = feedback.reward
+        kind = feedback.kind
+        attribution = feedback.attribution_confidence
         decision_id = str(row["decision_id"])
         old_version = int(row["weight_version"])
         inserted = await self._database.execute(
@@ -288,9 +381,14 @@ class ArbitrationRepository:
         winner_features = {
             key: float(value)
             for key, value in json.loads(str(winner["features_json"])).items()
+            if value is not None
         }
         alternative_features = [
-            {key: float(value) for key, value in json.loads(str(row["features_json"])).items()}
+            {
+                key: float(value)
+                for key, value in json.loads(str(row["features_json"])).items()
+                if value is not None
+            }
             for row in alternatives
         ]
         keys = set(winner_features)
@@ -418,29 +516,43 @@ class ArbitrationRepository:
             return
         profile = await self.profile(guild_id)
         if profile.observations + 1 < self.minimum_feedback_observations:
-            await self._store_profile(
+            new_version = await self._store_profile(
                 profile,
                 weights=dict(profile.weights),
                 source_biases=dict(profile.source_biases),
                 observations=profile.observations + 1,
                 observed_at=observed_at,
             )
+            await self._database.execute(
+                """UPDATE language_arbitration_feedback
+                   SET new_version = ?, applied_at = ?
+                   WHERE feedback_event_id = ?""",
+                (new_version, observed_at.isoformat(), feedback_event_id),
+            )
             return
         winner_features = {
             key: float(value)
             for key, value in json.loads(str(winner["features_json"])).items()
+            if value is not None
         }
         alternative_features = [
-            {key: float(value) for key, value in json.loads(str(row["features_json"])).items()}
+            {
+                key: float(value)
+                for key, value in json.loads(str(row["features_json"])).items()
+                if value is not None
+            }
             for row in alternatives
         ]
         weights = dict(profile.weights)
         deltas: dict[str, float] = {}
         for name, current in weights.items():
-            winner_value = winner_features.get(name, 0.0)
-            alternative = sum(item.get(name, 0.0) for item in alternative_features) / len(
-                alternative_features
-            )
+            winner_value = winner_features.get(name)
+            measured_alternatives = [
+                item[name] for item in alternative_features if name in item
+            ]
+            if winner_value is None or not measured_alternatives:
+                continue
+            alternative = sum(measured_alternatives) / len(measured_alternatives)
             if name in _PENALTY_FEATURES:
                 winner_value = -winner_value
                 alternative = -alternative
@@ -458,14 +570,12 @@ class ArbitrationRepository:
         )
         biases[winner_source] = max(-1.0, min(1.0, biases.get(winner_source, 0.0) + bias_delta))
         deltas[f"source:{winner_source}"] = bias_delta
-        new_version = profile.version + 1
-        await self._store_profile(
+        new_version = await self._store_profile(
             profile,
             weights=weights,
             source_biases=biases,
             observations=profile.observations + 1,
             observed_at=observed_at,
-            version=new_version,
         )
         await self._database.execute(
             """UPDATE language_arbitration_feedback
@@ -483,72 +593,70 @@ class ArbitrationRepository:
         observations: int,
         observed_at: datetime,
         version: int | None = None,
-    ) -> None:
-        stored_version = version or profile.version
+    ) -> int:
+        latest = await self._database.fetchone(
+            """SELECT COALESCE(MAX(version), 0) AS version
+               FROM language_arbitration_profile_versions
+               WHERE guild_id = ? AND stage = 'surface'""",
+            (profile.guild_id,),
+        )
+        latest_version = int(latest["version"]) if latest is not None else 0
+        stored_version = max(version or 0, profile.version + 1, latest_version + 1)
         confidence = observations / (observations + 20.0)
         now = observed_at.isoformat()
-        await self._database.execute(
-            """INSERT INTO language_arbitration_weight_profiles (
-                   profile_id, guild_id, stage, weights_json, source_biases_json,
-                   baseline_json, observations, confidence, version, created_at, updated_at
-               ) VALUES (?, ?, 'surface', ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT (guild_id, stage) DO UPDATE SET
-                   weights_json = excluded.weights_json,
-                   source_biases_json = excluded.source_biases_json,
-                   observations = excluded.observations,
-                   confidence = excluded.confidence,
-                   version = excluded.version,
-                   updated_at = excluded.updated_at""",
-            (
-                profile.profile_id,
-                profile.guild_id,
-                _json(weights),
-                _json(source_biases),
-                _json(
-                    {
-                        "weights": dict(DEFAULT_WEIGHTS),
-                        "source_biases": dict(DEFAULT_SOURCE_BIASES),
-                    }
-                ),
-                observations,
-                confidence,
-                stored_version,
-                now,
-                now,
-            ),
+        baseline = _json(
+            {
+                "weights": dict(DEFAULT_WEIGHTS),
+                "source_biases": dict(DEFAULT_SOURCE_BIASES),
+            }
         )
-
-
-def _feedback_target(event: Event) -> int | None:
-    if event.event_type in {EventType.REACTION_ADDED, EventType.REACTION_REMOVED}:
-        value = event.payload.get("message_id")
-    elif event.event_type in {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}:
-        value = event.payload.get("reply_to_message_id")
-    else:
-        return None
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _feedback_signal(event: Event) -> tuple[float, str, float]:
-    if event.event_type in {EventType.REACTION_ADDED, EventType.REACTION_REMOVED}:
-        emoji = str(event.payload.get("emoji", ""))
-        direction = 1.0 if event.event_type is EventType.REACTION_ADDED else -1.0
-        if emoji in _POSITIVE_REACTIONS:
-            return 0.8 * direction, "positive_reaction", 0.90
-        if emoji in _NEGATIVE_REACTIONS:
-            return -0.8 * direction, "negative_reaction", 0.90
-        return 0.0, "neutral_reaction", 0.0
-    content = event.payload.get("content")
-    if not isinstance(content, str):
-        return 0.0, "empty_reply", 0.0
-    words = set(tokenize(content.casefold().replace("ё", "е")))
-    if words & (DISAPPROVAL | AVERSION):
-        return -1.0, "explicit_rejection", 0.95
-    if words & (APPROVAL | AFFIRMATION):
-        return 1.0, "explicit_confirmation", 0.95
-    if words & REFUSAL:
-        return -0.65, "refusal", 0.75
-    return 0.0, "conversation_continued", 0.10
+        async with self._database.transaction() as connection:
+            await connection.execute(
+                """INSERT OR IGNORE INTO language_arbitration_profile_versions (
+                       guild_id, stage, version, profile_id, weights_json,
+                       source_biases_json, baseline_json, observations, confidence,
+                       created_at
+                   ) VALUES (?, 'surface', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    profile.guild_id,
+                    profile.version,
+                    profile.profile_id,
+                    _json(dict(profile.weights)),
+                    _json(dict(profile.source_biases)),
+                    baseline,
+                    profile.observations,
+                    profile.confidence,
+                    now,
+                ),
+            )
+            await connection.execute(
+                """INSERT INTO language_arbitration_profile_versions (
+                       guild_id, stage, version, profile_id, weights_json,
+                       source_biases_json, baseline_json, observations, confidence,
+                       created_at
+                   ) VALUES (?, 'surface', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    profile.guild_id,
+                    stored_version,
+                    profile.profile_id,
+                    _json(weights),
+                    _json(source_biases),
+                    baseline,
+                    observations,
+                    confidence,
+                    now,
+                ),
+            )
+            await connection.execute(
+                """INSERT INTO language_arbitration_profile_pointers (
+                       guild_id, stage, active_version, updated_at
+                   ) VALUES (?, 'surface', ?, ?)
+                   ON CONFLICT (guild_id, stage) DO UPDATE SET
+                       active_version = excluded.active_version,
+                       updated_at = excluded.updated_at""",
+                (profile.guild_id, stored_version, now),
+            )
+        return stored_version
 
 
 def _json(value: object) -> str:
