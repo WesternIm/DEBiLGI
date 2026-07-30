@@ -186,3 +186,12 @@ def test_demonstrative_lookup_resolves_the_previous_discourse_topic() -> None:
     assert reference.chosen.lemma == "рэпер"
     assert analysis.resolved_bindings == (("direct_object", "рэпер"),)
     assert analysis.retrieval_query.endswith("рэпер")
+
+
+def test_transitive_morphology_recovers_omitted_object_without_a_valency_entry() -> None:
+    analysis = analyze_dialogue_state(
+        "а ты будто не знаешь",
+        ("Что ты подразумеваешь под гений?",),
+    )
+
+    assert analysis.resolved_bindings == (("direct_object", "гений"),)

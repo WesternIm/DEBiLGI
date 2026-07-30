@@ -106,7 +106,7 @@ class _SemanticConsultant:
                 "response_text": None,
                 "confidence": 0.72,
             },
-            provider="fake-puter",
+            provider="fake-provider",
             model="fake-model",
         )
 
@@ -150,7 +150,7 @@ class _ConstructionProvider:
                 ],
                 "confidence": 0.86,
             },
-            provider="fake-puter",
+            provider="fake-provider",
             model="fake-model",
         )
 

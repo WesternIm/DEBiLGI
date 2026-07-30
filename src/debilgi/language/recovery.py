@@ -28,7 +28,7 @@ _WELLBEING_RE = re.compile(
 )
 _THANKS = frozenset({"спасибо", "благодарю", "пасиб", "спс"})
 _CLARIFICATION_RE = re.compile(
-    r"^(?:а\s+)?(?:чего|чё|че|что)(?:\s+(?:бля|блин|нахуй))?[?!.…]*$",
+    r"^(?:а\s+)?(?:чего|чё|че|что)(?:\s+(?:бля|блин|нахуй))?[?!.…]*[)\]]*$",
     re.IGNORECASE,
 )
 _ATTENTION_CALL_RE = re.compile(
@@ -165,6 +165,12 @@ def is_social_routine(prompt: str) -> bool:
         or words & _THANKS
         or (len(words) <= 6 and words & (APPROVAL | DISAPPROVAL))
     )
+
+
+def is_clarification_request(prompt: str) -> bool:
+    """Return whether a short turn challenges the preceding answer."""
+
+    return _CLARIFICATION_RE.fullmatch(_normalized(prompt)) is not None
 
 
 def compose_recovery(evidence: RecoveryEvidence) -> str:

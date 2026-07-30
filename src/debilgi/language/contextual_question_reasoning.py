@@ -101,6 +101,23 @@ def reason_about_contextual_question(
     )
     target_terms = tuple(content_lemmas(antecedent))[-3:] if antecedent else ()
 
+    if _asks_about_current_conversational_intent(structure):
+        evidence = (
+            "addressee_asks_speaker_intent",
+            "volitional_speech_question",
+            "answer_from_current_dialogue_goal",
+        )
+        thought, patterns = _current_conversational_intent_thought(evidence)
+        return ContextualQuestionResolution(
+            "current_conversational_intent",
+            thought,
+            0.96,
+            evidence,
+            antecedent,
+            target_terms,
+            patterns,
+        )
+
     correction = _internal_capability_correction(
         structure,
         antecedent_structure,
@@ -200,6 +217,24 @@ def reason_about_contextual_question(
                     source="russian_negative_existential_structure",
                 ),
             ),
+        )
+
+    if (
+        question_markers & _CAUSE_MARKERS
+        and _antecedent_is_negative_self_assessment(antecedent_structure)
+    ):
+        evidence = (
+            "cause_follow_up",
+            "antecedent_negative_self_assessment",
+            "local_self_model_has_no_supporting_basis",
+        )
+        return ContextualQuestionResolution(
+            "self_assessment_cause",
+            _self_assessment_reason_thought(evidence),
+            0.94,
+            evidence,
+            antecedent,
+            target_terms,
         )
 
     if _asks_for_cognitive_method(structure, lemmas, question_markers):
@@ -437,6 +472,65 @@ def _reasoning_process_thought(evidence: tuple[str, ...]) -> ClauseThought:
         ),
         confidence=0.92,
         evidence=evidence,
+    )
+
+
+def _current_conversational_intent_thought(
+    evidence: tuple[str, ...],
+) -> tuple[ClauseThought, tuple[DependencyPattern, ...]]:
+    thought = ClauseThought(
+        predicate=ConceptLexeme(
+            "хотеть",
+            "хочу",
+            "verb",
+            (("tense", "present"), ("number", "singular"), ("person", "first")),
+        ),
+        dependencies=(
+            SemanticDependency("subject", _speaker()),
+            SemanticDependency(
+                "action_complement",
+                ConceptArgument(ConceptLexeme("понять", "понять", "verb")),
+            ),
+            SemanticDependency(
+                "direct_object",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "мысль",
+                        "мысль",
+                        "noun",
+                        (("number", "singular"), ("gender", "feminine")),
+                    ),
+                    modifiers=(
+                        ConceptLexeme(
+                            "твой",
+                            "твою",
+                            "adjective",
+                            (
+                                ("case", "accusative"),
+                                ("number", "singular"),
+                                ("gender", "feminine"),
+                            ),
+                        ),
+                    ),
+                    grammatical_case="accusative",
+                ),
+            ),
+        ),
+        confidence=0.96,
+        evidence=evidence,
+        predicate_class="modal",
+    )
+    return thought, (
+        DependencyPattern(
+            ("subject", "predicate", "action_complement", "direct_object"),
+            clause_kind="statement",
+            predicate_class="modal",
+            required_roles=("subject", "predicate", "action_complement", "direct_object"),
+            negation_mode="forbidden",
+            confidence=0.98,
+            evidence_count=12,
+            source="current_conversational_intent",
+        ),
     )
 
 
@@ -724,6 +818,55 @@ def _unresolved_reason_thought(evidence: tuple[str, ...]) -> ClauseThought:
     )
 
 
+def _self_assessment_reason_thought(evidence: tuple[str, ...]) -> ClauseThought:
+    return ClauseThought(
+        predicate=ConceptLexeme("нет", "нет", "predicate"),
+        dependencies=(
+            SemanticDependency("location", _speaker_location()),
+            SemanticDependency(
+                "subject",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "основание",
+                        "оснований",
+                        "noun",
+                        (("number", "plural"),),
+                    ),
+                    grammatical_case="genitive",
+                ),
+            ),
+            SemanticDependency(
+                "topic",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "оценка",
+                        "оценки",
+                        "noun",
+                        (("number", "singular"), ("gender", "feminine")),
+                    ),
+                    modifiers=(
+                        ConceptLexeme(
+                            "такой",
+                            "такой",
+                            "adjective",
+                            (
+                                ("case", "genitive"),
+                                ("number", "singular"),
+                                ("gender", "feminine"),
+                            ),
+                        ),
+                    ),
+                    preposition="для",
+                    grammatical_case="genitive",
+                ),
+            ),
+        ),
+        confidence=0.94,
+        evidence=evidence,
+        predicate_class="existential",
+    )
+
+
 def _cannot_confirm_thought(evidence: tuple[str, ...]) -> ClauseThought:
     return _negative_modal_thought("подтвердить", evidence)
 
@@ -912,11 +1055,48 @@ def _antecedent_has_epistemic_gap(
     if structure is None:
         return False
     lemmas = _all_lemmas(structure)
-    has_gap_predicate = bool(lemmas & (_EPISTEMIC_PREDICATES | {"хватать", "ответ"}))
+    has_gap_predicate = bool(
+        lemmas & (_EPISTEMIC_PREDICATES | {"хватать", "ответ", "ответить"})
+    )
     has_negation = bool(lemmas & {"не", "нет", "недостаточно"}) or any(
         clause.negated for clause in structure.clauses
     )
     return has_gap_predicate and has_negation
+
+
+def _antecedent_is_negative_self_assessment(
+    structure: StructuredUtterance | None,
+) -> bool:
+    if structure is None:
+        return False
+    for frame in structure.clauses:
+        if frame.predicate_index is None or not frame.negated:
+            continue
+        predicate = structure.tokens[frame.predicate_index].lemma
+        subjects = {structure.tokens[index].lemma for index in frame.subject_indices}
+        direct_objects = {
+            structure.tokens[index].lemma for index in frame.direct_object_indices
+        }
+        occupied = {
+            *frame.subject_indices,
+            *frame.direct_object_indices,
+            *frame.indirect_object_indices,
+            *((frame.predicate_index,) if frame.predicate_index is not None else ()),
+        }
+        has_assessment_target = bool(frame.predicate_complement_indices) or any(
+            index not in occupied
+            and structure.tokens[index].part_of_speech
+            in {"adjective", "noun", "participle"}
+            for index in range(frame.token_start, frame.token_end)
+        )
+        if (
+            predicate == "считать"
+            and subjects & {"я", "мы"}
+            and direct_objects & {"себя"}
+            and has_assessment_target
+        ):
+            return True
+    return False
 
 
 def _antecedent_denies_external_action(
@@ -1130,6 +1310,32 @@ def _all_lemmas(structure: StructuredUtterance) -> frozenset[str]:
     return frozenset(
         token.lemma for token in structure.tokens if token.semantic_role != "punctuation"
     )
+
+
+def _asks_about_current_conversational_intent(
+    structure: StructuredUtterance,
+) -> bool:
+    for clause in structure.clauses:
+        if clause.clause_kind != "question" or clause.predicate_index is None:
+            continue
+        predicate = structure.tokens[clause.predicate_index].lemma
+        subjects = {structure.tokens[index].lemma for index in clause.subject_indices}
+        action_complements = {
+            structure.tokens[index].lemma for index in clause.action_complement_indices
+        }
+        question_target = (
+            structure.tokens[clause.question_target_index].lemma
+            if clause.question_target_index is not None
+            else None
+        )
+        if (
+            predicate == "хотеть"
+            and (subjects & {"ты", "вы"} or clause.implicit_subject == "addressee")
+            and action_complements & {"сказать", "говорить"}
+            and question_target == "что"
+        ):
+            return True
+    return False
 
 
 def _is_question(structure: StructuredUtterance) -> bool:

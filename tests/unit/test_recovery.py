@@ -63,6 +63,10 @@ def test_person_label_is_a_dynamic_social_frame_not_encyclopedic_retrieval() -> 
     assert "телесериал" not in reply
 
 
+def test_emotional_clarification_with_emoticon_is_a_social_routine() -> None:
+    assert is_social_routine("чего??))")
+
+
 def test_unknown_word_failure_is_single_terminal_lookup_report() -> None:
     replies = {unknown_word_fallback("трощкэ", variant) for variant in range(10)}
 

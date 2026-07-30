@@ -12,7 +12,8 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 
-from debilgi.events.models import Event, EventType
+from debilgi.events.models import Event
+from debilgi.experience.feedback import DEFAULT_FEEDBACK_ATTRIBUTOR
 from debilgi.language.content import content_lemmas, content_tokens
 from debilgi.language.dialogue_acts import DialogueActFrame
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
@@ -26,11 +27,9 @@ from debilgi.language.productive_nlg import (
     realize_thought,
 )
 from debilgi.language.tokenizer import tokenize
-from debilgi.social.signals import AFFIRMATION, APPROVAL, AVERSION, DISAPPROVAL, REFUSAL
+from debilgi.personality.perspective import PersonalityPerspective
 from debilgi.storage.database import Database
 
-_POSITIVE_REACTIONS = frozenset({"❤️", "❤", "👍", "✅", "🔥", "💯", "🥰", "😍", "🤩"})
-_NEGATIVE_REACTIONS = frozenset({"👎", "🤮", "💩", "❌", "🤢"})
 _POSITION_PREDICATES = frozenset({"быть", "считать", "думать", "полагать"})
 
 
@@ -207,7 +206,8 @@ class PositionRepository:
             )
 
     async def observe_feedback(self, event: Event) -> None:
-        response_message_id = _feedback_target(event)
+        feedback = DEFAULT_FEEDBACK_ATTRIBUTOR.attribute(event)
+        response_message_id = feedback.target_message_id
         if response_message_id is None:
             return
         row = await self._database.fetchone(
@@ -217,9 +217,11 @@ class PositionRepository:
         )
         if row is None:
             return
-        reward, kind, attribution = _feedback_signal(event)
-        if reward == 0.0 or attribution < 0.60:
+        if not feedback.is_learnable():
             return
+        reward = feedback.reward
+        kind = feedback.kind
+        attribution = feedback.attribution_confidence
         inserted = await self._database.execute(
             """INSERT OR IGNORE INTO language_position_feedback (
                    feedback_event_id, response_message_id, guild_id, position_key,
@@ -297,6 +299,7 @@ class PositionReasoningService:
         *,
         facts: tuple[str, ...] = (),
         context_messages: tuple[str, ...] = (),
+        perspective: PersonalityPerspective | None = None,
     ) -> PositionDecision | None:
         request = _position_request(frame)
         if request is None or frame is None:
@@ -310,6 +313,7 @@ class PositionReasoningService:
             facts=facts,
             context_messages=context_messages,
             stored=stored,
+            perspective=perspective,
         )
         stance = "support" if score >= 0.22 else "oppose" if score <= -0.22 else "withhold"
         default_mode = "direct" if stance != "withhold" and confidence >= 0.64 else "qualified"
@@ -440,8 +444,10 @@ def _derive_score(
     facts: tuple[str, ...],
     context_messages: tuple[str, ...],
     stored: StoredPosition | None,
+    perspective: PersonalityPerspective | None = None,
 ) -> tuple[float, float, tuple[str, ...]]:
     weighted: list[tuple[float, float, str]] = []
+    perspective_evidence: tuple[str, ...] = ()
     for fact in facts:
         if _mentions_proposition(fact, target, quality):
             negative = _is_negated(fact)
@@ -452,6 +458,20 @@ def _derive_score(
             weighted.append((-0.42 if negative else 0.42, 0.48, "dialogue_claim"))
     if stored is not None:
         weighted.append((stored.score, stored.confidence, "stored_position"))
+    if perspective is not None:
+        appraisal = perspective.appraise((quality,))
+        if abs(appraisal.score) >= 0.12 and appraisal.dimensions:
+            # Personality is a genuine prior for an opinion, but grounded
+            # evidence and a consolidated prior position remain stronger.
+            weight = 0.30 + appraisal.confidence * 0.28
+            weighted.append(
+                (
+                    appraisal.score * 0.72,
+                    weight,
+                    "personality_value_appraisal",
+                )
+            )
+            perspective_evidence = appraisal.evidence
     if not weighted:
         # Lack of support is not evidence for a negative fact.  It creates a
         # provisional refusal to endorse the label, which remains revisable.
@@ -463,7 +483,18 @@ def _derive_score(
         0.38,
         min(0.96, sum(weight for _, weight, _ in weighted) / len(weighted)),
     )
-    return score, confidence, tuple(dict.fromkeys(reason for _, _, reason in weighted))
+    return (
+        score,
+        confidence,
+        tuple(
+            dict.fromkeys(
+                (
+                    *(reason for _, _, reason in weighted),
+                    *perspective_evidence,
+                )
+            )
+        ),
+    )
 
 
 def _mentions_proposition(text: str, target: str, quality: str) -> bool:
@@ -548,38 +579,6 @@ def _position_key(target: str, quality: str) -> str:
     )
     digest = hashlib.sha256(f"{target_key}|{quality_key}".encode()).hexdigest()[:24]
     return f"position:{digest}"
-
-
-def _feedback_target(event: Event) -> int | None:
-    if event.event_type in {EventType.REACTION_ADDED, EventType.REACTION_REMOVED}:
-        value = event.payload.get("message_id")
-    elif event.event_type in {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}:
-        value = event.payload.get("reply_to_message_id")
-    else:
-        return None
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _feedback_signal(event: Event) -> tuple[float, str, float]:
-    if event.event_type in {EventType.REACTION_ADDED, EventType.REACTION_REMOVED}:
-        emoji = str(event.payload.get("emoji", ""))
-        direction = 1.0 if event.event_type is EventType.REACTION_ADDED else -1.0
-        if emoji in _POSITIVE_REACTIONS:
-            return 0.8 * direction, "positive_reaction", 0.90
-        if emoji in _NEGATIVE_REACTIONS:
-            return -0.8 * direction, "negative_reaction", 0.90
-        return 0.0, "neutral_reaction", 0.0
-    content = event.payload.get("content")
-    if not isinstance(content, str):
-        return 0.0, "empty_reply", 0.0
-    words = set(tokenize(content.casefold().replace("ё", "е")))
-    if words & (DISAPPROVAL | AVERSION):
-        return -1.0, "explicit_rejection", 0.95
-    if words & (APPROVAL | AFFIRMATION):
-        return 1.0, "explicit_confirmation", 0.95
-    if words & REFUSAL:
-        return -0.65, "refusal", 0.75
-    return 0.0, "conversation_continued", 0.10
 
 
 def _json(value: object) -> str:

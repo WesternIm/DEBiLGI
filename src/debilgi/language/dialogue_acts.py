@@ -231,6 +231,19 @@ def analyze_dialogue_act(
             confidence=max(0.84, structure.confidence * 0.92),
             evidence=("construction:ellipsis_alternative_request",),
         )
+    if "attention_call" in pragmatic_functions:
+        return DialogueActFrame(
+            kind="attention_call",
+            response_obligation="acknowledge_attention",
+            subject="speaker",
+            predicate=None,
+            objects=(),
+            polarity=0.0,
+            register=register,
+            complete=True,
+            confidence=max(0.88, structure.confidence * 0.92),
+            evidence=("construction:attention_call",),
+        )
     if pragmatic_functions & {"opinion_request", "binary_answer_demand"}:
         opinion_objects = content_tokens(structure.text)
         return DialogueActFrame(
@@ -349,6 +362,32 @@ def analyze_dialogue_act(
         self_state is not None
         and self_state.complete
         and self_state.clause_kind == "statement"
+        and self_state.experiencer_kind == "self"
+    ):
+        return DialogueActFrame(
+            kind=(
+                "self_evaluation"
+                if self_state.state == "self_role_assessment"
+                else "self_state_attribution"
+            ),
+            response_obligation=(
+                "respond_to_evaluation"
+                if self_state.state == "self_role_assessment"
+                else "resolve_self_state"
+            ),
+            subject="addressee",
+            predicate=self_state.predicate_lemma,
+            objects=self_state.target_lemmas,
+            polarity=positive - negative,
+            register=register,
+            complete=True,
+            confidence=self_state.confidence,
+            evidence=(f"contextual_self_state:{self_state.state}",),
+        )
+    if (
+        self_state is not None
+        and self_state.complete
+        and self_state.clause_kind == "statement"
         and self_state.experiencer_kind == "speaker"
         and self_state.state == "understanding"
         and self_state.negated
@@ -382,7 +421,7 @@ def analyze_dialogue_act(
             response_obligation="answer_question",
             subject=subject or question_clause.implicit_subject,
             predicate=predicate,
-            objects=objects,
+            objects=objects or topical if not complete else objects,
             polarity=0.0,
             register=register,
             complete=complete,
@@ -469,7 +508,7 @@ def analyze_dialogue_act(
         response_obligation="continue_topic" if predicate else "clarify_fragment",
         subject=subject,
         predicate=predicate,
-        objects=objects,
+        objects=objects if predicate else objects or topical,
         polarity=positive - negative,
         register=register,
         complete=predicate is not None,
@@ -560,6 +599,9 @@ def dialogue_act_thought(frame: DialogueActFrame) -> ClauseThought | None:
     """Turn a social obligation into a proposition for productive grammar."""
 
     if not frame.complete:
+        # An incomplete act is an ambiguity signal, not a decision to emit one
+        # particular clarification.  The dialogue-move planner compares event,
+        # reaction and semantic probes in the full conversational context.
         return None
     if frame.response_obligation == "acknowledge_understanding":
         return ClauseThought(
@@ -602,6 +644,42 @@ def dialogue_act_thought(frame: DialogueActFrame) -> ClauseThought | None:
             response_polarity=True,
             confidence=frame.confidence,
             evidence=("acknowledge_understanding",),
+        )
+    if frame.response_obligation == "acknowledge_attention":
+        return ClauseThought(
+            predicate=ConceptLexeme(
+                "слушать",
+                "слушаю",
+                "verb",
+                (("tense", "present"), ("number", "singular"), ("person", "first")),
+            ),
+            dependencies=(
+                SemanticDependency(
+                    "subject",
+                    ConceptArgument(
+                        ConceptLexeme(
+                            "я",
+                            "я",
+                            "pronoun",
+                            (("number", "singular"), ("person", "first")),
+                        )
+                    ),
+                ),
+                SemanticDependency(
+                    "direct_object",
+                    ConceptArgument(
+                        ConceptLexeme(
+                            "ты",
+                            "тебя",
+                            "pronoun",
+                            (("number", "singular"), ("person", "second")),
+                        ),
+                        grammatical_case="accusative",
+                    ),
+                ),
+            ),
+            confidence=frame.confidence,
+            evidence=("acknowledge_attention",),
         )
     if frame.response_obligation == "acknowledge_evaluation":
         return ClauseThought(

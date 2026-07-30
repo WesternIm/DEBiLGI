@@ -9,6 +9,7 @@ from debilgi.language.arbitration import (
     ArbitrationProfile,
     ResponseArbitrator,
     ResponseCandidate,
+    merge_recovery_decision,
 )
 from debilgi.language.arbitration_repository import ArbitrationRepository
 from debilgi.storage.database import Database
@@ -106,6 +107,17 @@ async def test_decision_persists_every_candidate_and_explicit_feedback(
     assert stored["response_message_id"] == 555
     assert len(rows) == 2
     assert sum(int(row["selected"]) for row in rows) == 1
+    proposals = await database.fetchall(
+        "SELECT * FROM language_content_proposals WHERE decision_id = ?",
+        (decision.decision_id,),
+    )
+    surface_proposals = await database.fetchall(
+        "SELECT * FROM language_surface_proposals WHERE decision_id = ?",
+        (decision.decision_id,),
+    )
+    assert proposals
+    assert all(row["plan_json"] for row in proposals)
+    assert len(surface_proposals) == len(rows)
 
     feedback = event(
         "discord:message:feedback",
@@ -122,6 +134,72 @@ async def test_decision_persists_every_candidate_and_explicit_feedback(
     assert feedback_row is not None
     assert feedback_row["reward"] < 0
     assert feedback_row["applied_at"] is None
+
+
+async def test_recovery_decision_persists_original_and_fallback_proposals(
+    database: Database,
+) -> None:
+    prompt = event("discord:message:fallback-prompt")
+    await EventRepository(database).append(prompt)
+    profile = ArbitrationProfile.baseline(1)
+    primary = ResponseArbitrator(minimum_score=100.0).decide(
+        event_id=prompt.event_id,
+        prompt="Собачки умеют бегать?",
+        focus_concepts=("собачка", "бегать"),
+        candidates=(
+            ResponseCandidate.create(
+                event_id=prompt.event_id,
+                source="semantic_reasoning",
+                renderer="answer",
+                text="Собачки умеют бегать.",
+                speech_act="question",
+                source_confidence=0.85,
+            ),
+        ),
+        recent_replies=(),
+        profile=profile,
+    )
+    recovery = ResponseArbitrator(minimum_score=-100.0).decide(
+        event_id=prompt.event_id,
+        prompt="Собачки умеют бегать?",
+        focus_concepts=("собачка", "бегать"),
+        candidates=(
+            ResponseCandidate.create(
+                event_id=prompt.event_id,
+                source="fallback",
+                renderer="conversational_repair",
+                text="Уточни, о каких собачках речь?",
+                speech_act="question",
+                source_confidence=0.45,
+            ),
+        ),
+        recent_replies=(),
+        profile=profile,
+        used_fallback=True,
+    )
+    merged = merge_recovery_decision(primary, recovery)
+
+    await ArbitrationRepository(database).save_decision(
+        prompt,
+        merged,
+        mode="active",
+    )
+
+    candidates = await database.fetchall(
+        "SELECT * FROM language_response_candidates WHERE decision_id = ?",
+        (merged.decision_id,),
+    )
+    proposals = await database.fetchall(
+        "SELECT * FROM language_content_proposals WHERE decision_id = ?",
+        (merged.decision_id,),
+    )
+    mappings = await database.fetchall(
+        "SELECT * FROM language_surface_proposals WHERE decision_id = ?",
+        (merged.decision_id,),
+    )
+    assert len(candidates) == 2
+    assert len(proposals) == 2
+    assert len(mappings) == 2
 
 
 async def test_enabled_learning_updates_a_versioned_profile_after_bound_feedback(
@@ -189,6 +267,11 @@ async def test_enabled_learning_updates_a_versioned_profile_after_bound_feedback
     assert learned_weights
     assert len(stored_features) == 2
     assert any(key.startswith("cross:") for key in learned_weights)
+
+    assert await repository.activate_profile_version(1, 1)
+    rolled_back = await repository.profile(1)
+    assert rolled_back.version == 1
+    assert rolled_back.observations == 0
 
 
 async def test_feedback_reinforces_selected_abstract_construction(

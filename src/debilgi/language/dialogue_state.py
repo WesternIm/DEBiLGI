@@ -360,7 +360,7 @@ def _resolve_references(
                 slot.role == "direct_object" and slot.required_in_isolated_fact
                 for slot in profile.slots
             )
-        )
+        ) or dict(predicate.grammatical_features).get("transitivity") == "transitive"
         if not requires_object:
             continue
         ranked = _unique_concept_rankings(tuple(

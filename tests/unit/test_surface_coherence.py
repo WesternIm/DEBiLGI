@@ -69,3 +69,10 @@ def test_generic_data_counter_is_never_a_user_facing_answer() -> None:
         "В памяти не хватает фактов.",
     ):
         assert internal_surface_reason(text) is not None
+
+
+def test_position_reason_is_not_mistaken_for_internal_evidence_bookkeeping() -> None:
+    text = "У меня нет оснований для такой оценки."
+
+    assert internal_surface_reason(text) is None
+    assert evaluate_surface(text).learnable

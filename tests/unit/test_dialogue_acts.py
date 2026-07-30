@@ -226,6 +226,32 @@ def test_self_assessment_is_a_question_about_the_bots_position() -> None:
     assert act.objects == ("умный",)
 
 
+def test_nominal_self_role_is_conversation_not_an_information_mode() -> None:
+    act = _act("Ты чё герой что-ли?")
+
+    assert act.kind == "self_state_question"
+    assert act.response_obligation == "resolve_self_state"
+    assert act.objects == ("герой",)
+
+
+def test_colloquial_predicative_confirmation_resolves_to_a_self_trait() -> None:
+    act = _act("Ты же круто, да?")
+
+    assert act.kind == "self_state_question"
+    assert act.response_obligation == "resolve_self_state"
+    assert act.objects == ("крутой",)
+    assert act.complete is True
+
+
+def test_unknown_fragment_does_not_choose_its_reply_inside_act_detection() -> None:
+    act = _act("ебануться")
+
+    assert act.kind == "fragment"
+    assert act.response_obligation == "clarify_fragment"
+    assert act.objects == ("ебануться",)
+    assert realize_dialogue_act(act) is None
+
+
 def test_open_self_reflection_is_not_treated_as_a_dictionary_question() -> None:
     act = _act("Что ты думаешь о себе?")
 
@@ -375,3 +401,31 @@ def test_elliptical_cause_question_keeps_priority_over_following_evidence() -> N
         "semantic_reasoning",
         text="Потому что я уже оцениваю контекст.",
     )
+
+
+def test_contextual_self_label_becomes_a_complete_evaluation_contract() -> None:
+    structure = analyze_structured_utterance("гений")
+    self_state = analyze_self_state(
+        structure,
+        replied_to_agent=True,
+        context_messages=("Я ответил бессвязно.",),
+    )
+    act = analyze_dialogue_act(structure, self_state=self_state)
+
+    assert act.kind == "self_evaluation"
+    assert act.response_obligation == "respond_to_evaluation"
+    assert act.objects == ("гений",)
+    assert act.complete is True
+
+
+def test_negated_second_person_state_is_not_reduced_to_a_fragment() -> None:
+    structure = analyze_structured_utterance("а ты будто не знаешь")
+    self_state = analyze_self_state(
+        structure,
+        resolved_bindings=(("direct_object", "гений"),),
+    )
+    act = analyze_dialogue_act(structure, self_state=self_state)
+
+    assert act.kind == "self_state_attribution"
+    assert act.response_obligation == "resolve_self_state"
+    assert act.objects == ("гений",)

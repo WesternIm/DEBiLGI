@@ -11,6 +11,10 @@ from discord.ext import commands
 from debilgi.autonomy.policy import InitiativePolicy
 from debilgi.autonomy.repository import AutonomyRepository
 from debilgi.background import BackgroundLearningService
+from debilgi.cognition.continuous import (
+    ContinuousCognitionConfig,
+    ContinuousCognitionService,
+)
 from debilgi.cognition.core import CognitiveCore, CognitiveCoreConfig
 from debilgi.cognition.core_repository import CognitiveRepository
 from debilgi.cognition.expectations import ExpectationPredictor
@@ -46,11 +50,12 @@ from debilgi.language.lexicon import LexiconService, NeologismRepository, Neolog
 from debilgi.language.morphology import MorphologyRepository
 from debilgi.language.open_questions import OpenLanguageQuestionService
 from debilgi.language.position_reasoning import PositionReasoningService, PositionRepository
+from debilgi.language.processing_outcomes import ProcessingOutcomeRepository
+from debilgi.language.response_trace import ResponseTraceRepository
 from debilgi.language.russian_reference import RussianReferenceService, WiktionaryClient
 from debilgi.language.semantic_assimilation import SemanticAssimilationService
 from debilgi.language.semantic_consultant import (
     CloudflareWorkersAIConsultant,
-    PuterSidecarConsultant,
     SemanticConsultationService,
 )
 from debilgi.language.semantics import SemanticMemoryRepository
@@ -209,6 +214,24 @@ class DebilgiBot(commands.Bot):
         )
         self.position_repository = PositionRepository(database)
         self.position_reasoning = PositionReasoningService(self.position_repository)
+        self.processing_outcomes = ProcessingOutcomeRepository(database)
+        self.response_traces = ResponseTraceRepository(database)
+        self.continuous_cognition = ContinuousCognitionService(
+            database,
+            enabled=settings.continuous_cognition_enabled,
+            config=ContinuousCognitionConfig(
+                active_interval=timedelta(
+                    seconds=settings.continuous_cognition_active_seconds
+                ),
+                idle_interval=timedelta(
+                    seconds=settings.continuous_cognition_idle_seconds
+                ),
+                work_per_pulse=settings.continuous_cognition_work_per_pulse,
+            ),
+        )
+        self.response_traces.set_completion_notifier(
+            self.continuous_cognition.wake
+        )
         self.abstract_reasoning = AbstractReasoningService(database)
         self.lexical_usage_learning = LexicalUsageLearningService(database, self.self_dataset)
         self.utterance_understandings = UtteranceUnderstandingRepository(database)
@@ -266,23 +289,15 @@ class DebilgiBot(commands.Bot):
             database,
             self.self_dataset,
         )
-        if settings.semantic_consultant_provider == "cloudflare":
-            semantic_provider = CloudflareWorkersAIConsultant(
-                settings.semantic_consultant_account_id or "",
-                settings.semantic_consultant_api_token or "",
-                model=settings.semantic_consultant_model,
-                instruction=settings.semantic_consultant_instruction_path.read_text(
-                    encoding="utf-8"
-                ),
-                timeout_seconds=settings.semantic_consultant_timeout_seconds,
-            )
-        else:
-            semantic_provider = PuterSidecarConsultant(
-                settings.semantic_consultant_endpoint,
-                model=settings.semantic_consultant_model,
-                timeout_seconds=settings.semantic_consultant_timeout_seconds,
-                shared_secret=settings.semantic_consultant_secret,
-            )
+        semantic_provider = CloudflareWorkersAIConsultant(
+            settings.semantic_consultant_account_id or "",
+            settings.semantic_consultant_api_token or "",
+            model=settings.semantic_consultant_model,
+            instruction=settings.semantic_consultant_instruction_path.read_text(
+                encoding="utf-8"
+            ),
+            timeout_seconds=settings.semantic_consultant_timeout_seconds,
+        )
         self.semantic_consultant = SemanticConsultationService(
             database,
             semantic_provider,
@@ -309,9 +324,8 @@ class DebilgiBot(commands.Bot):
             study_worker_count=settings.background_study_workers,
             maximum_study_attempts=settings.background_max_study_attempts,
             wikipedia_enabled=settings.wikipedia_enabled,
-            # The external teacher may expand abstract constructions only
-            # while idle. The live reply path remains entirely local and
-            # never forwards a generated answer from Puter.
+            # Idle learning and live semantic planning share the same strict
+            # contract: external wording is never admitted.
             semantic_consultant=self.semantic_consultant,
             causal_reasoning=self.causal_reasoning,
             abstract_reasoning=self.abstract_reasoning,
@@ -357,12 +371,15 @@ class DebilgiBot(commands.Bot):
             understanding_repository=self.utterance_understandings,
             arbitration_repository=self.arbitration_repository,
             context_gate=self.context_gate,
-            # The consultant teaches structured facts when local sources are
-            # exhausted. Its ready-made wording is still never surfaced.
+            # The consultant proposes word-free semantic alternatives. The
+            # local personality selects one and local morphology authors text.
             semantic_consultant=self.semantic_consultant,
             semantic_assimilation=self.semantic_assimilation,
             position_reasoning=self.position_reasoning,
             abstract_reasoning=self.abstract_reasoning,
+            processing_outcomes=self.processing_outcomes,
+            response_traces=self.response_traces,
+            continuous_cognition=self.continuous_cognition,
             arbitration_mode=settings.arbitration_mode,
             arbitration_minimum_score=settings.arbitration_minimum_score,
             arbitration_max_total_candidates=(
@@ -371,6 +388,7 @@ class DebilgiBot(commands.Bot):
             response_confidence_threshold=settings.response_confidence_threshold,
             response_plan_retry_limit=settings.response_plan_retry_limit,
             context_character_limit=settings.language_context_chars,
+            productive_only_replies=settings.productive_only_replies,
             enabled=settings.test_replies_enabled,
         )
         self.pipeline = EventPipeline(
@@ -394,6 +412,7 @@ class DebilgiBot(commands.Bot):
                 self.literacy_engine.observe,
                 self.learning_engine.observe,
                 self.cognitive_core.observe,
+                self.continuous_cognition.observe,
                 self.social_reaction_engine.observe,
                 self.experience_consolidator.observe,
                 self.self_dataset.observe,
@@ -452,12 +471,19 @@ class DebilgiBot(commands.Bot):
             await self.literacy_engine.observe(event)
         await self.learning_engine.start()
         await self.cognitive_core.start()
+        await self.continuous_cognition.start()
         await self.knowledge_service.start()
         await self.russian_reference.start()
         await self.pipeline.start()
         await self.open_language_questions.restore_working_context()
         await self.add_cog(
-            EventListener(self, self.pipeline, self.reply_service, self.context_gate)
+            EventListener(
+                self,
+                self.pipeline,
+                self.reply_service,
+                self.context_gate,
+                self.response_traces,
+            )
         )
         await self.add_cog(
             Diagnostics(
@@ -543,6 +569,7 @@ class DebilgiBot(commands.Bot):
 
     async def close(self) -> None:
         await self.background_learning.stop()
+        await self.continuous_cognition.stop()
         try:
             await super().close()
         finally:

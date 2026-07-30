@@ -14,6 +14,7 @@ _CUSTOM_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]+):\d+>")
 _TOKEN_RE = re.compile(
     r"<(?:url|user|role|channel|emoji:[A-Za-z0-9_]+)>"
     r"|(?:[A-Za-zА-Яа-яЁё]\.){2,}[A-Za-zА-Яа-яЁё]?\.?"
+    r"|\d+(?:(?:\.\d+)+|,\d+)?(?:[%‰])?"
     r"|[\w]+(?:['’\-][\w]+)*"
     r"|[^\s\w]",
     re.UNICODE,

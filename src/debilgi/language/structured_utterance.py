@@ -48,9 +48,7 @@ _COORDINATION_RELATIONS = {
     "зато": "contrast",
     "однако": "contrast",
 }
-_COORDINATABLE_PARTS = frozenset(
-    {"noun", "pronoun", "adjective", "participle", "number", "adverb"}
-)
+_COORDINATABLE_PARTS = frozenset({"noun", "pronoun", "adjective", "participle", "number", "adverb"})
 _SUBORDINATE_MARKERS = {
     "что": "ccomp",
     "чтобы": "ccomp:purpose",
@@ -67,6 +65,20 @@ _SUBORDINATE_MARKERS = {
     "будто": "advcl:comparison",
     "словно": "advcl:comparison",
 }
+_INTERROGATIVE_COMPLEMENT_PREDICATES = frozenset(
+    {
+        "выяснить",
+        "забыть",
+        "знать",
+        "интересоваться",
+        "объяснить",
+        "понимать",
+        "помнить",
+        "сказать",
+        "спросить",
+        "узнать",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +106,8 @@ class TokenInterpretation:
     meaning_confidence: float = 0.0
     context_fit: float = 0.0
     unknown_kind: str | None = None
+    morphology_known: bool | None = None
+    morphology_source: str | None = None
     confidence: float = 0.0
 
 
@@ -288,16 +302,14 @@ def analyze_structured_utterance(
                 meaning_confidence=(lexical.confidence.meaning if lexical else 0.0),
                 context_fit=lexical.confidence.context_fit if lexical else 0.0,
                 unknown_kind=unknown_kind,
+                morphology_known=reading.is_known if reading is not None else None,
+                morphology_source=reading.analysis_kind if reading is not None else None,
                 confidence=confidence,
             )
         )
         if corrected and expressive.kind is not None:
-            niche_signals.append(
-                f"expressive_{expressive.kind}:{surface}->{corrected}"
-            )
-            niche_signals.append(
-                f"expressive_intensity:{expressive.intensity:.2f}"
-            )
+            niche_signals.append(f"expressive_{expressive.kind}:{surface}->{corrected}")
+            niche_signals.append(f"expressive_intensity:{expressive.intensity:.2f}")
         elif corrected:
             niche_signals.append(f"spelling_correction:{surface}->{corrected}")
         if entity is not None:
@@ -312,6 +324,8 @@ def analyze_structured_utterance(
             niche_signals.append("emotional_intensifier")
         if lexical is not None and lexical.unknown_kind is not None:
             ambiguities.append(f"{surface}:{lexical.unknown_kind.value}")
+        elif reading is not None and reading.analysis_kind == "guessed":
+            ambiguities.append(f"{surface}:morphology_guess")
         elif len(candidates) > 1 and selected_meaning is None:
             ambiguities.append(f"{surface}:unresolved_sense")
         if len(alternatives) > 1 and reading is not None:
@@ -332,16 +346,15 @@ def analyze_structured_utterance(
 
     clauses: list[ClauseFrame] = []
     mutable_cards = token_cards
-    for clause_index, (start, end) in enumerate(
-        _clause_ranges(sentence.tokens, tuple(token_cards))
-    ):
+    clause_ranges = _clause_ranges(sentence.tokens, tuple(token_cards))
+    for clause_index, (start, end) in enumerate(clause_ranges):
         frame = _analyze_clause(
             clause_index,
             start,
             end,
             tuple(mutable_cards),
             address_indices,
-            text.rstrip().endswith("?"),
+            _range_has_question_terminal(sentence.tokens, end),
         )
         clauses.append(frame)
         role_updates = _roles_for_frame(frame)
@@ -397,16 +410,29 @@ def _analyze_clause(
     # Structural operators must survive long enough to connect content words.
     # They are never arguments themselves, but removing them here would erase
     # negation, question force, prepositional government and coordination.
+    #
+    # A pragmatic reading is not automatically a syntactic deletion.  Russian
+    # finite verbs such as ``знаешь`` and ``понимаешь`` can be parenthetical
+    # turn markers, but they remain the predicate when the clause has no other
+    # proposition scaffold (``а ты будто не знаешь``).  Treating every
+    # pragmatic cue as detached used to erase the only verb and collapse a
+    # complete utterance into a fragment.
+    detached_pragmatic_indices = _detached_pragmatic_indices(
+        cards,
+        start=start,
+        end=end,
+        address_indices=address_indices,
+    )
     syntactic_indices = tuple(
         index
         for index in range(start, end)
-        if cards[index].surface[:1].isalnum() and index not in address_indices
-        and cards[index].semantic_role not in {"emotional_modifier", "pragmatic_marker"}
+        if cards[index].surface[:1].isalnum()
+        and index not in address_indices
+        and cards[index].semantic_role != "emotional_modifier"
+        and index not in detached_pragmatic_indices
     )
     content_indices = tuple(
-        index
-        for index in syntactic_indices
-        if cards[index].semantic_role != "function_word"
+        index for index in syntactic_indices if cards[index].semantic_role != "function_word"
     )
     predicate_index = next(
         (
@@ -444,13 +470,31 @@ def _analyze_clause(
     predicate_complement: tuple[int, ...] = ()
     implicit_predicate: str | None = None
     if predicate_index is None and subject_index is not None:
-        predicate_complement = tuple(
+        nominal_predicate_complement = tuple(
             index
             for index in content_indices
             if index > subject_index
             and index not in complement_objects
             and cards[index].part_of_speech in {"noun", "adjective", "participle"}
         )
+        # Russian permits zero-copula predicatives beyond ordinary
+        # nouns/adjectives: ``это хорошо`` and colloquial confirmation
+        # questions may use an adverbial surface.  Use such a surface only
+        # when there is no nominal complement; otherwise a trailing temporal
+        # modifier such as ``теперь`` must not replace the actual role noun.
+        adverbial_predicate_complement = (
+            tuple(
+                index
+                for index in content_indices
+                if index > subject_index
+                and index not in complement_objects
+                and cards[index].part_of_speech in {"adverb", "predicate"}
+            )
+            if cards[subject_index].lemma
+            in {"я", "ты", "вы", "мы", "он", "она", "оно", "они", "это"}
+            else ()
+        )
+        predicate_complement = nominal_predicate_complement or adverbial_predicate_complement
         if predicate_complement:
             implicit_predicate = "быть"
         elif question_target is not None and any(
@@ -494,19 +538,26 @@ def _analyze_clause(
             )
         if direct is None:
             profile = predicate_valency(cards[predicate_index].lemma)
-            required_object_slot = next(
-                (
-                    slot
-                    for slot in profile.slots
-                    if slot.role == "direct_object"
-                    and slot.required_in_isolated_fact
-                ),
-                None,
-            ) if profile is not None else None
-            requires_object = required_object_slot is not None
+            required_object_slot = (
+                next(
+                    (
+                        slot
+                        for slot in profile.slots
+                        if slot.role == "direct_object" and slot.required_in_isolated_fact
+                    ),
+                    None,
+                )
+                if profile is not None
+                else None
+            )
+            requires_object = required_object_slot is not None or (
+                _feature(cards[predicate_index], "transitivity") == "transitive"
+            )
             required_object_case = (
                 required_object_slot.grammatical_case
                 if required_object_slot is not None
+                else "accusative"
+                if requires_object
                 else None
             )
             if requires_object:
@@ -519,9 +570,10 @@ def _analyze_clause(
                         and index not in complement_objects
                         and cards[index].part_of_speech in {"noun", "pronoun"}
                         and (
-                            _feature(cards[index], "case")
-                            == required_object_case
-                            if required_object_case is not None
+                            _can_be_accusative(cards[index])
+                            if required_object_case == "accusative"
+                            else _feature(cards[index], "case") == required_object_case
+                            if required_object_case
                             else _can_be_accusative(cards[index])
                         )
                     ),
@@ -594,10 +646,7 @@ def _analyze_clause(
     elliptical = predicate_index is None and implicit_predicate is None
     question_word_has_main_scope = bool(
         question_target is not None
-        and (
-            predicate_index is None
-            or question_target < predicate_index
-        )
+        and (predicate_index is None or question_target < predicate_index)
     )
     clause_kind = (
         "question"
@@ -641,6 +690,58 @@ def _analyze_clause(
     )
 
 
+def _detached_pragmatic_indices(
+    cards: tuple[TokenInterpretation, ...],
+    *,
+    start: int,
+    end: int,
+    address_indices: frozenset[int],
+) -> frozenset[int]:
+    """Detach discourse markers only when another proposition can host them."""
+
+    pragmatic = tuple(
+        index
+        for index in range(start, end)
+        if index not in address_indices and cards[index].semantic_role == "pragmatic_marker"
+    )
+    if not pragmatic:
+        return frozenset()
+    ordinary = tuple(
+        index
+        for index in range(start, end)
+        if index not in address_indices
+        and cards[index].surface[:1].isalnum()
+        and cards[index].semantic_role
+        not in {"emotional_modifier", "pragmatic_marker", "function_word"}
+    )
+    finite_ordinary = any(
+        cards[index].part_of_speech == "verb" and "INFN" not in cards[index].grammemes
+        for index in ordinary
+    )
+    predicative_ordinary = any(cards[index].part_of_speech == "predicate" for index in ordinary)
+    nominal_subject = any(
+        cards[index].part_of_speech in {"noun", "pronoun"}
+        and _feature(cards[index], "case") == "nominative"
+        for index in ordinary
+    )
+    nominal_complement = any(
+        cards[index].part_of_speech in {"adjective", "participle", "adverb"} for index in ordinary
+    )
+    independent_scaffold = (
+        finite_ordinary or predicative_ordinary or (nominal_subject and nominal_complement)
+    )
+    retained_finite_predicates = (
+        frozenset()
+        if independent_scaffold
+        else frozenset(
+            index
+            for index in pragmatic
+            if cards[index].part_of_speech == "verb" and "INFN" not in cards[index].grammemes
+        )
+    )
+    return frozenset(index for index in pragmatic if index not in retained_finite_predicates)
+
+
 def _subject_index(
     cards: tuple[TokenInterpretation, ...],
     content_indices: tuple[int, ...],
@@ -674,7 +775,38 @@ def _subject_index(
         )
     if not candidates:
         return None
-    return candidates[0] if predicate_index is None else candidates[-1]
+    if predicate_index is None or len(candidates) == 1:
+        return candidates[0]
+    predicate = cards[predicate_index]
+    predicate_number = _feature(predicate, "number")
+    predicate_gender = _feature(predicate, "gender")
+    predicate_person = _feature(predicate, "person")
+
+    def agreement_score(index: int) -> tuple[float, int]:
+        candidate = cards[index]
+        score = 0.0
+        candidate_number = _feature(candidate, "number")
+        candidate_gender = _feature(candidate, "gender")
+        candidate_person = _feature(candidate, "person")
+        if predicate_number and candidate_number:
+            score += 0.58 if predicate_number == candidate_number else -0.62
+        if predicate_gender and candidate_gender:
+            score += 0.32 if predicate_gender == candidate_gender else -0.28
+        if predicate_person and candidate_person:
+            score += 0.54 if predicate_person == candidate_person else -0.50
+        if candidate.part_of_speech == "pronoun":
+            score += 0.16
+        if candidate.lemma in {"я", "ты", "вы", "мы", "он", "она", "оно", "они"}:
+            score += 0.18
+        if _feature(predicate, "transitivity") == "transitive" and _can_be_accusative(candidate):
+            score -= 0.22
+        # Proximity only breaks genuinely equivalent analyses; agreement must
+        # beat the old "last noun before the verb" shortcut.
+        distance = abs(predicate_index - index)
+        score += max(0.0, 0.08 - distance * 0.01)
+        return score, index
+
+    return max(candidates, key=agreement_score)
 
 
 def _complements(
@@ -693,8 +825,7 @@ def _complements(
                 for following in range(index + 1, min(len(cards), index + 5))
                 if following in content_set
                 and (
-                    cards[following].part_of_speech
-                    in {"noun", "pronoun", "number"}
+                    cards[following].part_of_speech in {"noun", "pronoun", "number"}
                     or (
                         cards[following].part_of_speech is None
                         and cards[following].semantic_role == "unassigned_content"
@@ -709,12 +840,9 @@ def _complements(
         for following in range(target + 1, min(len(cards), target + 3)):
             if following not in content_set:
                 break
-            if (
-                cards[following].part_of_speech == "number"
-                or (
-                    cards[following].part_of_speech is None
-                    and cards[following].semantic_role == "unassigned_content"
-                )
+            if cards[following].part_of_speech == "number" or (
+                cards[following].part_of_speech is None
+                and cards[following].semantic_role == "unassigned_content"
             ):
                 object_indices.append(following)
                 continue
@@ -1029,6 +1157,22 @@ def _clause_ranges(
             )
             if (
                 marker_index is not None
+                and (
+                    role(cards[marker_index].surface) == "question"
+                    or role(cards[marker_index].lemma) == "question"
+                )
+                and _has_clause_core(cards, sentence_start, index)
+                and _has_clause_core(cards, marker_index, sentence_end)
+            ):
+                # A comma may introduce a new direct question rather than a
+                # modifier of the preceding predicate:
+                # ``вагонетка едет влево, откуда она появится``.  Keeping the
+                # two finite predicates in one frame made the second one
+                # disappear and downgraded the whole turn to a statement.
+                boundaries.append((index, marker_index))
+                continue
+            if (
+                marker_index is not None
                 and cards[marker_index].lemma in _SUBORDINATE_MARKERS
                 and _has_clause_core(cards, sentence_start, index)
                 and _has_clause_core(cards, marker_index, sentence_end)
@@ -1045,6 +1189,12 @@ def _clause_ranges(
     return tuple(ranges)
 
 
+def _range_has_question_terminal(tokens: tuple[str, ...], end: int) -> bool:
+    """Apply ``?`` only to the clause immediately before that punctuation."""
+
+    return end < len(tokens) and tokens[end] == "?"
+
+
 def _has_clause_core(
     cards: tuple[TokenInterpretation, ...],
     start: int,
@@ -1055,8 +1205,7 @@ def _has_clause_core(
     lexical = tuple(card for card in cards[start:end] if card.surface[:1].isalnum())
     has_nominal = any(card.part_of_speech in {"noun", "pronoun"} for card in lexical)
     has_question = any(
-        role(card.surface) == "question" or role(card.lemma) == "question"
-        for card in lexical
+        role(card.surface) == "question" or role(card.lemma) == "question" for card in lexical
     )
     definitional = any(card.lemma == "такой" for card in lexical)
     return has_nominal and (has_question or definitional)
@@ -1077,26 +1226,39 @@ def _clause_links(
     frames: tuple[ClauseFrame, ...],
 ) -> tuple[ClauseLink, ...]:
     links: list[ClauseLink] = []
+    preposed_root_indices: set[int] = set()
     if len(frames) >= 2:
-        first_lexical = next(
+        first_core_index = min(
+            (
+                *frames[0].subject_indices,
+                *((frames[0].predicate_index,) if frames[0].predicate_index is not None else ()),
+            ),
+            default=frames[0].token_end,
+        )
+        first_marker = next(
             (
                 index
-                for index in range(frames[0].token_start, frames[0].token_end)
-                if cards[index].surface[:1].isalnum()
+                for index in range(frames[0].token_start, first_core_index)
+                if cards[index].lemma in _SUBORDINATE_MARKERS
+                and (
+                    cards[index].semantic_role == "function_word"
+                    or cards[index].part_of_speech in {"conjunction", "adverb"}
+                )
             ),
             None,
         )
-        if first_lexical is not None:
-            preposed_relation = _SUBORDINATE_MARKERS.get(cards[first_lexical].lemma)
+        if first_marker is not None:
+            preposed_relation = _SUBORDINATE_MARKERS.get(cards[first_marker].lemma)
             if preposed_relation is not None:
                 links.append(
                     ClauseLink(
                         frames[1].clause_index,
                         frames[0].clause_index,
                         preposed_relation,
-                        first_lexical,
+                        first_marker,
                     )
                 )
+                preposed_root_indices.add(frames[1].clause_index)
     for child_index, child in enumerate(frames[1:], start=1):
         first_lexical = next(
             (
@@ -1109,11 +1271,36 @@ def _clause_links(
         if first_lexical is None:
             continue
         subordinate_relation = _SUBORDINATE_MARKERS.get(cards[first_lexical].lemma)
-        if subordinate_relation is not None:
+        if subordinate_relation is not None and not (
+            child.clause_index in preposed_root_indices
+            and child.clause_kind == "question"
+            and (
+                role(cards[first_lexical].surface) == "question"
+                or role(cards[first_lexical].lemma) == "question"
+            )
+        ):
             links.append(
                 ClauseLink(child_index - 1, child_index, subordinate_relation, first_lexical)
             )
             continue
+        if (
+            role(cards[first_lexical].surface) == "question"
+            or role(cards[first_lexical].lemma) == "question"
+        ):
+            parent = frames[child_index - 1]
+            parent_predicate = (
+                cards[parent.predicate_index].lemma if parent.predicate_index is not None else None
+            )
+            if parent_predicate in _INTERROGATIVE_COMPLEMENT_PREDICATES:
+                links.append(
+                    ClauseLink(
+                        child_index - 1,
+                        child_index,
+                        "ccomp:interrogative",
+                        first_lexical,
+                    )
+                )
+                continue
         conjunction_index = child.token_start - 1
         if conjunction_index >= 0:
             coordination = _COORDINATION_RELATIONS.get(cards[conjunction_index].lemma)
@@ -1148,9 +1335,7 @@ def _normalize_subordinate_scope(
 ) -> tuple[list[TokenInterpretation], list[ClauseFrame]]:
     """Keep subordinators and matrix question force out of embedded content."""
 
-    frame_positions = {
-        frame.clause_index: position for position, frame in enumerate(frames)
-    }
+    frame_positions = {frame.clause_index: position for position, frame in enumerate(frames)}
     for link in links:
         if link.relation.startswith("coord:"):
             continue
@@ -1175,12 +1360,8 @@ def _normalize_subordinate_scope(
         question_target = child.question_target_index
         if question_target not in marker_indices and child.clause_kind != "question":
             continue
-        inherited_question = (
-            child.clause_kind == "question"
-            and (
-                question_target is None
-                or question_target in marker_indices
-            )
+        inherited_question = child.clause_kind == "question" and (
+            question_target is None or question_target in marker_indices
         )
         frames[position] = replace(
             child,
@@ -1196,9 +1377,7 @@ def _normalize_subordinate_scope(
             )
             if inherited_question
             else child.clause_kind,
-            question_target_index=(
-                None if question_target in marker_indices else question_target
-            ),
+            question_target_index=(None if question_target in marker_indices else question_target),
         )
     return cards, frames
 

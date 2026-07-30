@@ -31,7 +31,7 @@ class _Consultant:
                 "response_text": "Здесь «база» означает согласие или одобрение.",
                 "confidence": self.confidence,
             },
-            provider="fake-puter",
+            provider="fake-provider",
             model="fake-model",
         )
 
@@ -215,7 +215,7 @@ async def test_research_lexeme_returns_only_topical_facts(database: Database) ->
                     ],
                     "confidence": 0.82,
                 },
-                provider="fake-puter",
+                provider="fake-provider",
                 model="fake-model",
             )
 
@@ -255,7 +255,7 @@ async def test_research_question_uses_a_distinct_mode_and_returns_answer_facts(
                     ],
                     "confidence": 0.84,
                 },
-                provider="fake-puter",
+                provider="fake-provider",
                 model="fake-model",
             )
 
@@ -281,6 +281,84 @@ async def test_research_question_uses_a_distinct_mode_and_returns_answer_facts(
     assert row is not None
     assert row["mode"] == "research"
     assert "foreground_answer_research" in str(row["reason_codes_json"])
+
+
+async def test_response_planning_persists_only_semantic_structure(
+    database: Database,
+) -> None:
+    class PlanningConsultant(_Consultant):
+        async def consult(self, request: ConsultationRequest) -> ConsultationResult:
+            self.calls += 1
+            assert request.mode == "planning"
+            assert request.grounding_facts == (
+                ("runtime.layout.observable", "observable=false"),
+            )
+            return ConsultationResult.from_payload(
+                {
+                    "interpretation": "Ответ о наблюдаемом состоянии.",
+                    "intent": "answer",
+                    "response_text": "Готовую фразу сохранять и отправлять нельзя.",
+                    "response_plans": [
+                        {
+                            "move": "answer",
+                            "stance": "direct",
+                            "propositions": [
+                                {
+                                    "predicate": "наблюдать",
+                                    "arguments": [
+                                        {
+                                            "role": "subject",
+                                            "lemma": "я",
+                                            "part_of_speech": "pronoun",
+                                        }
+                                    ],
+                                    "clause_kind": "statement",
+                                    "negated": True,
+                                    "evidence_ids": [
+                                        "runtime.layout.observable"
+                                    ],
+                                }
+                            ],
+                            "confidence": 0.82,
+                        }
+                    ],
+                    "confidence": 0.82,
+                },
+                provider="fake-provider",
+                model="semantic-only",
+            )
+
+    provider = PlanningConsultant()
+    service = SemanticConsultationService(database, provider, enabled=True)
+
+    result = await service.plan_response(
+        event_id="discord:planning",
+        guild_id=1,
+        channel_id=10,
+        prompt="Какая у тебя раскладка?",
+        context_messages=(),
+        known_terms=("раскладка",),
+        local_relations=(),
+        grounding_facts=(
+            ("runtime.layout.observable", "observable=false"),
+        ),
+        personality_drives=(("assertiveness", 0.8),),
+        response_obligation="answer_question",
+        local_confidence=0.9,
+    )
+
+    assert result is not None
+    assert result.response_text is None
+    assert result.response_plans[0].propositions[0].predicate == "наблюдать"
+    row = await database.fetchone(
+        """SELECT mode, result_json
+           FROM language_semantic_consultations
+           WHERE event_id = ?""",
+        ("discord:planning",),
+    )
+    assert row is not None
+    assert row["mode"] == "planning"
+    assert "Готовую фразу" not in str(row["result_json"])
 
 
 async def test_opinion_research_rejects_isolated_component_definitions(
@@ -321,7 +399,7 @@ async def test_opinion_research_rejects_isolated_component_definitions(
                     ],
                     "confidence": 0.84,
                 },
-                provider="fake-puter",
+                provider="fake-provider",
                 model="fake-model",
             )
 

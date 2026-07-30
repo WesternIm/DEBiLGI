@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import shutil
 import subprocess
 import sys
 import venv
@@ -129,21 +128,23 @@ def setup_environment(*, dev: bool, recreate: bool) -> None:
     print("Готово: проект установлен в локальную .venv.", flush=True)
 
 
-def ensure_env_file() -> bool:
-    target = PROJECT_ROOT / ".env"
-    if target.exists():
-        return True
+def ensure_local_config() -> bool:
+    """Create the ignored secret file without ever overwriting an existing one."""
 
-    example = PROJECT_ROOT / ".env.example"
-    if example.exists():
-        shutil.copyfile(example, target)
-        print(
-            "Создан файл .env. Впиши в него DISCORD_TOKEN и снова запусти проект.",
-            flush=True,
-        )
-    else:
-        print("Нет файла .env с настройками запуска.", flush=True)
-    return False
+    target = PROJECT_ROOT / ".env.local"
+    existed = target.exists()
+    result = run(
+        [
+            str(environment_python()),
+            "-m",
+            "debilgi.local_config",
+            "--project-root",
+            str(PROJECT_ROOT),
+        ]
+    )
+    if result != 0:
+        raise SystemExit("Не удалось подготовить локальный файл настроек.")
+    return existed
 
 
 def parse_args() -> argparse.Namespace:
@@ -174,12 +175,17 @@ def main() -> int:
     args = parse_args()
     dev = args.dev or args.command == "test"
     setup_environment(dev=dev, recreate=args.recreate)
+    local_config_existed = ensure_local_config()
 
     if args.command == "setup":
         return 0
     if args.command == "test":
         return run([str(environment_python()), "-m", "pytest"])
-    if not ensure_env_file():
+    if not local_config_existed:
+        print(
+            "Впиши DISCORD_TOKEN в .env.local и снова запусти проект.",
+            flush=True,
+        )
         return 2
     return run([str(environment_python()), "-m", "debilgi.main"])
 

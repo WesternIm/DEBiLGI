@@ -12,8 +12,9 @@ from debilgi.language.productive_nlg import DependencyPattern
 from debilgi.language.social_reasoning import SocialPolicy
 from debilgi.language.usage_learning import UsageGuidance
 from debilgi.personality.expression import PersonalityExpression
+from debilgi.personality.perspective import PersonalityPerspective
 from debilgi.reflection.models import ReflectionGuidance
-from debilgi.social.models import SocialReaction
+from debilgi.social.models import RelationState, SocialReaction
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +45,9 @@ class ReplyContext:
     required_facts: tuple[str, ...] = ()
     seed: str = ""
     personality: PersonalityExpression | None = None
+    perspective: PersonalityPerspective | None = None
     reaction: SocialReaction | None = None
+    relation: RelationState | None = None
     reflection: ReflectionGuidance | None = None
     exact_answer: str | None = None
     usage_hints: tuple[UsageGuidance, ...] = ()

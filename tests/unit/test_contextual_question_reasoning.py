@@ -45,6 +45,16 @@ def test_cognitive_method_is_answered_from_actual_local_process() -> None:
     assert text == "Я анализирую контекст."
 
 
+def test_reciprocal_intent_question_answers_the_dialogue_goal_not_the_verb_definition() -> None:
+    kind, text = _resolve(
+        "Хз, а ты что хочешь сказать?",
+        "Что ты хочешь сказать про типо?",
+    )
+
+    assert kind == "current_conversational_intent"
+    assert text == "Я хочу понять твою мысль."
+
+
 def test_elliptical_conditional_restores_the_previous_proposition() -> None:
     kind, text = _resolve(
         "А если всё же есть?",
@@ -119,6 +129,33 @@ def test_reason_follow_up_uses_embodiment_instead_of_generic_evidence_gap() -> N
     assert resolution is not None
     assert resolution.kind == "embodiment_cause"
     assert realize_thought(resolution.thought)[0].text == "У меня нет тела."
+
+
+def test_reason_follow_up_to_self_position_stays_in_the_conversation() -> None:
+    resolution = reason_about_contextual_question(
+        analyze_structured_utterance("А почему так?"),
+        ("Нет, я не считаю себя героем.",),
+    )
+
+    assert resolution is not None
+    assert resolution.kind == "self_assessment_cause"
+    assert realize_thought(resolution.thought, resolution.patterns)[0].text == (
+        "У меня нет оснований для такой оценки."
+    )
+
+
+def test_reason_follow_up_to_old_epistemic_fallback_does_not_repeat_it() -> None:
+    resolution = reason_about_contextual_question(
+        analyze_structured_utterance("А почему так?"),
+        ("Я не могу ответить на этот вопрос.",),
+    )
+
+    assert resolution is not None
+    assert resolution.kind == "overcautious_response_cause"
+    assert "не могу ответить" not in realize_thought(
+        resolution.thought,
+        resolution.patterns,
+    )[0].text.casefold()
 
 
 def test_location_follow_up_exposes_the_missing_slot_instead_of_inventing_it() -> None:

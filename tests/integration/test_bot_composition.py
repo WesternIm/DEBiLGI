@@ -30,6 +30,11 @@ async def test_bot_registers_listener_and_diagnostic_group(tmp_path: Path) -> No
         assert bot.reply_service._semantic_consultant is bot.semantic_consultant
         assert bot.russian_reference.worker_count == 4
         assert bot.background_learning.study_worker_count == 4
+        assert bot.continuous_cognition.running
+        assert (
+            bot.reply_service._continuous_cognition
+            is bot.continuous_cognition
+        )
         group = bot.tree.get_command("debilgi")
         assert group is not None
         command_names = {command.name for command in group.commands}
@@ -44,6 +49,7 @@ async def test_bot_registers_listener_and_diagnostic_group(tmp_path: Path) -> No
             "dna",
             "experience",
             "reflection",
+            "cognition-runtime",
             "literacy",
             "reactions",
             "autonomy",

@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 
 class ConfigurationError(RuntimeError):
@@ -65,6 +65,7 @@ class Settings:
     sync_commands: bool = False
     dev_guild_id: int | None = None
     test_replies_enabled: bool = False
+    productive_only_replies: bool = False
     initiative_enabled: bool = False
     wikipedia_enabled: bool = False
     wikipedia_language: str = "ru"
@@ -96,18 +97,15 @@ class Settings:
     response_confidence_threshold: float = 0.45
     response_plan_retry_limit: int = 2
     semantic_consultant_enabled: bool = False
-    semantic_consultant_provider: str = "puter"
-    semantic_consultant_endpoint: str = "http://127.0.0.1:43127/v1/consult"
-    semantic_consultant_model: str = "google/gemini-3.5-flash"
+    semantic_consultant_model: str = "@cf/meta/llama-3.1-8b-instruct-fast"
     semantic_consultant_account_id: str | None = None
     semantic_consultant_api_token: str | None = field(default=None, repr=False)
     semantic_consultant_instruction_path: Path = Path(
-        "integrations/puter-sidecar/semantic-instruction.txt"
+        "integrations/semantic-consultant-instruction.txt"
     )
     semantic_consultant_timeout_seconds: int = 45
     semantic_consultant_trigger_threshold: float = 0.72
     semantic_consultant_minimum_confidence: float = 0.58
-    semantic_consultant_secret: str | None = None
     arbitration_mode: str = "active"
     arbitration_minimum_score: float = 0.45
     arbitration_max_total_candidates: int = 48
@@ -148,6 +146,10 @@ class Settings:
     cognitive_episode_gap_seconds: int = 600
     cognitive_maintenance_seconds: int = 60
     cognitive_consolidation_batch_size: int = 100
+    continuous_cognition_enabled: bool = True
+    continuous_cognition_active_seconds: int = 2
+    continuous_cognition_idle_seconds: int = 15
+    continuous_cognition_work_per_pulse: int = 8
     raw_text_retention_days: int = 30
 
     def __post_init__(self) -> None:
@@ -161,8 +163,14 @@ class Settings:
     @classmethod
     def from_env(cls) -> Settings:
         root = _project_root()
+        # Explicit process/CI variables remain authoritative. ``.env`` is a
+        # backwards-compatible defaults source; the ignored machine-local
+        # file overrides only values that came from that shared file.
+        external_environment = frozenset(os.environ)
         load_dotenv(root / ".env")
-        load_dotenv(root / ".env.local")
+        for name, value in dotenv_values(root / ".env.local").items():
+            if name not in external_environment and value is not None:
+                os.environ[name] = value
 
         raw_guild_id = os.getenv("DEBILGI_DEV_GUILD_ID")
         try:
@@ -182,36 +190,12 @@ class Settings:
             raise ConfigurationError(
                 "DEBILGI_ARBITRATION_MODE must be off, shadow or active"
             )
-        consultant_provider = os.getenv(
-            "DEBILGI_SEMANTIC_CONSULTANT_PROVIDER", "puter"
-        ).strip().lower()
-        if consultant_provider not in {"puter", "cloudflare"}:
-            raise ConfigurationError(
-                "DEBILGI_SEMANTIC_CONSULTANT_PROVIDER must be puter or cloudflare"
-            )
-        consultant_endpoint = os.getenv(
-            "DEBILGI_SEMANTIC_CONSULTANT_ENDPOINT",
-            "http://127.0.0.1:43127/v1/consult",
-        ).strip()
-        if consultant_provider == "puter" and not consultant_endpoint.startswith(
-            ("http://", "https://")
-        ):
-            raise ConfigurationError(
-                "DEBILGI_SEMANTIC_CONSULTANT_ENDPOINT must be an HTTP URL"
-            )
-        consultant_model = (
-            os.getenv(
-                "DEBILGI_CLOUDFLARE_MODEL",
-                "@cf/meta/llama-3.1-8b-instruct-fast",
-            )
-            if consultant_provider == "cloudflare"
-            else os.getenv(
-                "DEBILGI_SEMANTIC_CONSULTANT_MODEL",
-                "google/gemini-3.5-flash",
-            )
+        consultant_model = os.getenv(
+            "DEBILGI_CLOUDFLARE_MODEL",
+            "@cf/meta/llama-3.1-8b-instruct-fast",
         ).strip()
         if not consultant_model:
-            raise ConfigurationError("DEBILGI_SEMANTIC_CONSULTANT_MODEL cannot be empty")
+            raise ConfigurationError("DEBILGI_CLOUDFLARE_MODEL cannot be empty")
         consultant_account_id = (
             os.getenv("DEBILGI_CLOUDFLARE_ACCOUNT_ID")
             or os.getenv("CLOUDFLARE_ACCOUNT_ID")
@@ -224,11 +208,11 @@ class Settings:
         ).strip() or None
         consultant_instruction_path = _path_from_env(
             "DEBILGI_SEMANTIC_CONSULTANT_INSTRUCTION_PATH",
-            "integrations/puter-sidecar/semantic-instruction.txt",
+            "integrations/semantic-consultant-instruction.txt",
             root,
         )
         consultant_enabled = _bool_from_env("DEBILGI_SEMANTIC_CONSULTANT_ENABLED")
-        if consultant_enabled and consultant_provider == "cloudflare":
+        if consultant_enabled:
             if consultant_account_id is None or consultant_api_token is None:
                 raise ConfigurationError(
                     "Cloudflare semantic consultant requires Account ID and API token"
@@ -246,6 +230,9 @@ class Settings:
             sync_commands=_bool_from_env("DEBILGI_SYNC_COMMANDS"),
             dev_guild_id=dev_guild_id,
             test_replies_enabled=_bool_from_env("DEBILGI_TEST_REPLIES"),
+            productive_only_replies=_bool_from_env(
+                "DEBILGI_PRODUCTIVE_ONLY_REPLIES"
+            ),
             initiative_enabled=_bool_from_env("DEBILGI_INITIATIVE"),
             wikipedia_enabled=_bool_from_env("DEBILGI_WIKIPEDIA_ENABLED"),
             wikipedia_language=wikipedia_language,
@@ -321,8 +308,6 @@ class Settings:
                 "DEBILGI_RESPONSE_PLAN_RETRY_LIMIT", 2
             ),
             semantic_consultant_enabled=consultant_enabled,
-            semantic_consultant_provider=consultant_provider,
-            semantic_consultant_endpoint=consultant_endpoint,
             semantic_consultant_model=consultant_model,
             semantic_consultant_account_id=consultant_account_id,
             semantic_consultant_api_token=consultant_api_token,
@@ -335,9 +320,6 @@ class Settings:
             ),
             semantic_consultant_minimum_confidence=_unit_float_from_env(
                 "DEBILGI_SEMANTIC_CONSULTANT_MINIMUM_CONFIDENCE", 0.58
-            ),
-            semantic_consultant_secret=(
-                os.getenv("DEBILGI_SEMANTIC_CONSULTANT_SECRET", "").strip() or None
             ),
             arbitration_mode=arbitration_mode,
             arbitration_minimum_score=_unit_float_from_env(
@@ -443,12 +425,28 @@ class Settings:
             cognitive_consolidation_batch_size=_positive_int_from_env(
                 "DEBILGI_COGNITIVE_BATCH_SIZE", 100
             ),
+            continuous_cognition_enabled=_bool_from_env(
+                "DEBILGI_CONTINUOUS_COGNITION_ENABLED",
+                True,
+            ),
+            continuous_cognition_active_seconds=_positive_int_from_env(
+                "DEBILGI_CONTINUOUS_COGNITION_ACTIVE_SECONDS",
+                2,
+            ),
+            continuous_cognition_idle_seconds=_positive_int_from_env(
+                "DEBILGI_CONTINUOUS_COGNITION_IDLE_SECONDS",
+                15,
+            ),
+            continuous_cognition_work_per_pulse=_positive_int_from_env(
+                "DEBILGI_CONTINUOUS_COGNITION_WORK_PER_PULSE",
+                8,
+            ),
             raw_text_retention_days=_positive_int_from_env("DEBILGI_RAW_TEXT_RETENTION_DAYS", 30),
         )
 
     def require_discord_token(self) -> str:
         if not self.discord_token:
             raise ConfigurationError(
-                "DISCORD_TOKEN is missing. Copy .env.example to .env and set the token."
+                "DISCORD_TOKEN is missing. Run debilgi-init and set it in .env.local."
             )
         return self.discord_token

@@ -13,6 +13,7 @@ from debilgi.language.productive_nlg import (
     ConceptLexeme,
     SemanticDependency,
 )
+from debilgi.personality.perspective import PersonalityPerspective
 
 _APPRAISAL_DIMENSIONS: tuple[tuple[str, float, frozenset[str]], ...] = (
     (
@@ -113,6 +114,8 @@ class PreferenceAppraisal:
 def appraise_preference(
     topic: str,
     evidence_texts: tuple[str, ...] = (),
+    *,
+    perspective: PersonalityPerspective | None = None,
 ) -> PreferenceAppraisal:
     """Appraise known properties using a small personality value profile.
 
@@ -139,7 +142,38 @@ def appraise_preference(
     for dimension, weight, cues in _APPRAISAL_DIMENSIONS:
         for lemma in evidence_lemmas:
             if lemma in cues:
-                matches.append((weight, dimension, lemma))
+                adjusted = weight
+                if perspective is not None:
+                    drive_name = {
+                        "curiosity": "curiosity",
+                        "expressiveness": "expressiveness",
+                        "usefulness": "coherence",
+                        "harm": "caution",
+                        "coercion": "independence",
+                    }.get(dimension, dimension)
+                    drive = perspective.drive(drive_name)
+                    # Positive criteria become more important when their
+                    # corresponding drive is strong. Negative criteria use
+                    # caution/independence as sensitivity, not a global rule.
+                    adjusted = weight * (0.42 + drive * 0.86)
+                matches.append((adjusted, dimension, lemma))
+    perspective_appraisal = (
+        perspective.appraise((*evidence_lemmas, topic_lemma))
+        if perspective is not None
+        else None
+    )
+    if (
+        perspective_appraisal is not None
+        and perspective_appraisal.dimensions
+        and abs(perspective_appraisal.score) >= 0.12
+    ):
+        matches.append(
+            (
+                perspective_appraisal.score * 0.42,
+                "personal_values",
+                perspective_appraisal.terms[0],
+            )
+        )
     if not matches:
         return PreferenceAppraisal(
             topic_lemma,
@@ -154,6 +188,18 @@ def appraise_preference(
     strongest = max(matches, key=lambda item: abs(item[0]))
     stance = "like" if score >= 0.18 else "dislike" if score <= -0.18 else "undecided"
     confidence = min(0.92, 0.58 + len(matches) * 0.07)
+    appraisal_evidence = tuple(
+        dict.fromkeys(
+            (
+                *(f"appraisal:{dimension}:{lemma}" for _, dimension, lemma in matches),
+                *(
+                    perspective_appraisal.evidence
+                    if perspective_appraisal is not None
+                    else ()
+                ),
+            )
+        )
+    )
     return PreferenceAppraisal(
         topic_lemma,
         stance,
@@ -161,11 +207,7 @@ def appraise_preference(
         confidence,
         strongest[2],
         strongest[1],
-        tuple(
-            dict.fromkeys(
-                (f"appraisal:{dimension}:{lemma}" for _, dimension, lemma in matches)
-            )
-        ),
+        appraisal_evidence,
     )
 
 

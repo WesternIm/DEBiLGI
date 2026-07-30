@@ -14,6 +14,7 @@ from typing import Any
 import aiosqlite
 
 from debilgi.events.models import Event, EventType
+from debilgi.experience.feedback import DEFAULT_FEEDBACK_ATTRIBUTOR
 from debilgi.experience.models import PreparedReply
 from debilgi.language.addressing import DEFAULT_ADDRESSING
 from debilgi.language.content import content_lemmas
@@ -22,15 +23,11 @@ from debilgi.language.lexical_matching import same_lexical_family
 from debilgi.language.semantics import extract_semantic_frames
 from debilgi.language.surface_policy import internal_surface_reason
 from debilgi.language.tokenizer import tokenize
-from debilgi.social.signals import AFFIRMATION, APPROVAL, AVERSION, DISAPPROVAL, REFUSAL
 from debilgi.storage.database import Database
 
 _relation_filter_logger = logging.getLogger("debilgi.relation_filter")
 
 _MENTION_RE = re.compile(r"<@!?\d+>")
-_NEGATIVE_PHRASES = ("не так", "неверно", "неправильно", "не понял", "не поняла", "ошиб")
-_POSITIVE_REACTIONS = frozenset({"👍", "❤️", "🔥", "✅", "💯", "🥰"})
-_NEGATIVE_REACTIONS = frozenset({"👎", "🤮", "💩", "❌"})
 _NO_SPACE_BEFORE = frozenset(",.!?:;)]}»…")
 
 
@@ -145,7 +142,8 @@ class SelfDatasetRepository:
             return
         if event.payload.get("suppress_full_parse") is True:
             return
-        response_message_id = _feedback_target(event)
+        feedback = DEFAULT_FEEDBACK_ATTRIBUTOR.attribute(event)
+        response_message_id = feedback.target_message_id
         if response_message_id is None:
             return
         row = await self._database.fetchone(
@@ -155,14 +153,13 @@ class SelfDatasetRepository:
         )
         if row is None:
             return
-        score, kind = _feedback_signal(event)
-        if score == 0.0:
+        if not feedback.is_learnable():
             return
         await self.record_feedback(
             example_id=str(row["example_id"]),
-            feedback_event_id=event.event_id,
-            kind=kind,
-            score=score,
+            feedback_event_id=feedback.feedback_event_id,
+            kind=feedback.kind,
+            score=feedback.reward,
             observed_at=event.utc_timestamp,
         )
 
@@ -1204,47 +1201,6 @@ async def _upsert_edge(
             now,
         ),
     )
-
-
-def _feedback_target(event: Event) -> int | None:
-    if event.event_type in {EventType.REACTION_ADDED, EventType.REACTION_REMOVED}:
-        value = event.payload.get("message_id")
-    elif event.event_type in {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}:
-        value = event.payload.get("reply_to_message_id")
-    else:
-        return None
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _feedback_signal(event: Event) -> tuple[float, str]:
-    if event.event_type in {EventType.REACTION_ADDED, EventType.REACTION_REMOVED}:
-        emoji = str(event.payload.get("emoji", ""))
-        direction = 1.0 if event.event_type is EventType.REACTION_ADDED else -1.0
-        if emoji in _POSITIVE_REACTIONS:
-            return (
-                0.9 * direction,
-                "positive_reaction" if direction > 0 else "positive_reaction_removed",
-            )
-        if emoji in _NEGATIVE_REACTIONS:
-            return (
-                -0.9 * direction,
-                "negative_reaction" if direction > 0 else "negative_reaction_removed",
-            )
-        return 0.0, "neutral_reaction"
-    content = event.payload.get("content")
-    if not isinstance(content, str):
-        return 0.0, "empty_reply"
-    normalized = content.casefold().replace("ё", "е")
-    words = set(tokenize(normalized))
-    if any(phrase in normalized for phrase in _NEGATIVE_PHRASES) or words & (
-        DISAPPROVAL | AVERSION
-    ):
-        return -0.9, "explicit_correction"
-    if words & (APPROVAL | AFFIRMATION):
-        return 0.8, "explicit_approval"
-    if words & REFUSAL:
-        return -0.55, "refusal"
-    return 0.12, "conversation_continued"
 
 
 def _surface_issue(instruction: str, answer: str) -> str | None:

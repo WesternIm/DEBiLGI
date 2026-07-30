@@ -63,7 +63,7 @@ def prepared(*, initiative: bool = False) -> PreparedReply:
     )
 
 
-async def test_direct_reply_reinforces_used_language_transitions(database: Database) -> None:
+async def test_plain_direct_reply_is_neutral_for_language_transitions(database: Database) -> None:
     repository = ExperienceRepository(database)
     consolidator = ExperienceConsolidator(repository)
     prompt = event("message:1", at=NOW)
@@ -79,10 +79,9 @@ async def test_direct_reply_reinforces_used_language_transitions(database: Datab
     stats = await repository.stats(1)
     adjustments = dict(await repository.transition_adjustments(1))
     assert stats.resolved == 1
-    assert stats.average_reward == pytest.approx(0.90)
+    assert stats.average_reward == pytest.approx(0.0)
     assert stats.learned_transitions == 3
-    assert adjustments[("server", "again")] > 0.0
-    assert adjustments[("server", "again", "broken")] > 0.0
+    assert adjustments == {}
 
 
 async def test_ignored_reply_expires_and_weakens_transitions(database: Database) -> None:
@@ -132,11 +131,11 @@ async def test_negative_reaction_weakens_the_generated_transitions(database: Dat
     stats = await repository.stats(1)
     adjustments = dict(await repository.transition_adjustments(1))
     assert stats.resolved == 1
-    assert stats.average_reward == pytest.approx(-0.65)
+    assert stats.average_reward == pytest.approx(-0.8)
     assert adjustments[("server", "again")] < 0.0
 
 
-async def test_positive_initiative_outcome_updates_self_efficacy(database: Database) -> None:
+async def test_neutral_reply_does_not_claim_initiative_success(database: Database) -> None:
     repository = ExperienceRepository(database)
     consolidator = ExperienceConsolidator(repository)
     prompt = event("message:6", at=NOW)
@@ -152,5 +151,5 @@ async def test_positive_initiative_outcome_updates_self_efficacy(database: Datab
     self_model = await repository.self_model(1)
     assert self_model.utterances_observed == 1
     assert self_model.initiative_attempts == 1
-    assert self_model.initiative_successes == 1
-    assert self_model.efficacy == pytest.approx(0.95)
+    assert self_model.initiative_successes == 0
+    assert self_model.efficacy == pytest.approx(0.5)

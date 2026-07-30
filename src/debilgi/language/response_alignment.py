@@ -16,7 +16,9 @@ from debilgi.language.tokenizer import tokenize
 _FIRST_PERSON = frozenset({"я", "мы"})
 _SECOND_PERSON = frozenset({"ты", "вы"})
 _POLAR_MARKERS = frozenset({"да", "нет", "не", "верно", "неверно"})
-_FOCUS_PARTS = frozenset({"noun", "adjective", "participle", "verb", "predicate"})
+_FOCUS_PARTS = frozenset(
+    {"noun", "adjective", "participle", "verb", "predicate", "number"}
+)
 _FIXED_PRONOUN_FOCUS = frozenset({"себя"})
 
 

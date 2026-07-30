@@ -6,12 +6,38 @@ from debilgi.language.capabilities import (
 from debilgi.language.entities import analyze_entities
 from debilgi.language.lexicon import ConfidenceProfile, WordAnalysis
 from debilgi.language.structured_utterance import analyze_structured_utterance
+from debilgi.personality.expression import PersonalityExpression
+from debilgi.personality.perspective import build_personality_perspective
 
 
 def structure(text: str):
     return analyze_structured_utterance(
         text,
         entity_analysis=analyze_entities(text, {}),
+    )
+
+
+def playful_perspective():
+    return build_personality_perspective(
+        PersonalityExpression(
+            genome_signature="test:playful",
+            chaos=0.7,
+            curiosity=0.7,
+            impulsivity=0.7,
+            expressiveness=0.8,
+            memory_attachment=0.7,
+            novelty_drive=0.8,
+            coherence_drive=0.7,
+            target_tokens=30,
+            candidate_count=40,
+            sociability=0.7,
+            suspicion=0.2,
+            patience=0.3,
+            assertiveness=0.7,
+            warmth=0.7,
+            playfulness=0.8,
+            uncertainty=0.2,
+        )
     )
 
 
@@ -108,6 +134,31 @@ def test_future_tense_action_request_is_not_retrieved_as_an_old_fact() -> None:
     assert assessment.action_lemma == "открыть"
     assert assessment.action_object is not None
     assert realize_capability_assessment(assessment) == ("Я не могу открыть бутылку.")
+
+
+def test_analytical_future_about_reply_becomes_local_commitment() -> None:
+    assessment = assess_capability_question(structure("Будешь отвечать?"))
+
+    assert assessment is not None
+    assert assessment.mode == "commitment"
+    assert assessment.action_lemma == "отвечать"
+    assert realize_capability_assessment(assessment) == "Да, я буду отвечать."
+
+
+def test_direct_desire_is_appraised_by_personality_before_realization() -> None:
+    assessment = assess_capability_question(
+        structure("Ты хочешь побегать?"),
+        perspective=playful_perspective(),
+    )
+
+    assert assessment is not None
+    assert assessment.mode == "personal_desire"
+    assert assessment.supported
+    assert any(
+        item.startswith("desire:drive:playfulness:")
+        for item in assessment.evidence
+    )
+    assert realize_capability_assessment(assessment) == "Да, я хочу побегать."
 
 
 def test_past_bodily_experience_is_not_treated_as_missing_topic_data() -> None:

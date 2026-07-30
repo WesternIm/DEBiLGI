@@ -81,9 +81,9 @@ async def test_outcome_creates_one_reflection_and_strategy_beliefs(database: Dat
     stats = await reflections.stats(1)
     beliefs = await reflections.beliefs(1)
     assert reflection is not None
-    assert reflection.lesson_kind == "better_than_expected"
-    assert reflection.actual_reward == pytest.approx(0.90)
-    assert reflection.prediction_error == pytest.approx(0.90)
+    assert reflection.lesson_kind == "expectation_confirmed"
+    assert reflection.actual_reward == pytest.approx(0.0)
+    assert reflection.prediction_error == pytest.approx(0.0)
     assert "act:question" in reflection.strategies
     assert "search:wide" in reflection.strategies
     assert stats.reflections == 1
@@ -117,7 +117,7 @@ async def test_learned_strategy_reward_becomes_next_prediction(database: Databas
     )
     pending = await experiences.pending_for_response_message(1, 1001)
     assert pending is not None
-    assert pending.expected_reward == pytest.approx(0.90)
+    assert pending.expected_reward == pytest.approx(0.0)
 
     await consolidator.observe(
         event("message:13", at=NOW + timedelta(seconds=8), reply_to=1001)

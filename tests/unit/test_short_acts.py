@@ -8,7 +8,11 @@ from debilgi.events.normalizer import normalize_message_created
 from debilgi.events.repository import EventRepository
 from debilgi.language.context_gate import WorkingMemoryContextGate
 from debilgi.language.discourse import DiscourseMemoryRepository
-from debilgi.language.short_acts import ShortSpeechActService, detect_short_speech_act
+from debilgi.language.short_acts import (
+    ShortActResolution,
+    ShortSpeechActService,
+    detect_short_speech_act,
+)
 from debilgi.storage.database import Database
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +31,10 @@ MIGRATIONS = PROJECT_ROOT / "migrations"
         ("и?", "continue"),
         ("ну и?", "continue"),
         ("дальше", "continue"),
+        ("ну и ну", "surprise_reaction"),
+        ("типа", "hedged_confirmation"),
+        ("типо", "hedged_confirmation"),
+        ("чего?", "repair"),
     ],
 )
 def test_explicit_short_speech_acts_preempt_full_parser(text: str, kind: str) -> None:
@@ -63,6 +71,44 @@ def test_unresolved_short_pronoun_uses_safe_coreference_fallback() -> None:
     assert detection.recognized is False
     assert detection.coreference_to_bot is True
     assert detection.suppress_full_parse is True
+
+
+def test_clarification_request_does_not_become_a_topic_continuation_guess() -> None:
+    detection = detect_short_speech_act("Чего?")
+
+    assert detection is not None
+    assert detection.kind == "repair"
+    assert detection.recognized is True
+
+
+def test_clarification_request_acknowledges_the_previous_reply_was_unclear() -> None:
+    resolution = ShortActResolution(
+        event_id="discord:message:repair",
+        kind="repair",
+        recognized=True,
+        coreference_to_bot=True,
+        target_message_id=99,
+        target_source_id="discord:message:previous",
+        target_content="Глагол — обозначающий стремление к чему-то.",
+        interpretation="request_clarification_of_previous_bot_response",
+    )
+
+    assert resolution.reply_text() == "Я выразился неясно."
+
+
+def test_surprise_reaction_keeps_its_pragmatic_force() -> None:
+    resolution = ShortActResolution(
+        event_id="discord:message:surprise",
+        kind="surprise_reaction",
+        recognized=True,
+        coreference_to_bot=True,
+        target_message_id=98,
+        target_source_id="discord:message:previous",
+        target_content="Неожиданная реплика.",
+        interpretation="surprise_at_previous_bot_response",
+    )
+
+    assert resolution.reply_text() == "Это удивило тебя?"
 
 
 class _ExperienceSpy:

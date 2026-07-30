@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9,<4",
     "aiosqlite>=0.20,<1",
+    "cryptography>=44,<47",
     "discord.py>=2.4,<3",
     "python-dotenv>=1.0,<2",
     "pymorphy3>=2.0,<3",
@@ -25,7 +26,9 @@ dev = [
 
 [project.scripts]
 debilgi = "debilgi.main:main"
+debilgi-init = "debilgi.local_config:main"
 debilgi-replay = "debilgi.simulation:main"
+debilgi-secrets = "debilgi.secret_vault:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -107,3 +107,8 @@ async def test_cloudflare_consultant_marks_quota_error_retryable() -> None:
 
     assert result is None
     assert consultant.last_failure_retryable
+
+    repeated = await consultant.consult(request())
+
+    assert repeated is None
+    assert len(session.calls) == 1

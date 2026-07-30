@@ -1429,6 +1429,16 @@ class LexiconService:
                 "builtin_abbreviation",
                 0.98,
             )
+        if reading is not None and reading.analysis_kind == "numeric_literal":
+            return (
+                reading.lemma,
+                "NUMR",
+                reading.features(),
+                (),
+                ("numeric_literal",),
+                "numeric_literal",
+                0.99,
+            )
         if self._morph is None:
             return None
         if reading is None or (not is_known and reading.corrected_form is None):

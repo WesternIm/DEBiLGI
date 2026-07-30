@@ -32,7 +32,6 @@ from debilgi.language.content import content_lemmas
 logger = logging.getLogger(__name__)
 selection_logger = logging.getLogger("debilgi.knowledge_selection")
 _REFERENCE_MAX_CHARS = 420
-_REFERENCE_MORE_NOTE = " Если нужно подробнее — уточни."
 
 
 class KnowledgeSource(Protocol):
@@ -733,16 +732,16 @@ def concise_reference(definition: str) -> str:
         truncated = True
     if not truncated:
         return selected
-    budget = _REFERENCE_MAX_CHARS - len(_REFERENCE_MORE_NOTE)
+    budget = _REFERENCE_MAX_CHARS - 1
     if len(selected) <= budget:
-        return selected.rstrip() + _REFERENCE_MORE_NOTE
+        return selected.rstrip()
     prefix = selected[:budget].rstrip()
     sentence_end = max(prefix.rfind(mark) for mark in ".!?")
     if sentence_end >= max(40, budget // 3):
         prefix = prefix[: sentence_end + 1]
     elif (word_end := prefix.rfind(" ")) > 0:
         prefix = prefix[:word_end].rstrip(" ,;:—-") + "…"
-    return prefix.rstrip() + _REFERENCE_MORE_NOTE
+    return prefix.rstrip()
 
 
 def _title_matches_query(query: str, title: str) -> bool:

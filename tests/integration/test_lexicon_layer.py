@@ -79,6 +79,20 @@ async def test_common_abbreviation_is_understood_without_unknown_fallback(
     assert dotted.unknown_kind is None
 
 
+async def test_numeric_literal_does_not_pollute_unknown_word_learning(
+    database: Database,
+) -> None:
+    analysis = await LexiconService(database).analyze_word(
+        "2.0",
+        context="Версия 2.0 работает",
+    )
+
+    assert analysis.lemma == "2.0"
+    assert analysis.part_of_speech == "NUMR"
+    assert analysis.source == "numeric_literal"
+    assert analysis.unknown_kind is None
+
+
 async def test_conversation_can_teach_a_new_abbreviation(database: Database) -> None:
     service = LexiconService(database)
     teaching = normalize_message_created(

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from debilgi.language.semantic_reply_plan import ProcessingOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +28,8 @@ class PreparedReply:
     arbitration_decision_id: str | None = None
     winner_candidate_id: str | None = None
     arbitration_weight_version: int = 0
+    semantic_reply_plan_id: str | None = None
+    processing_outcome: ProcessingOutcome | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -42,6 +42,7 @@ SHORT_ACT_PATTERNS: dict[str, frozenset[str]] = {
             "согласна",
         }
     ),
+    "hedged_confirmation": frozenset({"типа", "типо"}),
     "rejection": frozenset(
         {
             "нет",
@@ -78,6 +79,8 @@ SHORT_ACT_PATTERNS: dict[str, frozenset[str]] = {
             "красиво",
         }
     ),
+    "surprise_reaction": frozenset({"ну и ну"}),
+    "repair": frozenset({"чего", "что"}),
 }
 
 _MESSAGE_TYPES = {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}
@@ -154,7 +157,7 @@ class ShortActResolution:
 
 
 def _short_act_thought(resolution: ShortActResolution) -> ClauseThought | None:
-    if resolution.kind == "confirmation":
+    if resolution.kind in {"confirmation", "hedged_confirmation"}:
         return _first_person_statement(
             lemma="понять",
             surface="понял",
@@ -211,6 +214,84 @@ def _short_act_thought(resolution: ShortActResolution) -> ClauseThought | None:
                 grammatical_case="accusative",
             ),
             evidence="acknowledge_reaction",
+        )
+    if resolution.kind == "surprise_reaction":
+        return ClauseThought(
+            predicate=ConceptLexeme(
+                "удивить",
+                "удивило",
+                "verb",
+                (
+                    ("tense", "past"),
+                    ("number", "singular"),
+                    ("gender", "neuter"),
+                ),
+            ),
+            dependencies=(
+                SemanticDependency(
+                    "subject",
+                    ConceptArgument(
+                        ConceptLexeme(
+                            "это",
+                            "это",
+                            "pronoun",
+                            (("case", "nominative"), ("number", "singular")),
+                        )
+                    ),
+                ),
+                SemanticDependency(
+                    "direct_object",
+                    ConceptArgument(
+                        ConceptLexeme(
+                            "ты",
+                            "тебя",
+                            "pronoun",
+                            (("number", "singular"), ("person", "second")),
+                        ),
+                        grammatical_case="accusative",
+                    ),
+                ),
+            ),
+            clause_kind="question",
+            focus_role="direct_object",
+            confidence=0.91,
+            evidence=("surprise_reaction_to_previous_bot_turn",),
+        )
+    if resolution.kind == "repair":
+        return ClauseThought(
+            predicate=ConceptLexeme(
+                "выразиться",
+                "выразился",
+                "verb",
+                (
+                    ("tense", "past"),
+                    ("number", "singular"),
+                    ("gender", "masculine"),
+                ),
+            ),
+            dependencies=(
+                SemanticDependency(
+                    "subject",
+                    ConceptArgument(
+                        ConceptLexeme(
+                            "я",
+                            "я",
+                            "pronoun",
+                            (
+                                ("case", "nominative"),
+                                ("number", "singular"),
+                                ("person", "first"),
+                            ),
+                        )
+                    ),
+                ),
+                SemanticDependency(
+                    "manner",
+                    ConceptArgument(ConceptLexeme("неясно", "неясно", "adverb")),
+                ),
+            ),
+            confidence=0.90,
+            evidence=("request_to_clarify_previous_bot_turn",),
         )
     if resolution.coreference_to_bot and resolution.target_message_id is not None:
         return ClauseThought(
@@ -390,8 +471,11 @@ def detect_short_speech_act(text: str, *, maximum_words: int = 3) -> ShortActDet
         if key in patterns:
             coreference = bool(set(words) & _PRONOUN_REFERENCES) or kind in {
                 "confirmation",
+                "hedged_confirmation",
                 "rejection",
                 "continue",
+                "repair",
+                "surprise_reaction",
             }
             return ShortActDetection(
                 kind=kind,
@@ -595,9 +679,12 @@ def _has_concrete_noun(words: tuple[str, ...]) -> bool:
 def _interpretation(kind: str) -> str:
     return {
         "confirmation": "accepted_previous_bot_response",
+        "hedged_confirmation": "tentatively_accepted_previous_bot_response",
         "rejection": "rejected_previous_bot_response",
         "continue": "continue_previous_bot_response",
         "reaction": "reaction_to_previous_bot_response",
+        "surprise_reaction": "surprise_at_previous_bot_response",
+        "repair": "request_clarification_of_previous_bot_response",
     }[kind]
 
 

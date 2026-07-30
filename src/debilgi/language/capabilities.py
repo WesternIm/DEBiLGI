@@ -22,6 +22,7 @@ from debilgi.language.structured_utterance import (
     analyze_structured_utterance,
 )
 from debilgi.language.tokenizer import tokenize
+from debilgi.personality.perspective import PersonalityPerspective
 
 _CAPABILITY_PREDICATES = frozenset({"мочь", "уметь"})
 _COMPUTATIONAL_ACTIONS = frozenset(
@@ -65,6 +66,15 @@ _COMPUTATIONAL_ACTIONS = frozenset(
         "строить",
         "учиться",
         "читать",
+    }
+)
+_CONVERSATIONAL_COMMITMENTS = frozenset(
+    {
+        "отвечать",
+        "ответить",
+        "обсуждать",
+        "продолжать",
+        "продолжить",
     }
 )
 _UNASSISTED_HUMAN_LIMITS = frozenset({"летать"})
@@ -111,6 +121,7 @@ _ABSTRACT_INTERNAL_OBJECTS = frozenset(
 _EXTERNAL_ACTIONS = frozenset(
     {
         "бежать",
+        "бегать",
         "бить",
         "брать",
         "взять",
@@ -127,6 +138,7 @@ _EXTERNAL_ACTIONS = frozenset(
         "открыть",
         "пить",
         "плыть",
+        "побегать",
         "поиграть",
         "поднять",
         "положить",
@@ -205,6 +217,7 @@ class CapabilityAssessment:
     subject_number: str | None = None
     mode: str = "capability"
     action_object: ConceptArgument | None = None
+    evidence: tuple[str, ...] = ()
 
     @property
     def patterns(self) -> tuple[DependencyPattern, ...]:
@@ -289,7 +302,7 @@ class CapabilityAssessment:
                 confidence=self.confidence,
                 evidence=(self.reason,),
             )
-        if self.mode == "hypothetical_desire":
+        if self.mode in {"hypothetical_desire", "personal_desire"}:
             dependencies = [
                 SemanticDependency("subject", subject),
                 SemanticDependency(
@@ -311,10 +324,33 @@ class CapabilityAssessment:
                     ),
                 ),
                 dependencies=tuple(dependencies),
+                negated=not self.supported,
+                response_polarity=self.supported,
+                confidence=self.confidence,
+                evidence=(self.reason, *self.evidence),
+                predicate_class="modal",
+            )
+        if self.mode == "commitment":
+            dependencies = [SemanticDependency("subject", subject)]
+            if self.action_object is not None:
+                dependencies.append(
+                    SemanticDependency("direct_object", self.action_object)
+                )
+            return ClauseThought(
+                predicate=ConceptLexeme(
+                    self.action_lemma,
+                    self.action_lemma,
+                    "verb",
+                    (
+                        ("tense", "future"),
+                        ("number", "singular"),
+                        ("person", "first"),
+                    ),
+                ),
+                dependencies=tuple(dependencies),
                 response_polarity=True,
                 confidence=self.confidence,
                 evidence=(self.reason,),
-                predicate_class="modal",
             )
         predicate_lemma = (
             "мочь"
@@ -363,6 +399,7 @@ def assess_capability_question(
     context_messages: tuple[str, ...] = (),
     knowledge_facts: Sequence[str] = (),
     study_completed: bool = False,
+    perspective: PersonalityPerspective | None = None,
 ) -> CapabilityAssessment | None:
     """Ground self-directed capability, experience and external-action requests."""
 
@@ -437,6 +474,69 @@ def assess_capability_question(
                     "singular",
                     "hypothetical_desire",
                     action_object or context_object or _context_action_object(context_messages),
+                )
+        if (
+            addressed_bot
+            and frame.clause_kind == "question"
+            and predicate.lemma == "хотеть"
+        ):
+            action = next(
+                (
+                    structure.tokens[index]
+                    for index in frame.action_complement_indices
+                    if structure.tokens[index].part_of_speech == "verb"
+                ),
+                None,
+            )
+            desire = (
+                _appraise_personal_desire(action.lemma, perspective)
+                if action is not None
+                else None
+            )
+            if action is not None and desire is not None:
+                desired, desire_confidence, desire_evidence = desire
+                return CapabilityAssessment(
+                    "ты",
+                    "ты",
+                    "bot",
+                    action.lemma,
+                    desired,
+                    "personality_appraised_desire",
+                    desire_confidence,
+                    "singular",
+                    "personal_desire",
+                    action_object,
+                    desire_evidence,
+                )
+        if (
+            addressed_bot
+            and frame.clause_kind == "question"
+            and predicate.lemma == "быть"
+            and dict(predicate.grammatical_features).get("tense") == "future"
+        ):
+            action = next(
+                (
+                    structure.tokens[index]
+                    for index in frame.action_complement_indices
+                    if structure.tokens[index].part_of_speech == "verb"
+                ),
+                None,
+            )
+            if (
+                action is not None
+                and action.lemma in _CONVERSATIONAL_COMMITMENTS
+            ):
+                return CapabilityAssessment(
+                    "ты",
+                    "ты",
+                    "bot",
+                    action.lemma,
+                    True,
+                    "active_conversation_commitment",
+                    0.96,
+                    "singular",
+                    "commitment",
+                    _action_object(structure, frame, subject.index if subject else None),
                 )
         requires_external_agency = (
             action_requires_external_agency(predicate.lemma)
@@ -666,6 +766,80 @@ def action_requires_external_agency(action_lemma: str) -> bool:
     """Separate internal language work from bodily or world-changing actions."""
 
     return action_lemma.casefold() in _EXTERNAL_ACTIONS if action_lemma else False
+
+
+def action_requires_personal_world_history(action_lemma: str) -> bool:
+    """Return whether an action needs embodiment or an external account history."""
+
+    normalized = action_lemma.casefold()
+    return normalized in (
+        _EXTERNAL_ACTIONS
+        | _OBJECT_SENSITIVE_EXTERNAL_ACTIONS
+        | _RESOURCE_USE_ACTIONS
+    )
+
+
+def _appraise_personal_desire(
+    action_lemma: str,
+    perspective: PersonalityPerspective | None,
+) -> tuple[bool, float, tuple[str, ...]] | None:
+    """Turn current drives into a revisable desire, before wording exists."""
+
+    if perspective is None:
+        return None
+    if action_requires_external_agency(action_lemma):
+        domain = "embodied_activity"
+        drive_weights = (
+            ("playfulness", 0.34),
+            ("exploration", 0.30),
+            ("novelty", 0.20),
+            ("arousal", 0.16),
+        )
+    elif action_lemma in _COMPUTATIONAL_ACTIONS:
+        domain = "cognitive_activity"
+        drive_weights = (
+            ("curiosity", 0.34),
+            ("exploration", 0.28),
+            ("coherence", 0.22),
+            ("novelty", 0.16),
+        )
+    else:
+        domain = "unclassified_activity"
+        drive_weights = (
+            ("curiosity", 0.30),
+            ("exploration", 0.28),
+            ("novelty", 0.24),
+            ("playfulness", 0.18),
+        )
+    drive_score = sum(
+        perspective.drive(name) * weight
+        for name, weight in drive_weights
+    )
+    score = max(
+        -1.0,
+        min(1.0, drive_score - 0.50 - perspective.drive("caution") * 0.12),
+    )
+    desired = score >= 0.0
+    confidence = min(
+        0.90,
+        0.60 + abs(score) * 0.72 + perspective.confidence * 0.12,
+    )
+    evidence = tuple(
+        dict.fromkeys(
+            (
+                f"desire:action:{action_lemma}",
+                f"desire:domain:{domain}",
+                *(
+                    f"desire:drive:{name}:{perspective.drive(name):.3f}"
+                    for name, _ in drive_weights
+                ),
+                f"desire:caution:{perspective.drive('caution'):.3f}",
+                f"desire:score:{score:+.3f}",
+                *perspective.evidence,
+            )
+        )
+    )
+    return desired, confidence, evidence
 
 
 def _object_sensitive_external_action(

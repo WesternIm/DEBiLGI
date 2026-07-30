@@ -71,7 +71,8 @@ def test_reference_dump_is_limited_to_two_sentences_with_a_more_note() -> None:
 
     assert result.startswith("Первое определение. Второе полезное уточнение.")
     assert "Третья" not in result
-    assert result.endswith("Если нужно подробнее — уточни.")
+    assert "Если нужно подробнее" not in result
+    assert len(result) <= 420
     assert len(result) <= 420
 
 

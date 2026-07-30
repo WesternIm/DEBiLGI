@@ -263,6 +263,17 @@ def assess_predicate_valency(
         for slot in profile.slots
         if slot.required_in_isolated_fact and slot.role not in available
     )
+    if (
+        normalized == "хотеть"
+        and "action_complement" in available
+        and "direct_object" in missing
+    ):
+        # ``Хотеть`` selects either a nominal object (``хочу чай``) or an
+        # infinitival action (``хочу побегать``). The infinitive fills the
+        # semantic object slot instead of requiring a second accusative noun.
+        missing = tuple(
+            role for role in missing if role != "direct_object"
+        )
     # Complements outside a lexical profile are still legal adjuncts.  Only
     # core object roles are useful as an anomaly signal here.
     unexpected = tuple(
