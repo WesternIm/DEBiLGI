@@ -1,4 +1,5 @@
 from debilgi.language.capabilities import (
+    action_requires_external_agency,
     assess_capability_question,
     capability_study_terms,
     realize_capability_assessment,
@@ -124,6 +125,31 @@ def test_external_directive_is_grounded_in_agent_boundary() -> None:
     assert assessment is not None
     assert assessment.mode == "directive"
     assert realize_capability_assessment(assessment) == ("Я не могу выкинуть штурвал.")
+
+
+def test_motion_directive_uses_the_same_agent_boundary() -> None:
+    assessment = assess_capability_question(structure("Лети отсюда"))
+
+    assert assessment is not None
+    assert assessment.mode == "directive"
+    assert assessment.action_lemma == "лететь"
+    assert realize_capability_assessment(assessment) == ("Я не могу лететь.")
+
+
+def test_prefixed_motion_verbs_share_an_external_action_family() -> None:
+    assert all(
+        action_requires_external_agency(action)
+        for action in ("бегать", "сбегать", "прибежать", "понабегать")
+    )
+    assert not action_requires_external_agency("проанализировать")
+
+    assessment = assess_capability_question(structure("Сбегай за сушняком"))
+
+    assert assessment is not None
+    assert assessment.mode == "directive"
+    assert realize_capability_assessment(assessment) == (
+        "Я не могу сбегать за сушняком."
+    )
 
 
 def test_future_tense_action_request_is_not_retrieved_as_an_old_fact() -> None:

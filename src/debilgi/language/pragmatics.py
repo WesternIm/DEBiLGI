@@ -296,6 +296,8 @@ def _expressive_cue(
             return PragmaticCue(word, "particle", "emphatic_affirmation", 0.92, 0.78)
         if canonical in {"нет", "не"}:
             return PragmaticCue(word, "particle", "emphatic_rejection", 0.92, 0.82)
+    if re.fullmatch(r"ау+", word):
+        return PragmaticCue(word, "interjection", "attention_call", 0.92, 0.74)
     if re.fullmatch(r"хм+", word):
         return PragmaticCue(word, "interjection", "hesitation", 0.86, 0.68)
     if _LAUGHTER_RE.fullmatch(word):

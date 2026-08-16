@@ -99,6 +99,8 @@ def reason_about_contextual_question(
     antecedent_structure = (
         analyze_structured_utterance(antecedent) if antecedent is not None else None
     )
+    if _colloquial_cause_follow_up(structure, antecedent_structure):
+        question_markers = frozenset((*question_markers, "почему"))
     target_terms = tuple(content_lemmas(antecedent))[-3:] if antecedent else ()
 
     if _asks_about_current_conversational_intent(structure):
@@ -1304,6 +1306,35 @@ def _question_markers(structure: StructuredUtterance) -> frozenset[str]:
     if markers & {"какой", "что"} and lemmas & {"цель", "смысл"}:
         markers.add("зачем")
     return frozenset(markers)
+
+
+def _colloquial_cause_follow_up(
+    current: StructuredUtterance,
+    antecedent: StructuredUtterance | None,
+) -> bool:
+    """Resolve colloquial ``чего не ...`` as why only when context disambiguates it."""
+
+    if antecedent is None:
+        return False
+    has_colloquial_marker = any(
+        token.surface.casefold().replace("ё", "е") == "чего"
+        for token in current.tokens
+    )
+    current_negated = "не" in _all_lemmas(current) or any(
+        clause.negated for clause in current.clauses
+    )
+    if not has_colloquial_marker or not current_negated:
+        return False
+    current_predicate = _main_predicate(current)
+    antecedent_predicate = _main_predicate(antecedent)
+    if current_predicate is None or antecedent_predicate is None:
+        return False
+    if current_predicate == antecedent_predicate:
+        return True
+    return bool(
+        current_predicate in {"мочь", "уметь"}
+        and _antecedent_denies_external_action(antecedent)
+    )
 
 
 def _all_lemmas(structure: StructuredUtterance) -> frozenset[str]:

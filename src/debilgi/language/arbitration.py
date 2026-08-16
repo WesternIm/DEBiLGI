@@ -256,6 +256,7 @@ DEFAULT_SOURCE_BIASES: Mapping[str, float] = MappingProxyType(
         "dialogue_context": 0.24,
         "personal_action": 0.30,
         "semantic_reasoning": 0.23,
+        "semantic_recovery": 0.04,
         "semantic_inquiry": 0.31,
         "abstract_reasoning": 0.32,
         "relation_reasoning": 0.28,

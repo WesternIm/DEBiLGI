@@ -163,7 +163,8 @@ def understand_utterance(
         1.0,
         known_ratio * 0.58 + relation_score * 0.27 + context_score * 0.15,
     )
-    sufficient = (
+    has_semantic_evidence = bool(known_terms or relations or context_links)
+    sufficient = has_semantic_evidence and comprehension_score >= 0.25 and (
         not unknown_terms
         or (
             bool(known_terms)

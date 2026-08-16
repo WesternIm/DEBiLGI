@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from debilgi.events.models import Event, EventType
+from debilgi.language.repair_signals import signals_prior_answer_correction
 from debilgi.language.tokenizer import tokenize
 from debilgi.social.signals import AFFIRMATION, APPROVAL, AVERSION, DISAPPROVAL, REFUSAL
 
@@ -71,6 +72,15 @@ class FeedbackAttributor:
                 "explicit_rejection",
                 -1.0,
                 0.95,
+                True,
+            )
+        if target is not None and signals_prior_answer_correction(content):
+            return AttributedFeedback(
+                event.event_id,
+                target,
+                "contextual_correction",
+                -0.85,
+                0.86,
                 True,
             )
         if words & (APPROVAL | AFFIRMATION):

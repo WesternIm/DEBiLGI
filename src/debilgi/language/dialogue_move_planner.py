@@ -74,6 +74,7 @@ class DialogueMovePlan:
     stance: str
     evidence: tuple[str, ...]
     key_points: tuple[str, ...] = ()
+    semantic_origin: str = "scaffold"
 
 
 def plan_dialogue_moves(
@@ -225,6 +226,7 @@ def _self_reflection_moves(
             stance="direct",
             evidence=evidence,
             key_points=("контекст",),
+            semantic_origin="derived",
         ),
     )
 
@@ -282,6 +284,7 @@ def _self_role_moves(
                 stance=stance,
                 evidence=evidence,
                 key_points=(target.head.lemma,),
+                semantic_origin="derived",
             )
         )
         plans.append(
@@ -298,6 +301,7 @@ def _self_role_moves(
                 stance=stance,
                 evidence=evidence,
                 key_points=(target.head.lemma, "оценка"),
+                semantic_origin="derived",
             )
         )
     else:
@@ -318,6 +322,7 @@ def _self_role_moves(
                     stance=stance,
                     evidence=evidence,
                     key_points=(target.head.lemma, "оценка"),
+                    semantic_origin="derived",
                 ),
                 DialogueMovePlan(
                     move="request_basis",
@@ -330,6 +335,7 @@ def _self_role_moves(
                     stance=stance,
                     evidence=evidence,
                     key_points=(target.head.lemma,),
+                    semantic_origin="derived",
                 ),
             )
         )
@@ -489,6 +495,7 @@ def _nominal_relation_moves(
             stance="engage",
             evidence=evidence,
             key_points=(subject_token.lemma, object_token.lemma),
+            semantic_origin="derived",
         ),
         DialogueMovePlan(
             move="inspect_relation",
@@ -517,6 +524,7 @@ def _nominal_relation_moves(
             stance="curious",
             evidence=evidence,
             key_points=(subject_token.lemma, object_token.lemma),
+            semantic_origin="derived",
         ),
     )
 
@@ -591,6 +599,11 @@ def _social_moves(
         ),
     }
     plans: list[DialogueMovePlan] = []
+    derived_obligation = obligation in {
+        "acknowledge_attention",
+        "acknowledge_understanding",
+        "acknowledge_evaluation",
+    }
     for index, (move, strategy, thought) in enumerate(specifications.get(obligation, ())):
         reaction_fit = 0.0
         if reaction is not None:
@@ -616,6 +629,7 @@ def _social_moves(
                 stance=intention.stance_mode if intention is not None else "engage",
                 evidence=evidence,
                 key_points=frame.objects[:2],
+                semantic_origin="derived" if derived_obligation else "scaffold",
             )
         )
     return tuple(plans)

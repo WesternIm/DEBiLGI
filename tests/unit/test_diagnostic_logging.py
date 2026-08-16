@@ -23,6 +23,7 @@ def test_separate_diagnostic_log_files_are_created(tmp_path: Path) -> None:
         "debilgi.meaning_plan": "meaning-plan.log",
         "debilgi.dialogue_state": "dialogue-state.log",
         "debilgi.response_trace": "response-trace.log",
+        "debilgi.learning_quality": "learning-quality.log",
     }
     try:
         for logger_name in names:

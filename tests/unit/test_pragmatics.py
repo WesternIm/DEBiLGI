@@ -28,9 +28,11 @@ def test_interjections_and_discourse_markers_are_not_topic_content() -> None:
 def test_stretched_chat_interjections_keep_their_pragmatic_function() -> None:
     hesitation = analyze_pragmatics("Хмм")
     laughter = analyze_pragmatics("Хехехех")
+    attention = analyze_pragmatics("ауу")
 
     assert "hesitation" in hesitation.functions
     assert "amusement" in laughter.functions
+    assert "attention_call" in attention.functions
 
 
 def test_laughter_with_leading_vowel_and_chat_emotions_are_pragmatic() -> None:

@@ -131,6 +131,23 @@ def test_reason_follow_up_uses_embodiment_instead_of_generic_evidence_gap() -> N
     assert realize_thought(resolution.thought)[0].text == "У меня нет тела."
 
 
+def test_colloquial_chego_is_a_cause_only_when_previous_answer_disambiguates_it() -> None:
+    resolution = reason_about_contextual_question(
+        analyze_structured_utterance("А чего не можешь то а?"),
+        ("Я не могу лететь.",),
+    )
+
+    assert resolution is not None
+    assert resolution.kind == "embodiment_cause"
+    assert realize_thought(resolution.thought)[0].text == "У меня нет тела."
+
+    independent = reason_about_contextual_question(
+        analyze_structured_utterance("Чего не можешь найти?"),
+        ("Мы обсуждали ключ.",),
+    )
+    assert independent is None
+
+
 def test_reason_follow_up_to_self_position_stays_in_the_conversation() -> None:
     resolution = reason_about_contextual_question(
         analyze_structured_utterance("А почему так?"),

@@ -282,6 +282,13 @@ def test_elliptical_follow_up_keeps_the_previous_answer_as_its_target() -> None:
     assert act.response_obligation == "repair_previous_answer"
 
 
+def test_prior_claim_correction_requires_repair_instead_of_topic_continuation() -> None:
+    act = _act("Ты сказал делал")
+
+    assert act.kind == "prior_answer_correction"
+    assert act.response_obligation == "repair_previous_answer"
+
+
 def test_explicit_opinion_request_creates_a_position_obligation() -> None:
     act = _act("Бобун лох или нет? Да или нет? Как думаешь?")
 

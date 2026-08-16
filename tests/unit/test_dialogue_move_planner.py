@@ -38,6 +38,7 @@ def test_expressive_fragment_produces_competing_non_lexical_moves() -> None:
     }
     assert "Что ты подразумеваешь под ебануться?" not in surfaces
     assert all(surface.endswith("?") for surface in surfaces)
+    assert {plan.semantic_origin for plan in plans} == {"scaffold"}
 
 
 def test_self_label_stance_changes_with_dialogue_markers() -> None:
@@ -68,6 +69,7 @@ def test_known_nominal_relation_is_digested_instead_of_defined() -> None:
     }
     assert "Я представляю островок на башке." in surfaces
     assert all("подразумева" not in surface.casefold() for surface in surfaces)
+    assert {plan.semantic_origin for plan in plans} == {"derived"}
 
 
 def test_complete_statement_continues_its_content_instead_of_dialogue_meta_talk() -> None:
@@ -85,6 +87,7 @@ def test_complete_statement_continues_its_content_instead_of_dialogue_meta_talk(
     assert "Что ты планируешь на четверг?" in surfaces
     assert all("продолжаю мысль" not in surface.casefold() for surface in surfaces)
     assert all("держу тему" not in surface.casefold() for surface in surfaces)
+    assert {plan.semantic_origin for plan in plans} == {"scaffold"}
 
 
 def test_non_temporal_statement_uses_its_salient_concept() -> None:
@@ -126,3 +129,11 @@ def test_underspecified_self_reflection_question_describes_active_process() -> N
         "ground_self_reflection_in_active_process"
     }
     assert surfaces == {"Я анализирую контекст."}
+    assert {plan.semantic_origin for plan in plans} == {"derived"}
+
+
+def test_attention_call_is_a_grounded_local_acknowledgement() -> None:
+    plans = _plans("ауу")
+
+    assert {plan.strategy for plan in plans} == {"active_listening", "hold_attention"}
+    assert {plan.semantic_origin for plan in plans} == {"derived"}

@@ -39,6 +39,7 @@ from debilgi.language.arbitration_repository import ArbitrationRepository
 from debilgi.language.archive_repository import ArchiveRepository
 from debilgi.language.autonomous_response import realize_autonomous_responses
 from debilgi.language.capabilities import (
+    action_requires_external_agency,
     assess_capability_question,
     capability_study_terms,
 )
@@ -224,6 +225,11 @@ _QUOTATION_REQUEST_RE = re.compile(
 )
 _BARE_STANCE_ANSWERS = frozenset({"да", "нет", "сейчас будет", "не хочу"})
 _BROKEN_OPENING_WORDS = frozenset({"ответа", "значит", "контекста", "смысла", "темы"})
+_QUESTION_OBJECTION_RE = re.compile(
+    r"\b(?:специально\s+зада\w*\s+вопрос\w*|хватит\s+зада\w*\s+вопрос\w*|"
+    r"не\s+зада\w*\s+вопрос\w*|зачем\s+(?:ты\s+)?(?:мне\s+)?зада\w*\s+вопрос\w*)\b",
+    re.IGNORECASE,
+)
 _DIRECT_MEMORY_SURFACE_SOURCES = frozenset(
     {"grounded_surface", "knowledge_retrieval", "lexical_reference", "meaning_plan"}
 )
@@ -388,6 +394,109 @@ def _latest_user_consultation_prompt(
         if separator and role.casefold() == "user" and content.strip():
             return content.strip()
     return None
+
+
+def _previous_answer_grounding(
+    consultation_messages: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    """Compile the latest agent surface back into reusable proposition facts."""
+
+    previous = next(
+        (
+            content.strip()
+            for message in reversed(consultation_messages)
+            if (parts := message.partition(": "))[1]
+            if parts[0].casefold() == "agent"
+            if (content := parts[2]).strip()
+        ),
+        None,
+    )
+    if previous is None:
+        return ()
+    structure = analyze_structured_utterance(previous)
+    clause = max(structure.clauses, key=lambda item: item.confidence, default=None)
+    if clause is None or clause.predicate_index is None:
+        return ()
+    predicate = structure.tokens[clause.predicate_index]
+    action = (
+        structure.tokens[clause.action_complement_indices[0]]
+        if clause.action_complement_indices
+        else None
+    )
+    direct_object = (
+        structure.tokens[clause.direct_object_indices[0]]
+        if clause.direct_object_indices
+        else None
+    )
+    negated = clause.negated or any(
+        token.lemma == "не"
+        for token in structure.tokens[clause.token_start : clause.token_end]
+    )
+    features = dict(predicate.grammatical_features)
+    statement = (
+        f"predicate={predicate.lemma};subject=agent;"
+        + (f"action_complement={action.lemma};" if action is not None else "")
+        + (f"direct_object={direct_object.lemma};" if direct_object is not None else "")
+        + (f"tense={features['tense']};" if features.get("tense") else "")
+        + f"truth={str(not negated).lower()}. Предыдущий ответ агента: {previous}"
+    )
+    facts = [("previous_answer.statement", statement)]
+    if negated and action is not None and action_requires_external_agency(action.lemma):
+        facts.append(
+            (
+                "previous_answer.capability_boundary",
+                "predicate=иметь;subject=agent;direct_object=тело;"
+                "tense=present;truth=false. Отказ связан с отсутствием физического тела.",
+            )
+        )
+    return tuple(facts)
+
+
+def _generation_failure_thought() -> ClauseThought:
+    """Represent total generation failure as semantics, never as a canned question."""
+
+    return ClauseThought(
+        predicate=ConceptLexeme(
+            "мочь",
+            "могу",
+            "verb",
+            (("tense", "present"), ("number", "singular"), ("person", "first")),
+        ),
+        dependencies=(
+            SemanticDependency(
+                "subject",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "я",
+                        "я",
+                        "pronoun",
+                        (("number", "singular"), ("person", "first")),
+                    )
+                ),
+            ),
+            SemanticDependency(
+                "action_complement",
+                ConceptArgument(ConceptLexeme("сформулировать", "сформулировать", "verb")),
+            ),
+            SemanticDependency(
+                "direct_object",
+                ConceptArgument(
+                    ConceptLexeme(
+                        "ответ",
+                        "ответ",
+                        "noun",
+                        (("case", "accusative"), ("number", "singular")),
+                    ),
+                    modifiers=(ConceptLexeme("связный", "связный", "adjective"),),
+                    grammatical_case="accusative",
+                ),
+            ),
+        ),
+        negated=True,
+        confidence=0.86,
+        evidence=("all_semantic_routes_exhausted", "no_valid_surface"),
+        predicate_class="modal",
+    )
 
 
 def _looks_like_lexical_definition(text: str) -> bool:
@@ -2317,6 +2426,7 @@ class SafeMentionReplyService:
                 source in _AUTONOMOUS_LOCAL_PRODUCTIVE_SOURCES
                 and candidate_metadata.get("authored_reply_template") is False
                 and candidate_metadata.get("role_order")
+                and candidate_metadata.get("semantic_scaffold") is not True
             )
             if (
                 self._autonomous_planning_required
@@ -2357,6 +2467,18 @@ class SafeMentionReplyService:
                 }
                 if not alignment.allowed:
                     candidate_metadata["hard_rejection"] = ",".join(alignment.reasons)
+            if self._autonomous_planning_required:
+                question_issue = self._question_response_issue(
+                    text,
+                    response_obligation=(
+                        dialogue_act.response_obligation if dialogue_act is not None else None
+                    ),
+                    dialogue_messages=utterance.context.dialogue_messages,
+                    recent_self_replies=recent_self_replies,
+                    metadata=candidate_metadata,
+                )
+                if question_issue is not None:
+                    candidate_metadata["hard_rejection"] = question_issue
             issue = self._surface_quality_issue(
                 text,
                 prompt=prompt,
@@ -3109,6 +3231,8 @@ class SafeMentionReplyService:
                         "role_order": move_surface.role_order,
                         "construction_id": move_surface.construction_id,
                         "authored_reply_template": False,
+                        "semantic_origin": move_plan.semantic_origin,
+                        "semantic_scaffold": move_plan.semantic_origin != "derived",
                         "completed_subgoals": (
                             (dialogue_act.response_obligation,) if dialogue_act is not None else ()
                         ),
@@ -3437,6 +3561,7 @@ class SafeMentionReplyService:
             and candidate.source_confidence >= local_productive_threshold
             and candidate.metadata.get("authored_reply_template") is False
             and candidate.metadata.get("role_order")
+            and candidate.metadata.get("semantic_scaffold") is not True
             and not candidate.metadata.get("hard_rejection")
             for candidate in candidates
         )
@@ -3973,6 +4098,9 @@ class SafeMentionReplyService:
             )
             for fact in relevant_grounding_facts[:16]
         )
+        autonomous_grounding.extend(
+            _previous_answer_grounding(utterance.context.consultation_messages)
+        )
         autonomous_grounding.append(
             (
                 "personality.current",
@@ -4311,7 +4439,9 @@ class SafeMentionReplyService:
                         source_confidence=0.45,
                     )
                 )
-            fallback_decision = ResponseArbitrator(minimum_score=-100.0).decide(
+            fallback_decision = ResponseArbitrator(
+                minimum_score=self._arbitrator.minimum_score
+            ).decide(
                 event_id=event.event_id,
                 prompt=prompt,
                 focus_concepts=focus_concepts,
@@ -4321,6 +4451,54 @@ class SafeMentionReplyService:
                 structural_weights=structural_weights,
                 used_fallback=True,
             )
+            if fallback_decision.winner is None and self._autonomous_planning_required:
+                semantic_recovery_attempt = fallback_decision
+                generation_failure_candidates = tuple(
+                    ResponseCandidate.create(
+                        event_id=event.event_id,
+                        source="semantic_recovery",
+                        renderer=f"generation_failure_state:{surface.source}:{surface_index}",
+                        text=surface.text,
+                        speech_act=utterance.speech_act,
+                        source_confidence=min(0.86, surface.confidence),
+                        metadata={
+                            "semantic_recovery": True,
+                            "gap_kind": "generation_failure",
+                            "reasoning_evidence": (
+                                "all_semantic_routes_exhausted",
+                                "no_valid_surface",
+                            ),
+                            "truth_grounding": 1.0,
+                            "semantic_frame_fit": 0.92,
+                            "role_order": surface.role_order,
+                            "construction_id": surface.construction_id,
+                            "authored_reply_template": False,
+                        },
+                    )
+                    for surface_index, surface in enumerate(
+                        realize_thought(
+                            _generation_failure_thought(),
+                            utterance.context.dependency_patterns,
+                            limit=3,
+                        )
+                    )
+                )
+                fallback_decision = merge_recovery_decision(
+                    semantic_recovery_attempt,
+                    ResponseArbitrator(
+                        minimum_score=self._arbitrator.minimum_score
+                    ).decide(
+                        event_id=event.event_id,
+                        prompt=prompt,
+                        focus_concepts=focus_concepts,
+                        candidates=generation_failure_candidates,
+                        recent_replies=recent_self_replies,
+                        profile=profile,
+                        structural_weights=structural_weights,
+                        used_fallback=True,
+                    ),
+                    selection_reason="generation_failure_state_after_recovery",
+                )
             decision = merge_recovery_decision(decision, fallback_decision)
         decision = replace(decision, latency_ms=(perf_counter() - started) * 1000.0)
         await self._trace_step(
@@ -4450,6 +4628,39 @@ class SafeMentionReplyService:
             if isinstance((content := item.payload.get("content")), str)
             if content.strip()
         )[-6:]
+
+    @staticmethod
+    def _question_response_issue(
+        text: str,
+        *,
+        response_obligation: str | None,
+        dialogue_messages: tuple[str, ...],
+        recent_self_replies: tuple[str, ...],
+        metadata: dict[str, object],
+    ) -> str | None:
+        """Reject question-shaped evasions when the turn requires an answer or repair."""
+
+        if not text.rstrip().endswith("?"):
+            return None
+        response_move = metadata.get("response_move")
+        genuine_clarification = bool(
+            metadata.get("unresolved_reference")
+            or response_move in {"clarify_reference", "clarify_intended_meaning"}
+        )
+        if response_obligation in {
+            "answer_question",
+            "repair_previous_answer",
+            "repair_understanding",
+            "address_negative_evaluation",
+            "resolve_relation",
+            "resolve_self_state",
+        } and not genuine_clarification:
+            return "question_does_not_fulfill_answer_or_repair"
+        if any(_QUESTION_OBJECTION_RE.search(message) for message in dialogue_messages[-8:]):
+            return "question_loop_after_user_objection"
+        if recent_self_replies and recent_self_replies[-1].rstrip().endswith("?"):
+            return "consecutive_bot_question"
+        return None
 
     @staticmethod
     def _surface_quality_issue(

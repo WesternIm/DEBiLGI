@@ -16,6 +16,7 @@ from debilgi.language.productive_nlg import (
 )
 from debilgi.language.question_reasoning import SemanticQuestionFrame
 from debilgi.language.relation_reasoning import RelationQuestionFrame
+from debilgi.language.repair_signals import signals_prior_answer_correction
 from debilgi.language.self_state_reasoning import SelfStateFrame
 from debilgi.language.structured_utterance import StructuredUtterance
 from debilgi.language.tokenizer import tokenize
@@ -204,6 +205,19 @@ def analyze_dialogue_act(
             complete=True,
             confidence=max(0.86, structure.confidence * 0.94),
             evidence=("construction:do_not_pretend_not_to_understand",),
+        )
+    if signals_prior_answer_correction(structure.text):
+        return DialogueActFrame(
+            kind="prior_answer_correction",
+            response_obligation="repair_previous_answer",
+            subject="addressee",
+            predicate=predicate or "сказать",
+            objects=topical,
+            polarity=-0.78,
+            register=register,
+            complete=True,
+            confidence=max(0.88, structure.confidence * 0.94),
+            evidence=("construction:prior_answer_correction",),
         )
     if "rhetorical_challenge" in pragmatic_functions and predicate is not None:
         return DialogueActFrame(

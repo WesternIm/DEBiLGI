@@ -27,6 +27,7 @@ _DIAGNOSTIC_LOGGERS = {
     "debilgi.contextual_question_reasoning": "contextual-question-reasoning.log",
     "debilgi.semantic_reply_plan": "semantic-reply-plan.log",
     "debilgi.response_trace": "response-trace.log",
+    "debilgi.learning_quality": "learning-quality.log",
 }
 
 

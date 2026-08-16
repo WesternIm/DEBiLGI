@@ -55,5 +55,10 @@ async def test_bot_registers_listener_and_diagnostic_group(tmp_path: Path) -> No
             "autonomy",
             "knowledge",
         } <= command_names
+        language = group.get_command("language")
+        assert language is not None
+        assert language.get_command("progress") is not None
+        assert language.get_command("progress-live") is not None
+        assert language.get_command("quality-cases") is not None
     finally:
         await bot.close()

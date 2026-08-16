@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from debilgi.language.content import content_lemmas
 from debilgi.language.lexical_matching import same_lexical_family
+from debilgi.language.repair_signals import signals_prior_answer_correction
 from debilgi.language.structured_utterance import (
     StructuredUtterance,
     TokenInterpretation,
@@ -543,6 +544,11 @@ def _repair_target(prompt: str, messages: tuple[str, ...]) -> str | None:
         and structure.tokens[frame.subject_indices[0]].lemma in {"я", "мы"}
         for frame in structure.clauses
     )
+    if signals_prior_answer_correction(prompt):
+        return next(
+            (message for message in reversed(messages) if message.rstrip().endswith("?")),
+            messages[-1] if messages else None,
+        )
     if not (explicit_failure or retry_command or meta_question_reference):
         return None
     if not meta_question_reference and terms - repair_vocabulary:

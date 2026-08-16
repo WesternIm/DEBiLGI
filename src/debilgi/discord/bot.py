@@ -23,6 +23,7 @@ from debilgi.cognition.learning import LearningConfig, LearningEngine
 from debilgi.cognition.world_model import WorldModelRepository
 from debilgi.config import Settings
 from debilgi.dataset.self_dataset import SelfDatasetRepository
+from debilgi.diagnostics.quality_loop import LearningQualityLoop
 from debilgi.discord.archive import DiscordHistorySource
 from debilgi.discord.commands import Diagnostics
 from debilgi.discord.events import EventListener
@@ -248,6 +249,13 @@ class DebilgiBot(commands.Bot):
             ttl_messages=settings.open_question_ttl_messages,
             working_context=self.context_gate,
         )
+        self.learning_quality = LearningQualityLoop(database, self.lexicon)
+        self.processing_outcomes.set_quality_observer(
+            self.learning_quality.observe_processing_outcome
+        )
+        self.response_traces.set_quality_observer(
+            self.learning_quality.observe_response_trace
+        )
         self.reflection_repository = ReflectionRepository(database)
         self.reflection_engine = ReflectionEngine(
             self.reflection_repository,
@@ -416,6 +424,7 @@ class DebilgiBot(commands.Bot):
                 self.social_reaction_engine.observe,
                 self.experience_consolidator.observe,
                 self.self_dataset.observe,
+                self.learning_quality.observe_feedback,
                 self.autonomy_repository.observe,
                 self.knowledge_service.observe,
             ],

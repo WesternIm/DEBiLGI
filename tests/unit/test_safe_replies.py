@@ -1552,7 +1552,7 @@ async def test_active_arbitration_does_not_invent_a_named_subject_for_answer_ref
     assert prepared.response_source == "arbitrated:dialogue_rule"
 
 
-async def test_active_arbitration_rejects_logged_graph_garbage_and_uses_fallback() -> None:
+async def test_active_arbitration_rejects_logged_graph_garbage_without_forcing_fallback() -> None:
     garbage = "узнай?. затем ошибку разобрать. значение слова зависит от контекста: оно может быть."
     service = SafeMentionReplyService(
         FakeRepository(intent()),
@@ -1570,10 +1570,7 @@ async def test_active_arbitration_rejects_logged_graph_garbage_and_uses_fallback
         event(mentioned=True, content="<@123> продолжай разговор")
     )
 
-    assert prepared is not None
-    assert prepared.text != garbage
-    assert prepared.fallback
-    assert prepared.response_source == "arbitrated:fallback"
+    assert prepared is None
 
 
 async def test_causal_question_rejects_remembered_topic_phrase_and_composes_effect() -> None:
@@ -1725,8 +1722,8 @@ async def test_active_arbitration_handles_attention_call_before_graph_generation
     prepared = await service.prepare_reply(event(mentioned=True, content="<@123> ауу"))
 
     assert prepared is not None
-    assert prepared.text == "Я здесь. Говори."
-    assert prepared.response_source == "arbitrated:dialogue_rule"
+    assert prepared.text == "Я слушаю тебя."
+    assert prepared.response_source == "arbitrated:dialogue_act"
 
 
 async def test_active_arbitration_can_answer_from_grounded_meaning_plan() -> None:
@@ -2629,7 +2626,7 @@ async def test_abbreviation_meaning_answers_when_external_lookup_is_unavailable(
         assert prepared.response_source == "arbitrated:lexical_reference"
 
 
-async def test_answer_gap_arbitrates_meaning_moves_instead_of_one_stock_sentence() -> None:
+async def test_answer_gap_does_not_force_a_below_threshold_stock_sentence() -> None:
     service = SafeMentionReplyService(
         FakeRepository(intent()),
         FakeMemory(),
@@ -2644,11 +2641,7 @@ async def test_answer_gap_arbitrates_meaning_moves_instead_of_one_stock_sentence
 
     prepared = await service.prepare_reply(event(mentioned=True, content="<@123> кто тут шалава?"))
 
-    assert prepared is not None
-    assert "шалав" in prepared.text.casefold()
-    assert "данн" not in prepared.text.casefold()
-    assert prepared.response_source == "arbitrated:fallback"
-    assert prepared.candidate_count >= 3
+    assert prepared is None
 
 
 async def test_relation_question_studies_ambiguous_word_then_answers_from_subject_model() -> None:
@@ -3857,6 +3850,206 @@ async def test_local_self_reflection_does_not_wait_for_unavailable_planner() -> 
     assert planner.calls == 0
 
 
+@pytest.mark.parametrize(
+    ("prompt", "expected_source", "expected_texts"),
+    (
+        (
+            "ауу",
+            "arbitrated:dialogue_move",
+            {"Я слушаю тебя.", "Я держу внимание."},
+        ),
+        (
+            "лети отсюда",
+            "arbitrated:semantic_reasoning",
+            {"Я не могу лететь."},
+        ),
+        (
+            "сбегай за сушняком",
+            "arbitrated:semantic_reasoning",
+            {"Я не могу сбегать за сушняком."},
+        ),
+    ),
+)
+async def test_grounded_local_replies_survive_autonomous_provider_failure(
+    prompt: str,
+    expected_source: str,
+    expected_texts: set[str],
+) -> None:
+    class UnavailablePlanner:
+        autonomous_planning = True
+        trigger_threshold = 0.72
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def should_consult(self, **kwargs) -> bool:
+            del kwargs
+            return False
+
+        async def plan_response(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            return None
+
+    planner = UnavailablePlanner()
+    service = SafeMentionReplyService(
+        FakeRepository(intent()),
+        FakeMemory(),
+        FakeArchiveRepository(),
+        EXPRESSION_ENGINE,
+        EXPERIENCE,
+        INITIATIVE,
+        FixedGenerator(""),
+        semantic_consultant=planner,  # type: ignore[arg-type]
+        arbitration_mode="active",
+        arbitration_minimum_score=0.45,
+        productive_only_replies=True,
+        enabled=True,
+    )
+
+    prepared = await service.prepare_reply(
+        event(mentioned=True, content=f"<@123> {prompt}")
+    )
+
+    assert prepared is not None
+    assert prepared.response_source == expected_source
+    assert prepared.text in expected_texts
+    assert planner.calls == 0
+
+
+async def test_scaffolded_statement_defers_to_autonomous_semantic_planner() -> None:
+    class StatementPlanner:
+        autonomous_planning = True
+        trigger_threshold = 0.72
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def should_consult(self, **kwargs) -> bool:
+            del kwargs
+            return False
+
+        async def plan_response(self, **kwargs) -> ConsultationResult:
+            self.calls.append(kwargs)
+            return ConsultationResult.from_payload(
+                {
+                    "interpretation": "Пользователь сообщил утверждение.",
+                    "intent": "engage_statement",
+                    "response_plans": [
+                        {
+                            "move": "engage",
+                            "stance": "direct",
+                            "propositions": [
+                                {
+                                    "predicate": "рассматривать",
+                                    "predicate_features": {"tense": "present"},
+                                    "arguments": [
+                                        {
+                                            "role": "subject",
+                                            "lemma": "я",
+                                            "part_of_speech": "pronoun",
+                                        },
+                                        {
+                                            "role": "direct_object",
+                                            "lemma": "версия",
+                                            "part_of_speech": "noun",
+                                        },
+                                    ],
+                                    "clause_kind": "statement",
+                                    "evidence_ids": ["personality.current"],
+                                }
+                            ],
+                            "confidence": 0.91,
+                        }
+                    ],
+                    "confidence": 0.91,
+                },
+                provider="fake-semantic-planner",
+                model="semantic-only",
+            )
+
+    planner = StatementPlanner()
+    service = SafeMentionReplyService(
+        FakeRepository(intent()),
+        FakeMemory(),
+        FakeArchiveRepository(),
+        EXPRESSION_ENGINE,
+        EXPERIENCE,
+        INITIATIVE,
+        FixedGenerator(""),
+        semantic_consultant=planner,  # type: ignore[arg-type]
+        arbitration_mode="active",
+        arbitration_minimum_score=0.0,
+        productive_only_replies=True,
+        enabled=True,
+    )
+
+    prepared = await service.prepare_reply(
+        event(mentioned=True, content="<@123> завтра будет четверг")
+    )
+
+    assert prepared is not None
+    assert prepared.response_source == "arbitrated:autonomous_semantic_plan"
+    assert not prepared.text.endswith("?")
+    assert planner.calls
+
+
+async def test_colloquial_capability_follow_up_uses_structured_previous_answer() -> None:
+    class UnavailablePlanner:
+        autonomous_planning = True
+        trigger_threshold = 0.72
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def should_consult(self, **kwargs) -> bool:
+            del kwargs
+            return False
+
+        async def plan_response(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            return None
+
+    previous = event(
+        mentioned=False,
+        author_is_bot=True,
+        actor_id=123,
+        event_id="discord:message:previous-capability-boundary",
+        content="Я не могу лететь.",
+    )
+    planner = UnavailablePlanner()
+    service = SafeMentionReplyService(
+        FakeRepository(intent()),
+        FakeMemory(channel_events=(previous,)),
+        FakeArchiveRepository(),
+        EXPRESSION_ENGINE,
+        EXPERIENCE,
+        INITIATIVE,
+        FixedGenerator(""),
+        semantic_consultant=planner,  # type: ignore[arg-type]
+        arbitration_mode="active",
+        arbitration_minimum_score=0.45,
+        productive_only_replies=True,
+        enabled=True,
+    )
+
+    prepared = await service.prepare_reply(
+        event(mentioned=True, content="<@123> а чего не можешь то а?")
+    )
+
+    assert prepared is not None
+    assert prepared.text == "У меня нет тела."
+    assert prepared.response_source == "arbitrated:dialogue_context"
+    assert planner.calls == 0
+
+    grounding = dict(
+        reply_module._previous_answer_grounding(("agent: Я не могу лететь.",))
+    )
+    assert "previous_answer.statement" in grounding
+    assert "previous_answer.capability_boundary" in grounding
+
+
 async def test_contextual_intent_is_not_suppressed_by_external_planning_mode() -> None:
     class UnavailablePlanner:
         autonomous_planning = True
@@ -3912,7 +4105,7 @@ async def test_contextual_intent_is_not_suppressed_by_external_planning_mode() -
     assert planner.calls == 0
 
 
-async def test_recovery_reuses_valid_low_score_local_candidate() -> None:
+async def test_recovery_does_not_promote_scaffold_below_the_quality_threshold() -> None:
     class UnavailablePlanner:
         autonomous_planning = True
         trigger_threshold = 0.72
@@ -3950,12 +4143,9 @@ async def test_recovery_reuses_valid_low_score_local_candidate() -> None:
     )
 
     assert prepared is not None
-    assert prepared.text in {
-        "Что произошло?",
-        "Что вызвало такую реакцию?",
-    }
-    assert prepared.response_source == "arbitrated:dialogue_move"
-    assert planner.calls == 0
+    assert prepared.text == "Я не могу сформулировать связный ответ."
+    assert prepared.response_source == "arbitrated:semantic_recovery"
+    assert planner.calls == 1
 
 
 async def test_local_productive_reasoning_survives_external_plan_failure() -> None:
@@ -4021,8 +4211,8 @@ async def test_local_productive_reasoning_survives_external_plan_failure() -> No
     assert directive.text == "Я не могу выкинуть мусорку.", directive.text.encode("unicode_escape")
     assert directive.response_source == "arbitrated:semantic_reasoning"
     assert fragment is not None
-    assert fragment.text.endswith("?")
-    assert fragment.response_source == "arbitrated:dialogue_move"
+    assert fragment.text == "Я не могу сформулировать связный ответ."
+    assert fragment.response_source == "arbitrated:semantic_recovery"
 
 
 async def test_bare_reply_label_is_digested_as_evaluation_not_definition_probe() -> None:
@@ -4138,7 +4328,7 @@ async def test_addressed_statement_gets_content_bound_continuation_at_live_thres
     assert "тему" not in prepared.text.casefold()
 
 
-async def test_productive_epistemic_recovery_survives_autonomous_plan_failure() -> None:
+async def test_epistemic_recovery_is_not_forced_below_threshold_after_plan_failure() -> None:
     class UnavailablePlanner:
         autonomous_planning = True
         trigger_threshold = 0.72
@@ -4171,9 +4361,20 @@ async def test_productive_epistemic_recovery_survives_autonomous_plan_failure() 
     )
 
     assert prepared is not None
-    assert prepared.response_source == "arbitrated:fallback"
-    assert "Повтори запрос" not in prepared.text
-    assert prepared.text.endswith(".")
+    assert prepared.text == "Я не могу сформулировать связный ответ."
+    assert prepared.response_source == "arbitrated:semantic_recovery"
+
+
+def test_question_loop_gate_rejects_evasive_questions_after_user_objection() -> None:
+    issue = SafeMentionReplyService._question_response_issue(
+        "Что ты думаешь о космосе?",
+        response_obligation="continue_topic",
+        dialogue_messages=("Ты что специально задаешь вопросы?",),
+        recent_self_replies=("Что ты думаешь о времени?",),
+        metadata={"response_move": "explore_assertion"},
+    )
+
+    assert issue == "question_loop_after_user_objection"
 
 
 async def test_productive_motion_question_answers_instead_of_staying_silent() -> None:

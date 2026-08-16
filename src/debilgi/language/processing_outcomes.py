@@ -3,16 +3,29 @@
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 from debilgi.events.models import Event
 from debilgi.language.semantic_reply_plan import ProcessingOutcome
 from debilgi.storage.database import Database
 
+logger = logging.getLogger("debilgi.learning_quality")
+
 
 class ProcessingOutcomeRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
+        self._quality_observer: (
+            Callable[[Event, ProcessingOutcome, datetime], Awaitable[None]] | None
+        ) = None
+
+    def set_quality_observer(
+        self,
+        observer: Callable[[Event, ProcessingOutcome, datetime], Awaitable[None]] | None,
+    ) -> None:
+        self._quality_observer = observer
 
     async def save(
         self,
@@ -49,3 +62,12 @@ class ProcessingOutcomeRepository:
                 created_at.isoformat(),
             ),
         )
+        if self._quality_observer is not None:
+            try:
+                await self._quality_observer(event, outcome, created_at)
+            except Exception:
+                logger.exception(
+                    "quality_loop_failed event=%s outcome=%s",
+                    event.event_id,
+                    outcome.outcome_type.value,
+                )
