@@ -7,8 +7,10 @@ import pytest
 from debilgi.dataset.self_dataset import SelfDatasetRepository
 from debilgi.events.normalizer import normalize_message_created
 from debilgi.language.context_gate import WorkingMemoryContextGate
+from debilgi.language.definition_relations import definition_answer_thought
 from debilgi.language.lexicon import LexiconService
 from debilgi.language.open_questions import OpenLanguageQuestionService
+from debilgi.language.productive_nlg import realize_thought
 from debilgi.storage.database import Database
 
 NOW = datetime(2026, 7, 18, 10, 0, tzinfo=UTC)
@@ -57,6 +59,39 @@ def services(
     return lexicon, dataset, OpenLanguageQuestionService(database, lexicon, dataset)
 
 
+async def test_lesson_survives_restart_and_supplies_meaning_to_inflected_word(database):
+    lexicon, _, questions = services(database)
+    prompt = message(1, user_id=20, content="салфетка")
+    await questions.open_for(prompt, concept="салфетка", question_message_id=500, asked_at=NOW)
+    lesson = message(2, user_id=20, content="Это бумага для гигиены", reply_to_message_id=500)
+    await questions.observe(lesson)
+    assert await questions.resolution_for_event(lesson.event_id) is not None
+    await database.close()
+    await database.initialize()
+    lexicon = LexiconService(database)
+    learned = await lexicon.analyze_word("салфеткой", guild_id=1, context="Пользуюсь салфеткой")
+    assert learned.source == "personal_lexicon"
+    assert learned.selected_meaning == "Это бумага для гигиены"
+    assert learned.grammatical_features["case"] == "instrumental"
+    assert ("is_a", "бумага") in learned.semantic_relations
+    thought = definition_answer_thought("Что такое салфетка?", ((
+        learned.lemma, learned.semantic_relations,
+    ),))
+    assert thought is not None
+    assert "бумагой" in realize_thought(thought, limit=1)[0].text
+    other = await lexicon.analyze_word("салфеткой", guild_id=2)
+    assert other.personal_interpretation is None
+
+
+async def test_other_speaker_cannot_supply_the_pending_lesson(database):
+    lexicon, _, questions = services(database)
+    prompt = message(1, user_id=20, content="салфетка")
+    await questions.open_for(prompt, concept="салфетка", question_message_id=500, asked_at=NOW)
+    await questions.observe(message(2, user_id=30, content="Это оружие", reply_to_message_id=500))
+    assert await questions.active_for(1, 10, 20) is not None
+    assert (await lexicon.analyze_word("салфетка", guild_id=1)).source != "personal_lexicon"
+
+
 async def test_explanation_is_bound_learned_and_confirmed(database: Database) -> None:
     lexicon, dataset, questions = services(database)
     prompt = message(1, user_id=20, content="Я сужу по твоим ответам")
@@ -66,6 +101,12 @@ async def test_explanation_is_bound_learned_and_confirmed(database: Database) ->
         question_message_id=500,
         asked_at=NOW,
     )
+    await questions.open_for(
+        prompt, concept="сужу", question_message_id=500, asked_at=NOW,
+    )
+    rows = await database.fetchall("SELECT status FROM language_open_questions")
+    assert len(rows) == 1
+    assert rows[0]['status'] == 'active'
     explanation = message(
         2,
         user_id=20,

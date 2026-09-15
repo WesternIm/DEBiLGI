@@ -427,6 +427,9 @@ def assess_capability_question(
     """Ground self-directed capability, experience and external-action requests."""
 
     for frame in reversed(structure.clauses):
+        if (frame.question_target_index is not None
+                and structure.tokens[frame.question_target_index].lemma == "почему"):
+            continue  # A reason request cannot be answered by a capability yes/no.
         if frame.predicate_index is None:
             continue
         predicate = structure.tokens[frame.predicate_index]

@@ -46,7 +46,7 @@ async def test_migration_and_round_trip(database: Database) -> None:
     duplicate_inserted = await repository.append(original)
     restored = (await repository.recent(10))[0]
 
-    assert await database.schema_version() == 45
+    assert await database.schema_version() == 49
     assert inserted is True
     assert duplicate_inserted is False
     assert restored == original
@@ -103,7 +103,7 @@ async def test_existing_v1_database_is_backfilled_by_processing_migration(
     await upgraded_database.initialize()
     upgraded_repository = EventRepository(upgraded_database)
     try:
-        assert await upgraded_database.schema_version() == 45
+        assert await upgraded_database.schema_version() == 49
         assert (
             await upgraded_repository.processing_status("before-upgrade")
             is ProcessingStatus.PENDING
@@ -132,7 +132,7 @@ async def test_existing_v4_database_upgrades_to_cognitive_core_without_data_loss
     upgraded = Database(db_path, MIGRATIONS)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 45
+        assert await upgraded.schema_version() == 49
         assert await EventRepository(upgraded).get("preserved-v4-event") is not None
         tables = await upgraded.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
         table_names = {str(row["name"]) for row in tables}
@@ -173,6 +173,7 @@ async def test_existing_v4_database_upgrades_to_cognitive_core_without_data_loss
 async def test_service_word_cleanup_removes_old_graph_noise(tmp_path: Path) -> None:
     db_path = tmp_path / "service-word-cleanup.sqlite3"
     connection = sqlite3.connect(db_path)
+    connection.executescript((MIGRATIONS / "001_initial_events.sql").read_text(encoding="utf-8"))
     connection.executescript(
         """
         PRAGMA foreign_keys = ON;
@@ -199,6 +200,12 @@ async def test_service_word_cleanup_removes_old_graph_noise(tmp_path: Path) -> N
         );
         CREATE TABLE knowledge_relations (
             relation_id TEXT PRIMARY KEY, normalized_object_title TEXT NOT NULL
+        );
+        CREATE TABLE language_personal_interpretations (
+            guild_id INTEGER, normalized_form TEXT, interpretation TEXT
+        );
+        CREATE TABLE language_open_questions (
+            guild_id INTEGER, concept_key TEXT, status TEXT, response_text TEXT
         );
             CREATE TABLE learning_instruction_examples (
                 example_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL DEFAULT '',
@@ -244,7 +251,7 @@ async def test_service_word_cleanup_removes_old_graph_noise(tmp_path: Path) -> N
     upgraded = Database(db_path, MIGRATIONS)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 45
+        assert await upgraded.schema_version() == 49
         assert await upgraded.fetchone(
             "SELECT 1 FROM learning_graph_nodes WHERE node_id = 'node:tipa'"
         ) is None
@@ -342,7 +349,7 @@ async def test_internal_surface_cleanup_preserves_raw_history_and_rejects_deriva
     upgraded = Database(db_path, MIGRATIONS)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 45
+        assert await upgraded.schema_version() == 49
         assert await EventRepository(upgraded).get("raw-event-survives-cleanup") is not None
         example = await upgraded.fetchone(
             "SELECT status, quality_score FROM learning_instruction_examples "
@@ -420,7 +427,7 @@ async def test_authored_warm_start_replies_are_removed_on_upgrade(tmp_path: Path
     upgraded = Database(db_path, MIGRATIONS)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 45
+        assert await upgraded.schema_version() == 49
         archived = await upgraded.fetchone(
             "SELECT 1 FROM archive_messages WHERE message_id IN (?, ?)",
             (prompt_message_id, response_message_id),

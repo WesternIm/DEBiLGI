@@ -23,6 +23,9 @@ _SAFE_SHORT_ROLES = frozenset({"interjection", "predicate", "adverb"})
 _MALFORMED_PUNCTUATION_RE = re.compile(r"(?:\?\.|!\.|\.\?|\.!|,\.|\.,|;\.|:\.)")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 
+# A case ending may be rough while the composed semantic roles remain valid.
+COMPOSED_SURFACE_SOFT_ISSUES = frozenset({"governed_case_mismatch"})
+
 
 @dataclass(frozen=True, slots=True)
 class SurfaceCoherence:
@@ -192,6 +195,8 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
                 and actual_case
                 and expected_case
                 and actual_case != expected_case
+                and not (clause.negated and expected_case == "accusative"
+                         and actual_case == "genitive")
                 and not syncretic_accusative
                 and not surface_supports_expected_case
             ):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 
 import discord
@@ -26,9 +27,12 @@ from debilgi.dataset.self_dataset import SelfDatasetRepository
 from debilgi.diagnostics.quality_loop import LearningQualityLoop
 from debilgi.discord.archive import DiscordHistorySource
 from debilgi.discord.commands import Diagnostics
+from debilgi.discord.delivery import DiscordReplyTransport, ReplyDeliveryService
+from debilgi.discord.delivery_repository import DeliveryRepository
 from debilgi.discord.events import EventListener
 from debilgi.discord.permissions import build_intents
 from debilgi.discord.replies import SafeMentionReplyService
+from debilgi.discord.reply_workflow import ReplyWorkflow
 from debilgi.events.pipeline import EventPipeline
 from debilgi.events.repository import EventRepository
 from debilgi.experience.consolidation import ExperienceConsolidator
@@ -41,6 +45,7 @@ from debilgi.language.abstract_reasoning import AbstractReasoningService
 from debilgi.language.arbitration_repository import ArbitrationRepository
 from debilgi.language.archive_importer import ArchiveImporter, ArchiveImportManager
 from debilgi.language.archive_repository import ArchiveRepository
+from debilgi.language.assertion_experience import AssertionExperienceRepository
 from debilgi.language.causal_reasoning import CausalReasoningRepository
 from debilgi.language.character_markov import CharacterMarkovConfig, CharacterMarkovRepository
 from debilgi.language.context_gate import ContextGateDeferred, WorkingMemoryContextGate
@@ -54,6 +59,7 @@ from debilgi.language.position_reasoning import PositionReasoningService, Positi
 from debilgi.language.processing_outcomes import ProcessingOutcomeRepository
 from debilgi.language.response_trace import ResponseTraceRepository
 from debilgi.language.russian_reference import RussianReferenceService, WiktionaryClient
+from debilgi.language.ruwordnet import open_ruwordnet
 from debilgi.language.semantic_assimilation import SemanticAssimilationService
 from debilgi.language.semantic_consultant import (
     CloudflareWorkersAIConsultant,
@@ -159,6 +165,8 @@ class DebilgiBot(commands.Bot):
         )
         self.lexicon = LexiconService(
             database,
+            ruwordnet=(open_ruwordnet(settings.ruwordnet_path)
+                       if settings.ruwordnet_enabled else None),
             unknown_word_threshold=settings.unknown_word_threshold,
             curiosity_threshold=settings.curiosity_threshold,
             curiosity_question_cooldown=timedelta(
@@ -350,6 +358,7 @@ class DebilgiBot(commands.Bot):
         self.lexicon.set_study_notifier(
             self.background_learning.wake_for_study
         )
+        self.assertion_experiences = AssertionExperienceRepository(database)
         self.reply_service = SafeMentionReplyService(
             self.cognitive_repository,
             self.memory,
@@ -388,6 +397,7 @@ class DebilgiBot(commands.Bot):
             processing_outcomes=self.processing_outcomes,
             response_traces=self.response_traces,
             continuous_cognition=self.continuous_cognition,
+            assertion_experiences=self.assertion_experiences,
             arbitration_mode=settings.arbitration_mode,
             arbitration_minimum_score=settings.arbitration_minimum_score,
             arbitration_max_total_candidates=(
@@ -405,6 +415,7 @@ class DebilgiBot(commands.Bot):
                 self.short_speech_acts.observe,
                 self.arbitration_repository.observe_feedback,
                 self.position_repository.observe_feedback,
+                self.assertion_experiences.observe_feedback,
                 self.memory.observe,
                 self.context_gate.observe,
                 self.long_term_memory.observe,
@@ -430,6 +441,12 @@ class DebilgiBot(commands.Bot):
             ],
         )
         self.archive_importer = ArchiveImporter(self.archive_repository)
+        self.reply_delivery = ReplyDeliveryService(
+            DeliveryRepository(database), repository,
+            ReplyWorkflow(self, self.pipeline, self.reply_service,
+                          self.context_gate, self.response_traces),
+            DiscordReplyTransport(self),
+        )
         self.archive_manager = ArchiveImportManager(
             self.archive_repository,
             self.archive_importer,
@@ -489,9 +506,7 @@ class DebilgiBot(commands.Bot):
             EventListener(
                 self,
                 self.pipeline,
-                self.reply_service,
-                self.context_gate,
-                self.response_traces,
+                self.reply_delivery,
             )
         )
         await self.add_cog(
@@ -522,6 +537,7 @@ class DebilgiBot(commands.Bot):
     async def on_ready(self) -> None:
         user_id = self.user.id if self.user else "?"
         logger.info("Connected to Discord as %s (%s)", self.user, user_id)
+        await self.reply_delivery.start()
         try:
             await self.archive_manager.start()
         except Exception:
@@ -577,33 +593,20 @@ class DebilgiBot(commands.Bot):
         await super().on_command_error(context, error)
 
     async def close(self) -> None:
-        await self.background_learning.stop()
-        await self.continuous_cognition.stop()
-        try:
-            await super().close()
-        finally:
-            try:
-                await self.archive_manager.stop()
-            finally:
-                try:
-                    await self.pipeline.stop()
-                finally:
-                    try:
-                        await self.russian_reference.stop()
-                    finally:
-                        try:
-                            await self.knowledge_service.stop()
-                        finally:
-                            try:
-                                await self.semantic_consultant.close()
-                            finally:
-                                try:
-                                    await self.learning_engine.stop()
-                                finally:
-                                    try:
-                                        await self.cognitive_core.stop()
-                                    finally:
-                                        await self.database.close()
+        # Callbacks run in reverse order, including when an earlier stop fails.
+        async with AsyncExitStack() as cleanup:
+            cleanup.push_async_callback(self.database.close)
+            cleanup.push_async_callback(self.cognitive_core.stop)
+            cleanup.push_async_callback(self.learning_engine.stop)
+            cleanup.push_async_callback(self.semantic_consultant.close)
+            cleanup.push_async_callback(self.knowledge_service.stop)
+            cleanup.push_async_callback(self.russian_reference.stop)
+            cleanup.push_async_callback(self.pipeline.stop)
+            cleanup.push_async_callback(self.archive_manager.stop)
+            cleanup.push_async_callback(super().close)
+            cleanup.push_async_callback(self.reply_delivery.stop)
+            cleanup.push_async_callback(self.continuous_cognition.stop)
+            cleanup.push_async_callback(self.background_learning.stop)
 
 
 def create_bot(settings: Settings, database: Database, repository: EventRepository) -> DebilgiBot:

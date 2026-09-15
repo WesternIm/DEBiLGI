@@ -7,6 +7,7 @@ from debilgi.logging import configure_logging
 def test_separate_diagnostic_log_files_are_created(tmp_path: Path) -> None:
     configure_logging("INFO", tmp_path)
     names = {
+        "debilgi": "runtime.log",
         "debilgi.reply_failures": "reply-fallback.log",
         "debilgi.topic_continuity": "topic-continuity.log",
         "debilgi.identity_replies": "identity-replies.log",

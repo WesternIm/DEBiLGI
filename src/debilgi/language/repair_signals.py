@@ -49,6 +49,12 @@ def signals_prior_answer_correction(text: str) -> bool:
     if any(marker in normalized for marker in _CONTRADICTION_MARKERS):
         return True
     words = tuple(token for token in tokenize(normalized) if token[:1].isalnum())
+    # Discourse particles do not change who is being held accountable.
+    while words and words[0] in {"но", "ведь", "а", "ну"}:
+        words = words[1:]
+    if (len(words) >= 4 and words[0] in {"ты", "вы"}
+            and words[1] in _CLAIM_VERBS and words[2] == "что"):
+        return True
     if len(words) < 3 or words[0] not in {"ты", "вы"}:
         return False
     try:

@@ -66,6 +66,28 @@ class Diagnostics(
         self._learning_progress = LearningProgressAnalyzer(database)
         self._live_progress_sessions: set[tuple[int, int]] = set()
 
+    @language.command(name="delivery", description="Show durable reply delivery status")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def delivery(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        rows = await self._database.fetchall(
+            """SELECT j.status, COUNT(*) AS count FROM reply_delivery_jobs j
+               JOIN events e ON e.event_id = j.event_id WHERE e.guild_id = ?
+               GROUP BY j.status""", (interaction.guild_id,),
+        )
+        issues = await self._database.fetchall(
+            """SELECT j.event_id, j.status FROM reply_delivery_jobs j
+               JOIN events e ON e.event_id = j.event_id
+               WHERE e.guild_id = ? AND j.status IN ('uncertain', 'failed')
+               ORDER BY j.updated_at DESC LIMIT 10""", (interaction.guild_id,),
+        )
+        lines = [f"worker running: {self.bot.reply_delivery.running}"]
+        lines.extend(f"{row['status']}: {row['count']}" for row in rows)
+        lines.extend(f"{row['status']}: {row['event_id']}" for row in issues)
+        await interaction.response.send_message('\n'.join(lines), ephemeral=True)
+
     @app_commands.command(name="dna", description="Show immutable personality genome")
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)

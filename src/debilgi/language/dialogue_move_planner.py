@@ -8,10 +8,11 @@ single phrase that was already decided by an act label.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
+from debilgi.language.clarification_policy import is_contact_request
 from debilgi.language.dialogue_acts import DialogueActFrame
+from debilgi.language.dialogue_obligations import DialogueExchange, resolve_dialogue_exchange
 from debilgi.language.productive_nlg import (
     ClauseThought,
     ConceptArgument,
@@ -88,13 +89,36 @@ def plan_dialogue_moves(
     structure: StructuredUtterance | None = None,
     prompt: str = "",
     context_messages: tuple[str, ...] = (),
+    exchange: DialogueExchange | None = None,
+    resolve_from_context: bool = True,
 ) -> tuple[DialogueMovePlan, ...]:
     """Build competing moves from state, stance and conversational context."""
 
     if frame is None:
         return ()
+    if is_contact_request(prompt):
+        return (DialogueMovePlan(
+            move="engage", strategy="answer_contact",
+            thought=_listen_thought(0.95, ("current_message:contact_request",)),
+            confidence=0.95, stance="engage", evidence=("current_message:contact_request",),
+            semantic_origin="derived",
+        ),)
+    if exchange is None and resolve_from_context:
+        exchange = resolve_dialogue_exchange(prompt, context_messages)
+    if exchange is not None and exchange.bound_proposition is not None:
+        thought = exchange.bound_proposition
+        return (DialogueMovePlan(
+            move="verify_understanding", strategy="resolve_dialogue_obligation",
+            thought=thought, confidence=thought.confidence, stance="curious",
+            evidence=thought.evidence,
+            key_points=tuple(dep.argument.head.lemma for dep in thought.dependencies),
+            semantic_origin="derived",
+        ),)
     plans: list[DialogueMovePlan] = []
-    if self_state is not None and self_state.state == "self_role_assessment":
+    if self_state is not None and (
+        self_state.state == "self_role_assessment"
+        or (self_state.state == "self_assessment" and self_state.clause_kind == "question")
+    ):
         plans.extend(
             _self_role_moves(
                 frame,
@@ -111,6 +135,15 @@ def plan_dialogue_moves(
         and self_state.state == "self_reflection"
         and frame.response_obligation == "answer_question"
     ):
+        if structure is not None and any(
+            structure.tokens[complement.preposition_index].lemma in {"о", "об", "про"}
+            and any(structure.tokens[index].part_of_speech == "noun"
+                    for index in complement.object_indices)
+            for clause in structure.clauses for complement in clause.complements
+        ):
+            # "What do you think about scissors?" requires a topical appraisal.
+            # Describing an active thinking process does not fill that slot.
+            return ()
         plans.extend(
             _self_reflection_moves(
                 frame,
@@ -405,7 +438,7 @@ def _fragment_moves(
     # A bare expressive infinitive is normally a reaction in Russian, not a
     # request to define the word.  A semantic-scope probe remains available
     # for genuinely ambiguous non-expressive fragments.
-    if target and not expressive_fragment:
+    if target and target not in {"это", "этот", "тот", "такой"} and not expressive_fragment:
         plans.append(
             DialogueMovePlan(
                 move="clarify_intended_meaning",
@@ -865,59 +898,10 @@ def _self_role_opinion(
     prompt: str,
     context_messages: tuple[str, ...],
 ) -> PersonalOpinion:
-    words = {word.casefold() for word in re.findall(r"[\w-]+", prompt)}
-    evidence: list[tuple[float, float, str]] = []
-    positive_markers = words & _POSITIVE_CONFIRMATION
-    if positive_markers:
-        evidence.append((0.42, 0.52, "speaker_requests_positive_confirmation"))
-    challenge_markers = words & _CHALLENGE_MARKERS
-    if challenge_markers and not positive_markers:
-        evidence.append((-0.34, 0.48, "speaker_uses_challenge_markers"))
-    if reaction is not None:
-        vector = reaction.vector
-        reaction_score = (
-            vector.approval
-            + vector.agreement
-            + vector.trust * 0.35
-            - vector.resistance
-            - vector.aversion
-        ) * 0.52
-        evidence.append(
-            (
-                reaction_score,
-                max(0.28, reaction.confidence),
-                f"social_reaction_score:{reaction_score:.3f}",
-            )
-        )
-    if personality is not None and perspective is None:
-        personality_score = (
-            personality.expressiveness + personality.novelty_drive - 1.0
-        ) * 0.32
-        evidence.append(
-            (
-                personality_score,
-                0.34,
-                f"phenotype_position_score:{personality_score:.3f}",
-            )
-        )
-    target_mentions = sum(
-        target.casefold() in message.casefold() for message in context_messages[-6:]
-    )
-    if target_mentions:
-        context_score = min(0.34, target_mentions * 0.10)
-        evidence.append(
-            (
-                context_score,
-                min(0.62, 0.34 + target_mentions * 0.06),
-                f"context_target_support:{target_mentions}",
-            )
-        )
-    return form_personal_opinion(
-        "self",
-        target,
-        perspective=perspective,
-        situational_evidence=tuple(evidence),
-    )
+    # Conversational approval and repeated mentions are not evidence that a
+    # property applies to the speaker. Only a semantic value appraisal may
+    # support an owned opinion; absent a link, preserve uncertainty.
+    return form_personal_opinion("self", target, perspective=perspective)
 
 
 def _subject(lemma: str = "я", surface: str | None = None) -> SemanticDependency:

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from debilgi.cognition.models import ActionIntent, ActionType
+from debilgi.language.assertion_memory import AssertionMemory, ContinuationPlan
 from debilgi.language.construction_nlg import ConstructionSpec
 from debilgi.language.dialogue_state import DialogueStateAnalysis
 from debilgi.language.productive_nlg import DependencyPattern
@@ -33,15 +34,14 @@ class ReplyContext:
     prompt: str = ""
     memory_messages: tuple[str, ...] = ()
     dialogue_messages: tuple[str, ...] = ()
-    # Role-labelled turns are kept separately for the optional semantic
-    # teacher.  Local dialogue algorithms intentionally continue to consume
-    # plain text, while the teacher must know which ``я``/``ты`` belongs to
-    # the user and which belongs to the agent.
+    # The optional teacher receives labelled text. Local assertion reasoning
+    # retains event provenance and participant bindings separately below.
     consultation_messages: tuple[str, ...] = ()
     memory_ngrams: tuple[tuple[tuple[str, ...], int], ...] = ()
     experience_transitions: tuple[tuple[tuple[str, ...], float], ...] = ()
     reply_heads: tuple[tuple[str, ...], ...] = ()
     knowledge_facts: tuple[str, ...] = ()
+    reference_definitions: tuple[tuple[str, str], ...] = ()
     required_facts: tuple[str, ...] = ()
     seed: str = ""
     personality: PersonalityExpression | None = None
@@ -58,6 +58,9 @@ class ReplyContext:
     learned_registers: tuple[str, ...] = ()
     social_policies: tuple[SocialPolicy, ...] = ()
     dialogue_state: DialogueStateAnalysis | None = None
+    assertion_memory: AssertionMemory = field(default_factory=AssertionMemory)
+    assertion_continuation: ContinuationPlan | None = None
+    assertion_feedback_counts: tuple[int, int] = (0, 0)
 
 
 @dataclass(frozen=True, slots=True)

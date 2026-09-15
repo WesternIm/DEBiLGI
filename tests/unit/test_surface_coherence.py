@@ -76,3 +76,8 @@ def test_position_reason_is_not_mistaken_for_internal_evidence_bookkeeping() -> 
 
     assert internal_surface_reason(text) is None
     assert evaluate_surface(text).learnable
+
+
+def test_genitive_object_is_licensed_by_negation_only() -> None:
+    assert "governed_case_mismatch" not in evaluate_surface("Я не имею желудка.").hard_issues
+    assert "governed_case_mismatch" in evaluate_surface("Я имею желудка.").hard_issues

@@ -8,15 +8,54 @@ import pytest
 from debilgi.cognition.models import ActionIntent, ActionType
 from debilgi.events.models import Event, EventType
 from debilgi.knowledge.models import WikipediaResult
-from debilgi.knowledge.policy import KnowledgeQueryPolicy
+from debilgi.knowledge.policy import KnowledgeQueryPolicy, media_text_reasons
 from debilgi.knowledge.repository import KnowledgeRepository
-from debilgi.knowledge.service import KnowledgeAcquisitionService
+from debilgi.knowledge.service import KnowledgeAcquisitionService, _lookup_signals
 from debilgi.language.russian_reference import RemoteLexeme
 from debilgi.storage.database import Database
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS = PROJECT_ROOT / "migrations"
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("kind", ["опера", "балет", "пьеса", "фильм"])
+@pytest.mark.parametrize("capitalized", [False, True])
+async def test_common_word_never_falls_back_to_a_work_even_from_old_cache(
+    database, kind, capitalized,
+):
+    result = WikipediaResult(987, "Русалка", f"Русалка — {kind} в трёх действиях.",
+                             "https://ru.wikipedia.org/wiki/Русалка", None, None, ())
+
+    class Source(FakeWikipedia):
+        async def search(self, query):
+            return result
+
+    repository = KnowledgeRepository(database)
+    service = KnowledgeAcquisitionService(
+        repository, FakeCognitiveRepository(), KnowledgeQueryPolicy(enabled=True),
+        Source(), dictionary=FakeDictionary(None),
+    )
+    prompt = "Что значит Русалка?" if capitalized else "что значит русалка?"
+    signals = _lookup_signals(prompt, "русалка", dictionary_available=True)
+    assert await service._resolve_lookup("русалка", signals) is None
+    current = event(985, prompt)
+    query_id = await repository.reserve_query(
+        current, query="русалка", reason="explicit", uncertainty=0.8,
+        source="wikipedia", language="ru",
+    )
+    await repository.complete_query(query_id, result, source="wikipedia", language="ru")
+    assert await service.context_for_text(prompt) == ()
+    assert await service.grounding_for_event(current, prompt) == ((), None)
+    explicit = _lookup_signals(f"Расскажи про {kind} Русалка", "русалка",
+                               dictionary_available=True)
+    selected = await service._resolve_lookup("русалка", explicit)
+    assert selected and selected[0] == result and selected[1] == "wikipedia"
+
+
+@pytest.mark.parametrize("text", ["операция сложения", "оператор связи", "оперативная память"])
+def test_opera_marker_does_not_match_unrelated_word_prefixes(text):
+    assert not media_text_reasons(text)
 
 
 @pytest.fixture
@@ -320,6 +359,8 @@ async def test_study_command_resolves_numbered_cyrillic_acronym(
         assert source.calls == ["гта 5", "gta 5"]
         assert exact == facts[0]
         assert "компьютерная игра" in exact
+        evidence = await service.grounding_evidence_for_event(current, "гта 5")
+        assert evidence.definitions == (("гта 5", exact),)
         row = await database.fetchone(
             "SELECT query_text FROM knowledge_queries WHERE event_id = ?",
             (current.event_id,),
@@ -331,6 +372,29 @@ async def test_study_command_resolves_numbered_cyrillic_acronym(
         assert abbreviated[0].title == "Grand Theft Auto V"
     finally:
         await service.stop()
+
+
+async def test_cached_reference_keeps_its_definition_provenance(database: Database) -> None:
+    repository = KnowledgeRepository(database)
+    definition = "понимать — постигать смысл какого-либо высказывания, явления"
+    learned = event(981, "что значит понимать?")
+    query_id = await repository.reserve_query(
+        learned, query="понимать", reason="explicit", uncertainty=0.8,
+        source="ru_wiktionary", language="ru",
+    )
+    await repository.complete_query(
+        query_id, WikipediaResult(981, "понимать", definition,
+                                   "https://ru.wiktionary.org/wiki/понимать", None, None, ()),
+        source="ru_wiktionary", language="ru",
+    )
+    service = KnowledgeAcquisitionService(
+        repository, FakeCognitiveRepository(), KnowledgeQueryPolicy(enabled=True), FakeWikipedia(),
+    )
+    evidence = await service.grounding_evidence_for_event(event(982, "Как это понимать?"),
+                                                        "Как это понимать?")
+    assert evidence.facts == (definition,)
+    assert evidence.exact_answer is None
+    assert evidence.definitions == (("понимать", definition),)
 
 
 async def test_lookup_followup_reuses_the_previous_explicit_subject(database: Database) -> None:

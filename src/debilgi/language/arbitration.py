@@ -10,17 +10,20 @@ from difflib import SequenceMatcher
 from types import MappingProxyType
 from uuid import uuid4
 
+from debilgi.language.clarification_policy import clarification_rejection
 from debilgi.language.construction_nlg import ResponseContentPlan
 from debilgi.language.content import content_lemmas
 from debilgi.language.facts import (
     StructuredFact,
     covers_structured_fact,
 )
+from debilgi.language.lexical_gaps import irrelevant_lexical_question
+from debilgi.language.response_requirements import requirement_rejection
 from debilgi.language.structural_learning import (
     learned_structural_bonus,
     structural_response_features,
 )
-from debilgi.language.surface_coherence import evaluate_surface
+from debilgi.language.surface_coherence import COMPOSED_SURFACE_SOFT_ISSUES, evaluate_surface
 from debilgi.language.surface_policy import internal_surface_reason
 from debilgi.language.tokenizer import tokenize
 
@@ -60,6 +63,7 @@ class ContentProposal:
                 plan.response_goal or plan.response_act,
                 "|".join(fact.text for fact in plan.required_facts),
                 "|".join(plan.key_points),
+                str((metadata or {}).get("message_plan_key", "")),
             )
         )
         digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
@@ -311,6 +315,8 @@ class ScoredCandidate:
     total: float
     eligible: bool
     rejection_reasons: tuple[str, ...]
+    admission_score: float = 0.0
+    answer_status: str = "candidate"
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,6 +389,7 @@ class ResponseArbitrator:
         profile: ArbitrationProfile,
         structural_weights: Mapping[str, float] | None = None,
         used_fallback: bool = False,
+        clarifiable_terms: tuple[str, ...] | None = None,
     ) -> ArbitrationDecision:
         unique = self._deduplicate(candidates)
         proposals = {candidate.proposal.proposal_id: candidate.proposal for candidate in unique}
@@ -398,31 +405,29 @@ class ResponseArbitrator:
         )
         selected_proposal_ids = tuple(
             item.proposal.proposal_id for item in content_scores if item.eligible
-        )[:12]
-        surface_pool = (
-            tuple(
-                candidate
-                for candidate in unique
-                if candidate.proposal.proposal_id in selected_proposal_ids
-            )
-            if selected_proposal_ids
-            else unique
         )
         scores = tuple(
             self._score(
                 candidate,
+                clarifiable_terms=clarifiable_terms,
                 prompt=prompt,
                 focus_concepts=focus_concepts,
                 recent_replies=recent_replies,
                 profile=profile,
                 structural_weights=structural_weights or {},
             )
-            for candidate in surface_pool
+            # Confidence-only pruning used to hide potentially useful answers
+            # before their relevance or actual surface had even been assessed.
+            for candidate in unique
         )
         eligible = tuple(item for item in scores if item.eligible)
+        admitted = tuple(item for item in eligible if item.admission_score >= self.minimum_score)
         winner_score = max(
-            eligible,
+            admitted,
             key=lambda item: (
+                # Preserve competition between different valid answer methods;
+                # only a no-answer recovery belongs to a lower priority pool.
+                int(item.answer_status != "recovery"),
                 item.total,
                 _stable_number(f"{event_id}|{item.candidate.candidate_id}"),
             ),
@@ -430,11 +435,13 @@ class ResponseArbitrator:
         )
         winner = (
             winner_score.candidate
-            if winner_score is not None and winner_score.total >= self.minimum_score
+            if winner_score is not None
             else None
         )
         reason = (
-            "highest_score"
+            "grounded_answer_then_surface"
+            if winner_score is not None and winner_score.answer_status == "grounded_answer"
+            else "highest_score"
             if winner is not None
             else "below_minimum_score"
             if eligible
@@ -506,8 +513,17 @@ class ResponseArbitrator:
         recent_replies: tuple[str, ...],
         profile: ArbitrationProfile,
         structural_weights: Mapping[str, float],
+        clarifiable_terms: tuple[str, ...] | None = None,
     ) -> ScoredCandidate:
         reasons = self._hard_rejections(candidate)
+        if clarifiable_terms is not None and (
+            issue := clarification_rejection(candidate.text, clarifiable_terms)
+        ):
+            reasons = (*reasons, issue)
+        if irrelevant_lexical_question(prompt, candidate.text):
+            reasons = (*reasons, "definition_not_required_for_event")
+        if unmet := requirement_rejection(prompt, candidate.metadata):
+            reasons = (*reasons, unmet)
         features = extract_features(
             candidate,
             prompt=prompt,
@@ -550,8 +566,23 @@ class ResponseArbitrator:
         )
         components["learned_structure"] = structural_bonus * maximum
         total = sum(components.values()) / max(1.0, maximum)
+        answer_status = _answer_status(candidate, features, prompt, focus_concepts)
+        # Feedback about wording ranks admitted answers, but cannot suppress an
+        # otherwise grounded answer or turn lack of an answer into evidence.
+        admission_score = total
+        if answer_status == "grounded_answer":
+            stable_weights = {
+                name: DEFAULT_WEIGHTS.get(name, 0.0) for name in measured_features
+            }
+            admission_score = sum(
+                (-1 if name in _PENALTY_NAMES else 1) * stable_weights[name] * value
+                for name, value in measured_features.items()
+            ) / max(1.0, sum(
+                weight for name, weight in stable_weights.items() if name not in _PENALTY_NAMES
+            ))
         if reasons:
             total = min(total, -10.0)
+            admission_score = min(admission_score, -10.0)
         return ScoredCandidate(
             candidate=candidate,
             features=features,
@@ -559,11 +590,15 @@ class ResponseArbitrator:
             total=total,
             eligible=not reasons,
             rejection_reasons=reasons,
+            admission_score=admission_score,
+            answer_status=answer_status,
         )
 
     @staticmethod
     def _hard_rejections(candidate: ResponseCandidate) -> tuple[str, ...]:
         reasons: list[str] = []
+        if candidate.proposal.applicability is not None and candidate.proposal.applicability <= 0.0:
+            reasons.append("not_applicable")
         text = candidate.text.strip()
         normalized = text.casefold()
         if not text:
@@ -575,13 +610,19 @@ class ResponseArbitrator:
         surface = evaluate_surface(text)
         researched_fact_surface = bool(
             candidate.metadata.get("foreground_research") is True
+            and candidate.metadata.get("allow_rough_surface") is not True
             and candidate.required_facts
             and all(_covers_fact(text, fact) for fact in candidate.required_facts)
         )
         reasons.extend(
             f"surface:{issue}"
             for issue in surface.hard_issues
-            if not (researched_fact_surface and issue == "unexpected_valency_role")
+            if not (
+                (researched_fact_surface and issue == "unexpected_valency_role")
+                or (candidate.metadata.get("allow_rough_surface") is True
+                    and candidate.metadata.get("locally_composed") is True
+                    and issue in COMPOSED_SURFACE_SOFT_ISSUES)
+            )
         )
         explicit_rejection = candidate.metadata.get("hard_rejection")
         if isinstance(explicit_rejection, str) and explicit_rejection:
@@ -692,7 +733,13 @@ def extract_features(
         else 0.0
     )
     repetition_penalty = 1.0 - len(set(words)) / max(1, len(words))
-    broken_surface_penalty = float(bool(surface.hard_issues))
+    soft_surface = bool(
+        candidate.metadata.get("allow_rough_surface") is True
+        and candidate.metadata.get("locally_composed") is True
+        and surface.hard_issues
+        and not (set(surface.hard_issues) - COMPOSED_SURFACE_SOFT_ISSUES)
+    )
+    broken_surface_penalty = 0.15 if soft_surface else float(bool(surface.hard_issues))
     return CandidateFeatures(
         applicability=_clamp(applicability) if applicability is not None else None,
         context_relevance=_clamp(context_relevance),
@@ -717,6 +764,35 @@ def extract_features(
         repetition_penalty=_clamp(repetition_penalty),
         broken_surface_penalty=_clamp(broken_surface_penalty),
     )
+
+
+def _answer_status(
+    candidate: ResponseCandidate, features: CandidateFeatures,
+    prompt: str, focus_concepts: tuple[str, ...],
+) -> str:
+    metadata = candidate.metadata
+    if (candidate.source in {"fallback", "semantic_recovery"}
+            or metadata.get("semantic_recovery") is True):
+        return "recovery"
+    composed = bool(metadata.get("locally_composed") or (
+        metadata.get("authored_reply_template") is False
+        and (metadata.get("role_order") or metadata.get("proposition_count"))
+    ))
+    evidence = bool(candidate.required_facts or any(metadata.get(key) for key in (
+        "reasoning_evidence", "position_evidence", "used_evidence", "causal_path",
+    )))
+    # Binding is checked against actual words too; a producer's numerical
+    # confidence alone cannot make "I analyze context" answer any topic.
+    topics = set(content_lemmas(prompt)) | set(focus_concepts)
+    bound = bool(topics & set(content_lemmas(candidate.text)))
+    if not bound:
+        bound = bool(metadata.get("answer_slot") and features.semantic_frame_fit >= 0.8
+                     and metadata.get("obligation_fit", 0.0) >= 0.8)
+    if (composed and evidence and bound
+            and not metadata.get("response_signal_mismatch")
+            and metadata.get("semantic_scaffold") is not True):
+        return "grounded_answer"
+    return "candidate"
 
 
 def _speech_act_fit(speech_act: str, text: str) -> float:

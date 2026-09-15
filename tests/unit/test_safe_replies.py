@@ -1,29 +1,196 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 import debilgi.discord.replies as reply_module
 from debilgi.autonomy.models import InitiativeDecision
 from debilgi.cognition.models import ActionIntent, ActionType
+from debilgi.dataset.self_dataset import SelfDatasetRepository
 from debilgi.discord.replies import SafeMentionReplyService, _stable_response_seed
 from debilgi.events.models import Event, EventType
+from debilgi.events.repository import EventRepository
 from debilgi.experience.models import PreparedReply
+from debilgi.knowledge.models import WikipediaResult
+from debilgi.knowledge.repository import KnowledgeRepository
 from debilgi.language.arbitration import ArbitrationProfile
+from debilgi.language.assertion_experience import ExperienceGuidance
 from debilgi.language.causal_reasoning import infer_compositional_consequence
 from debilgi.language.conversation import ResponsePlan
-from debilgi.language.lexicon import ConfidenceProfile, UnknownKind, WordAnalysis
+from debilgi.language.lexicon import ConfidenceProfile, LexiconService, UnknownKind, WordAnalysis
 from debilgi.language.memory_based import MemoryPhraseGenerator
-from debilgi.language.open_questions import ExplanationResolution
+from debilgi.language.open_questions import ExplanationResolution, OpenLanguageQuestionService
 from debilgi.language.productive_nlg import realize_thought
-from debilgi.language.russian_reference import RemoteLexeme
+from debilgi.language.research_wait import LexicalResearchPending
+from debilgi.language.russian_reference import RemoteLexeme, RussianReferenceService
+from debilgi.language.ruwordnet import RuWordNet
 from debilgi.language.semantic_consultant import ConsultationResult
 from debilgi.language.sentence_understanding import UtteranceUnderstanding
 from debilgi.personality.expression import PersonalityExpressionEngine
 from debilgi.personality.genome import DEBILGI_GENOME
+from debilgi.storage.database import Database
 
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("surface_budget", [4, 48])
+@pytest.mark.parametrize("prompt,lemma,meanings,expected", [
+    ("Что думаешь о ножницах?", "ножницы",
+     ("режущий инструмент из двух раздвигающихся лезвий", "технический приём в футболе"),
+     ("полезными", "резать")),
+    ("У тебя нос капает?", "нос",
+     ("выступающая часть лица человека", "передняя часть судна"), ("носа", "тела")),
+    ("Что думаешь о грелке?", "грелка", ("согревающий прибор",), ("полезной", "согревать")),
+])
+async def test_dictionary_premises_reach_a_composed_selected_answer(
+    tmp_path, monkeypatch, prompt, lemma, meanings, expected, surface_budget,
+):
+    db = Database(tmp_path / "premises.sqlite3", Path(__file__).resolve().parents[2] / "migrations")
+    await db.initialize()
+    lexicon = LexiconService(db)
+    client = SimpleNamespace(lookup=AsyncMock(return_value=RemoteLexeme(
+        lemma, "NOUN", meanings, f"https://ru.wiktionary.org/wiki/{lemma}",
+    )))
+    reference = RussianReferenceService(db, lexicon, client, enabled=True)
+    try:
+        await reference.refresh_word(lemma)
+        current = event(mentioned=True, content=prompt)
+        await EventRepository(db).append(current)
+        service = SafeMentionReplyService(
+            FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+            EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""), lexicon=lexicon,
+            productive_only_replies=True, arbitration_mode="active", enabled=True,
+            arbitration_max_total_candidates=surface_budget,
+        )
+        decisions = []
+        remember = service._remember_arbitration
+
+        def capture(event_id, decision):
+            decisions.append(decision)
+            remember(event_id, decision)
+
+        monkeypatch.setattr(service, "_remember_arbitration", capture)
+        prepared = await service.prepare_reply(current)
+        assert prepared is not None
+        assert all(part in prepared.text for part in expected)
+        assert "потому что" in prepared.text
+        assert prepared.response_source == "arbitrated:semantic_reasoning"
+        assert prepared.assertion_experience is None
+        winner = decisions[-1].winner
+        assert winner.renderer.startswith("premise_chain:")
+        assert winner.metadata["locally_composed"] is True
+        assert winner.metadata["thought_before_surface"] is True
+        assert winner.metadata["reader_checked"] is True
+        assert winner.metadata["message_plan_key"]
+        assert winner.metadata["message_plan"]["reason"] is not None
+        assert winner.metadata["reasoning_evidence"]
+        assert winner.metadata["conditional_assumption"] == (len(meanings) > 1)
+        assert ("Если" in prepared.text) == (len(meanings) > 1)
+        client.lookup.assert_awaited_once_with(lemma)
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize("prompt,expected", [
+    ("Что такое спаржа?", "Спаржа является овощем."),
+    ("Что такое замок?", "«замок» означает «замок для запирания» или «средневековый замок»."),
+])
+async def test_installed_ruwordnet_reaches_selected_reply_without_network(
+    tmp_path, prompt, expected,
+):
+    root = Path(__file__).resolve().parents[2]
+    reference = root / "data/models/ruwordnet/ruwordnet-2021.db"
+    if not reference.exists():
+        pytest.skip("Published RuWordNet database is an optional local installation")
+    db = Database(tmp_path / "reply-ruwordnet.sqlite3", root / "migrations")
+    await db.initialize()
+    try:
+        current = event(mentioned=True, content=prompt)
+        await EventRepository(db).append(current)
+        service = SafeMentionReplyService(
+            FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+            EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+            lexicon=LexiconService(db, ruwordnet=RuWordNet(reference)),
+            productive_only_replies=True, arbitration_mode="active", enabled=True,
+        )
+        prepared = await service.prepare_reply(current)
+        assert prepared is not None
+        assert prepared.text == expected
+        assert prepared.response_source == "arbitrated:semantic_thought"
+    finally:
+        await db.close()
+
+
+async def test_acquired_definition_reaches_the_selected_reply_without_network(tmp_path):
+    db = Database(
+        tmp_path / "reply-definition.sqlite3", Path(__file__).resolve().parents[2] / "migrations"
+    )
+    await db.initialize()
+    try:
+        current = event(mentioned=True, content="Для чего ручка?")
+        await EventRepository(db).append(current)
+        await KnowledgeRepository(db).store_internalized_concept(
+            current, query="ручка", source="wikipedia", language="ru",
+            result=WikipediaResult(1, "Ручка", "Ручка — письменный инструмент для письма.",
+                "https://ru.wikipedia.org/wiki/Ручка", None, 1, ()),
+        )
+        service = SafeMentionReplyService(
+            FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+            EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+            lexicon=LexiconService(db), productive_only_replies=True,
+            arbitration_mode="active", enabled=True,
+        )
+        prepared = await service.prepare_reply(current)
+        assert prepared is not None
+        assert prepared.text == "Ручка используется для письма."
+        assert prepared.response_source == "arbitrated:semantic_thought"
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize("autonomous", [False, True])
+async def test_temporal_continuation_uses_attributed_memory_without_external_planner(autonomous):
+    async def adapt(current, prompt, plan):
+        return plan, ExperienceGuidance()
+
+    experiences = SimpleNamespace(adapt=AsyncMock(side_effect=adapt), record_sent=AsyncMock())
+    prior = replace(
+        event(mentioned=False, author_is_bot=True, actor_id=123, target_id=100,
+              bot_user_id=123, content="Я пока не открыл дверь.", event_id="prior"),
+        timestamp=NOW - timedelta(seconds=2),
+    )
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(channel_events=(prior,)),
+        FakeArchiveRepository(), EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE,
+        FixedGenerator(""), arbitration_mode="active",
+        productive_only_replies=True, enabled=True, assertion_experiences=experiences,
+    )
+    service._autonomous_planning_required = autonomous
+    current = event(mentioned=True, bot_user_id=123, content="Ну всё, время настало")
+    context = await service._reply_context(current, intent())
+    assert context.assertion_continuation is not None
+    prepared = await service.prepare_reply(current)
+    assert prepared is not None
+    assert prepared.text == "Я открыл дверь?"
+    assert prepared.response_source == "arbitrated:dialogue_context"
+    assert prepared.assertion_experience is not None
+    assert prepared.assertion_experience["anchor_event_id"] == prior.event_id
+    experiences.record_sent.assert_not_awaited()
+    await service.record_sent(
+        current, response_message_id=1234, reply=replace(prepared, fallback=True), created_at=NOW,
+    )
+    experiences.record_sent.assert_awaited_once_with(
+        current, response_message_id=1234, proposal=prepared.assertion_experience, created_at=NOW,
+    )
+    # A learned rejection must actually remove this interpretation from runtime context.
+    experiences.adapt = AsyncMock(return_value=(None, ExperienceGuidance(0, 2)))
+    rejected_context = await service._reply_context(current, intent())
+    assert rejected_context.assertion_continuation is None
+    assert rejected_context.assertion_feedback_counts == (0, 2)
 
 
 def test_research_surface_gate_separates_answers_from_dictionary_metadata() -> None:
@@ -858,7 +1025,7 @@ async def test_sent_identity_answer_is_logged_without_prescribing_its_name(monke
     assert "Имя, полученное из генерации." in records[0]
 
 
-async def test_sent_unknown_fallback_opens_a_per_user_question_marker() -> None:
+async def test_unknown_statement_does_not_open_a_question_even_with_stale_pending_marker() -> None:
     questions = FakeOpenQuestions()
     current = event(mentioned=True, content="<@123> что такое стромба")
     service = SafeMentionReplyService(
@@ -889,7 +1056,7 @@ async def test_sent_unknown_fallback_opens_a_per_user_question_marker() -> None:
         created_at=NOW,
     )
 
-    assert questions.opened == [("стромба", 700)]
+    assert questions.opened == []
 
 
 async def test_incoherent_reply_is_not_saved_as_successful_language_experience() -> None:
@@ -951,13 +1118,13 @@ async def test_unknown_generation_queues_learning_without_opening_a_user_questio
 
     assert prepared is not None
     assert prepared.pending_concept is None
-    assert "стромба" in prepared.text
+    assert not reply_module.requests_word_definition(prepared.text)
     assert "самостоятельный разбор" not in prepared.text
     assert "очеред" not in prepared.text
     assert lexicon.queued == ["стромба"]
 
 
-async def test_explicit_definition_request_can_still_open_a_word_question() -> None:
+async def test_explicit_definition_request_does_not_ask_user_to_define_it() -> None:
     lexicon = UnknownLexicon()
     current = event(mentioned=True, content="<@123> что такое стромба")
     service = SafeMentionReplyService(
@@ -975,7 +1142,8 @@ async def test_explicit_definition_request_can_still_open_a_word_question() -> N
     prepared = await service.prepare_reply(current)
 
     assert prepared is not None
-    assert prepared.pending_concept == "стромба"
+    assert prepared.pending_concept is None
+    assert not reply_module.requests_word_definition(prepared.text)
     assert lexicon.queued == ["стромба"]
 
 
@@ -1761,6 +1929,224 @@ async def test_active_arbitration_can_answer_from_grounded_meaning_plan() -> Non
     assert not prepared.fallback
 
 
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("repair", [False, True])
+async def test_reference_learning_cannot_replace_conversation_with_a_definition(
+    cached: bool, repair: bool,
+) -> None:
+    from debilgi.knowledge.models import KnowledgeGrounding
+
+    definition = "понимать — постигать смысл какого-либо высказывания, явления"
+
+    class ReferenceKnowledge:
+        async def grounding_evidence_for_event(self, current, prompt):
+            if cached:
+                return KnowledgeGrounding(
+                    facts=(definition,), exact_answer=definition,
+                    definitions=(("понимать", definition),),
+                )
+            return KnowledgeGrounding()
+
+        async def internalize_for_reasoning(self, current, terms, *, limit=6):
+            return (SimpleNamespace(title="понимать", definition=definition),)
+
+    history = (
+        event(mentioned=True, content="Как это понимать?", event_id="discord:message:question"),
+        event(mentioned=False, author_is_bot=True, actor_id=123,
+              content=definition, event_id="discord:message:bad-answer"),
+    ) if repair else ()
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(channel_events=history),
+        FakeArchiveRepository(exact_reply=definition),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(definition),
+        knowledge_service=ReferenceKnowledge(), lexicon=RelationLexicon(),
+        arbitration_mode="active", arbitration_minimum_score=0.0,
+        productive_only_replies=True, enabled=True,
+    )
+    current = event(mentioned=True, content=(
+        "<@123> О как, но я это не спрашивал" if repair else "<@123> Как это понимать?"
+    ))
+    context = await service._reply_context(current, intent())
+    assert not context.required_facts
+    assert context.exact_answer is None
+    prepared = await service.prepare_reply(current)
+    assert prepared is not None
+    assert "постигать" not in prepared.text.casefold()
+    assert "какого-либо" not in prepared.text.casefold()
+    assert not reply_module.requests_word_definition(prepared.text)
+
+
+@pytest.mark.parametrize("prompt", ["Что значит понимать?", "Объясни значение слова понимать"])
+async def test_explicit_definition_can_surface_reference_evidence(prompt: str, monkeypatch) -> None:
+    from debilgi.knowledge.models import KnowledgeGrounding
+
+    definition = "понимать — постигать смысл какого-либо высказывания, явления"
+
+    class ReferenceKnowledge:
+        async def grounding_evidence_for_event(self, current, prompt):
+            return KnowledgeGrounding(
+                facts=(definition,), definitions=(("понимать", definition),),
+            )
+
+        async def internalize_for_reasoning(self, current, terms, *, limit=6):
+            return (SimpleNamespace(title="понимать", definition=definition),)
+
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        knowledge_service=ReferenceKnowledge(), lexicon=RelationLexicon(),
+        arbitration_mode="active", arbitration_minimum_score=0.0,
+        productive_only_replies=True, enabled=True,
+    )
+    decisions = []
+    remember = service._remember_arbitration
+    def capture(event_id, decision):
+        decisions.append(decision)
+        remember(event_id, decision)
+    monkeypatch.setattr(service, "_remember_arbitration", capture)
+    prepared = await service.prepare_reply(event(mentioned=True, content=prompt))
+    assert prepared is not None
+    assert "постигать смысл" in prepared.text.casefold()
+    assert not reply_module.requests_word_definition(prepared.text)
+    assert prepared.text != definition
+    assert decisions[-1].winner.renderer == "definition_action_roles"
+    assert "action_complement" in decisions[-1].winner.metadata["role_order"]
+    assert decisions[-1].winner.metadata["locally_composed"] is True
+
+
+@pytest.mark.parametrize(("prompt", "definition"), [
+    ("И что это мне должно давать", "давать — перемещать что-либо в распоряжение другого субъекта"),
+    ("Ок и че?", "Отве́т — реплика, вызванная заданным вопросом или реакция на какое-либо событие."),
+])
+async def test_old_untyped_definitions_cannot_become_answer_plans(prompt, definition, monkeypatch):
+    # Historical memory lacks the provenance now provided by reference services.
+    knowledge = SimpleNamespace(
+        grounding_for_event=AsyncMock(return_value=((definition,), definition)),
+        internalize_for_reasoning=AsyncMock(return_value=()),
+    )
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(exact_reply=definition),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(definition),
+        knowledge_service=knowledge, lexicon=RelationLexicon(),
+        productive_only_replies=True, arbitration_mode="active",
+        arbitration_minimum_score=0.0, enabled=True,
+    )
+    decisions = []
+    remember = service._remember_arbitration
+    def capture(event_id, decision):
+        decisions.append(decision)
+        remember(event_id, decision)
+    monkeypatch.setattr(service, "_remember_arbitration", capture)
+    reply = await service.prepare_reply(event(mentioned=True, content=prompt))
+    assert reply is not None
+    assert reply.text != definition
+    assert not any(
+        word in reply.text.casefold() for word in ("распоряжение", "реплика", "субъекта")
+    )
+    assert not any(
+        score.eligible and score.candidate.renderer in {
+            "internalized_lexical_fact", "multi_act_knowledge_then_position",
+        }
+        for decision in decisions for score in decision.scores
+    )
+
+
+async def test_productive_fact_answer_is_composed_without_a_raw_required_reply(monkeypatch):
+    fact = "Лиса взяла красный ключ со стола."
+    knowledge = SimpleNamespace(
+        grounding_for_event=AsyncMock(return_value=((fact,), fact)),
+        internalize_for_reasoning=AsyncMock(return_value=()),
+    )
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        knowledge_service=knowledge, productive_only_replies=True,
+        arbitration_mode="active", arbitration_minimum_score=0.0, enabled=True,
+    )
+    decisions = []
+    remember = service._remember_arbitration
+    def capture(event_id, decision):
+        decisions.append(decision)
+        remember(event_id, decision)
+    monkeypatch.setattr(service, "_remember_arbitration", capture)
+    reply = await service.prepare_reply(event(mentioned=True, content="Что сделала лиса?"))
+    assert reply is not None
+    assert "ключ" in reply.text.casefold()
+    assert decisions[-1].winner.renderer == "structured_russian"
+    assert decisions[-1].winner.metadata["proposition_count"] == 1
+    assert decisions[-1].winner.metadata["locally_composed"] is True
+
+
+async def test_event_answer_does_not_wait_for_an_incidental_word_lookup():
+    reference = SimpleNamespace(
+        refresh_word=AsyncMock(return_value=None),
+        retry_delay_for=AsyncMock(return_value=300),
+    )
+    previous = replace(
+        event(mentioned=True, content="Я положил фепку на стол",
+              event_id="discord:message:previous-event"),
+        timestamp=NOW - timedelta(seconds=1),
+    )
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(channel_events=(previous,)), FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        lexicon=RelationLexicon(), russian_reference=reference,
+        arbitration_mode="active", productive_only_replies=True,
+        arbitration_minimum_score=0.0, enabled=True,
+    )
+    prepared = await service.prepare_reply(event(mentioned=True, content="Куда я положил фепку?"))
+    assert prepared is not None
+    assert "на стол" in prepared.text.casefold()
+    reference.refresh_word.assert_not_awaited()
+    # An empty task dependency list must not consult a service-wide pending status.
+    reference.retry_delay_for.assert_not_awaited()
+
+
+async def test_missing_reference_is_not_sent_to_dictionary_recovery():
+    reference = SimpleNamespace(
+        refresh_word=AsyncMock(return_value=None),
+        retry_delay_for=AsyncMock(return_value=300),
+    )
+    knowledge = SimpleNamespace(
+        grounding_for_event=AsyncMock(return_value=((), None)),
+        internalize_for_reasoning=AsyncMock(return_value=()),
+        investigate=AsyncMock(return_value=()),
+    )
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        lexicon=RelationLexicon(), russian_reference=reference, knowledge_service=knowledge,
+        arbitration_mode="active", productive_only_replies=True,
+        arbitration_minimum_score=0.0, enabled=True,
+    )
+    prepared = await service.prepare_reply(event(mentioned=True, content="Как это понимать?"))
+    assert prepared is not None
+    reference.refresh_word.assert_not_awaited()
+    reference.retry_delay_for.assert_not_awaited()
+    knowledge.internalize_for_reasoning.assert_not_awaited()
+    knowledge.investigate.assert_not_awaited()
+
+
+async def test_deferred_turn_cannot_bind_a_reference_to_a_future_message():
+    previous = replace(
+        event(mentioned=True, content="Волк живёт в лесу", event_id="discord:message:old"),
+        timestamp=NOW - timedelta(seconds=1),
+    )
+    future = replace(
+        event(mentioned=True, content="Кот живёт на кухне", event_id="discord:message:future"),
+        timestamp=NOW + timedelta(seconds=1),
+    )
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(channel_events=(previous, future)),
+        FakeArchiveRepository(), EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE,
+        FixedGenerator(""), enabled=True,
+    )
+    context = await service._reply_context(event(mentioned=True, content="Где он живёт?"), intent())
+    assert "волк живёт в лесу" in context.dialogue_messages
+    assert "кот живёт на кухне" not in context.dialogue_messages
+    assert all("кухне" not in message for message in context.consultation_messages)
+
+
 async def test_agent_intent_question_does_not_surface_a_dictionary_fact() -> None:
     class MisleadingKnowledge:
         async def grounding_for_event(
@@ -2242,6 +2628,7 @@ async def test_generic_no_data_surface_is_rejected_for_any_unresolved_question()
     assert prepared.text in {
         "Причина остаётся загадкой.",
         "Я не могу ответить на этот вопрос.",
+        "Я не знаю причины.",
     }
     assert "достаточ" not in prepared.text.casefold()
     assert "данн" not in prepared.text.casefold()
@@ -2767,7 +3154,7 @@ async def test_repeated_relation_question_keeps_the_bound_answer() -> None:
     assert prepared.response_source == "arbitrated:relation_reasoning"
 
 
-async def test_self_state_question_is_answered_from_local_state_without_reply_template() -> None:
+async def test_morphological_familiarity_does_not_claim_understanding_of_an_idea() -> None:
     previous = event(
         mentioned=True,
         content="<@123> Идея в том, чтобы сначала собрать мысль, а потом строить фразу.",
@@ -2790,7 +3177,7 @@ async def test_self_state_question_is_answered_from_local_state_without_reply_te
     prepared = await service.prepare_reply(event(mentioned=True, content="<@123> А ты понял идею?"))
 
     assert prepared is not None
-    assert prepared.text in {"Да, я понял идею.", "Да, идею я понял."}
+    assert prepared.text == "Нет, я не понял идею."
     assert prepared.response_source == "arbitrated:semantic_thought"
 
 
@@ -3002,6 +3389,9 @@ async def test_recent_conversational_failures_are_resolved_by_semantic_roles(
     prepared = await service.prepare_reply(event(mentioned=True, content=prompt))
 
     assert prepared is not None
+    if "считаешь себя умным" in prompt:
+        assert not prepared.text.startswith("Да,")
+        return
     assert prepared.text == expected
     assert prepared.response_source == source
 
@@ -3040,7 +3430,7 @@ async def test_counterevidence_revises_previous_internal_capability_answer() -> 
     assert prepared.response_source == "arbitrated:dialogue_context"
 
 
-async def test_epistemic_cause_identifies_overcautious_threshold() -> None:
+async def test_epistemic_cause_does_not_invent_a_threshold_failure() -> None:
     previous = event(
         mentioned=False,
         author_is_bot=True,
@@ -3067,11 +3457,10 @@ async def test_epistemic_cause_identifies_overcautious_threshold() -> None:
     )
 
     assert prepared is not None
-    assert prepared.text == ("Я слишком осторожно отвечаю из-за завышенного порога.")
-    assert prepared.response_source == "arbitrated:dialogue_context"
+    assert "порог" not in prepared.text.casefold()
 
 
-async def test_criticism_after_no_data_reply_explains_overcautious_threshold() -> None:
+async def test_criticism_after_no_data_reply_does_not_invent_a_threshold_failure() -> None:
     previous = event(
         mentioned=False,
         author_is_bot=True,
@@ -3101,8 +3490,7 @@ async def test_criticism_after_no_data_reply_explains_overcautious_threshold() -
     )
 
     assert prepared is not None
-    assert prepared.text == ("Я слишком осторожно отвечаю из-за завышенного порога.")
-    assert prepared.response_source == "arbitrated:dialogue_context"
+    assert "порог" not in prepared.text.casefold()
     assert "недостаточ" not in prepared.text.casefold()
 
 
@@ -3433,8 +3821,8 @@ async def test_answer_failure_retries_the_previous_question_instead_of_commentin
     )
 
     assert prepared is not None
-    assert prepared.text == "Нет, я не считаю себя осознанным."
-    assert prepared.response_source == "arbitrated:semantic_thought"
+    assert not prepared.text.startswith("Да,")
+    assert "умник ответил" not in prepared.text.casefold()
 
 
 async def test_consciousness_question_rejects_fluent_unrelated_graph_answer() -> None:
@@ -3459,8 +3847,8 @@ async def test_consciousness_question_rejects_fluent_unrelated_graph_answer() ->
     )
 
     assert prepared is not None
-    assert prepared.text == "Нет, я не считаю себя осознанным."
-    assert prepared.response_source == "arbitrated:semantic_thought"
+    assert not prepared.text.startswith("Да,")
+    assert "умник ответил" not in prepared.text.casefold()
 
 
 async def test_open_self_reflection_uses_semantic_state_not_grammar_memory() -> None:
@@ -4143,7 +4531,8 @@ async def test_recovery_does_not_promote_scaffold_below_the_quality_threshold() 
     )
 
     assert prepared is not None
-    assert prepared.text == "Я не могу сформулировать связный ответ."
+    assert prepared.text.endswith("?")
+    assert "сформулировать" not in prepared.text.casefold()
     assert prepared.response_source == "arbitrated:semantic_recovery"
     assert planner.calls == 1
 
@@ -4211,8 +4600,155 @@ async def test_local_productive_reasoning_survives_external_plan_failure() -> No
     assert directive.text == "Я не могу выкинуть мусорку.", directive.text.encode("unicode_escape")
     assert directive.response_source == "arbitrated:semantic_reasoning"
     assert fragment is not None
-    assert fragment.text == "Я не могу сформулировать связный ответ."
+    assert "подразумеваешь" not in fragment.text.casefold()
     assert fragment.response_source == "arbitrated:semantic_recovery"
+
+
+@pytest.mark.parametrize("prompt", ["але", "алло?", "эй", "ну ау", "привет"])
+async def test_contact_does_not_enter_lexical_clarification(prompt):
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        productive_only_replies=True, arbitration_mode="active", enabled=True,
+    )
+    prepared = await service.prepare_reply(event(mentioned=True, content=prompt))
+    assert prepared is not None
+    assert not prepared.text.endswith("?")
+    assert "слуш" in prepared.text.casefold() or "привет" in prepared.text.casefold()
+
+
+@pytest.mark.parametrize("autonomous", [False, True])
+async def test_name_question_uses_gateway_fact_in_productive_mode(autonomous):
+    current = event(mentioned=True, content="Как тебя зовут?")
+    current = replace(current, payload={
+        **current.payload, "bot_identity": {"id": 123, "display_name": "DEBiLGI"},
+    })
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        productive_only_replies=True, arbitration_mode="active", enabled=True,
+    )
+    service._autonomous_planning_required = autonomous
+    prepared = await service.prepare_reply(current)
+    assert prepared is not None
+    assert "DEBiLGI" in prepared.text
+    assert "подразумеваешь" not in prepared.text
+    assert prepared.response_source == "arbitrated:discord_identity"
+
+
+async def test_generated_definition_question_registers_a_learning_obligation():
+    questions = FakeOpenQuestions()
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        open_questions=questions, enabled=True,
+    )
+    current = event(mentioned=True, content="кваргония")
+    prepared = PreparedReply(
+        text="Что ты подразумеваешь под «кваргония»?", intent_id="intent:test",
+        tokens=(), genome_signature="test", candidate_count=1, fallback=True,
+        response_source="arbitrated:semantic_recovery",
+    )
+    await service.record_sent(current, response_message_id=99, reply=prepared, created_at=NOW)
+    assert questions.opened == [("кваргония", 99)]
+
+
+async def test_voluntary_lesson_changes_future_reply_after_restart_without_question(tmp_path):
+    db = Database(
+        tmp_path / "learning-cycle.sqlite3", Path(__file__).resolve().parents[2] / "migrations",
+    )
+    await db.initialize()
+    try:
+        lexicon = LexiconService(db)
+        questions = OpenLanguageQuestionService(db, lexicon, SelfDatasetRepository(db))
+        experience = SimpleNamespace(
+            transition_adjustments=EXPERIENCE.transition_adjustments, register_sent=AsyncMock(),
+        )
+
+        def service():
+            return SafeMentionReplyService(
+                SimpleNamespace(intent_for_event=AsyncMock(return_value=intent())),
+                FakeMemory(), FakeArchiveRepository(),
+                EXPRESSION_ENGINE, experience, INITIATIVE, FixedGenerator(""),
+                lexicon=lexicon, open_questions=questions,
+                productive_only_replies=True, arbitration_mode="active", enabled=True,
+            )
+
+        current = event(mentioned=True, content="кваргония")
+        await EventRepository(db).append(current)
+        await lexicon.observe(current)
+        bot = service()
+        question = await bot.prepare_reply(current)
+        assert question is not None and not reply_module.requests_word_definition(question.text)
+        assert await questions.active_for(1, 10, 100) is None
+        lesson = event(mentioned=True, content="Кваргония это настольная игра", event_id="lesson")
+        await EventRepository(db).append(lesson)
+        await lexicon.observe(lesson)
+        await db.close()
+        await db.initialize()
+        lexicon = LexiconService(db)
+        questions = OpenLanguageQuestionService(db, lexicon, SelfDatasetRepository(db))
+        followup = event(mentioned=True, content="Что такое кваргония?", event_id="followup")
+        await EventRepository(db).append(followup)
+        answer = await service().prepare_reply(followup)
+        assert answer is not None
+        assert "настольной игрой" in answer.text
+        assert "подразумеваешь" not in answer.text
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize("word,meaning,expected", [
+    ("кваргония", "настольная игра", "настольной игрой"),
+    ("спаржа", "овощ", "овощем"),
+])
+async def test_dictionary_outage_defers_original_reply_then_found_meaning_answers_it(
+    tmp_path, word, meaning, expected,
+):
+    db = Database(tmp_path / "research.sqlite3", Path(__file__).resolve().parents[2] / "migrations")
+    await db.initialize()
+
+    class ReferenceClient:
+        available = False
+
+        async def lookup(self, term):
+            if term != word:
+                return None
+            if not self.available:
+                raise OSError("temporary reference outage")
+            return RemoteLexeme(term, "NOUN", (meaning,), "https://example.test/dictionary")
+
+        async def close(self):
+            pass
+
+    client = ReferenceClient()
+    lexicon = LexiconService(db)
+    reference = RussianReferenceService(db, lexicon, client, enabled=True)
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        lexicon=lexicon, russian_reference=reference,
+        productive_only_replies=True, arbitration_mode="active", enabled=True,
+    )
+    current = event(mentioned=True, content=f"Что такое {word}?")
+    try:
+        await EventRepository(db).append(current)
+        with pytest.raises(LexicalResearchPending) as wait:
+            await service.prepare_guaranteed_reply(current)
+        assert word in wait.value.terms
+        assert 1 <= wait.value.retry_after <= 300
+        client.available = True
+        await db.execute(
+            "UPDATE language_reference_lookups SET checked_at='2000-01-01T00:00:00+00:00'",
+        )
+        prepared = await service.prepare_guaranteed_reply(current)
+        assert prepared is not None
+        assert expected in prepared.text
+        assert not reply_module.requests_word_definition(prepared.text)
+        assert (await lexicon.analyze_word(word)).has_usable_meaning
+    finally:
+        await reference.stop()
+        await db.close()
 
 
 async def test_bare_reply_label_is_digested_as_evaluation_not_definition_probe() -> None:
@@ -4328,7 +4864,20 @@ async def test_addressed_statement_gets_content_bound_continuation_at_live_thres
     assert "тему" not in prepared.text.casefold()
 
 
-async def test_epistemic_recovery_is_not_forced_below_threshold_after_plan_failure() -> None:
+@pytest.mark.parametrize("learned_penalty", [False, True])
+async def test_grounded_clarification_survives_learned_failure_penalties(
+    learned_penalty: bool,
+) -> None:
+    class NegativeFeedbackRepository:
+        async def profile(self, guild_id):
+            return ArbitrationProfile.baseline(guild_id)
+
+        async def structural_weights(self, guild_id):
+            return {"source:semantic_recovery": -100.0}
+
+        async def save_decision(self, *args, **kwargs):
+            pass
+
     class UnavailablePlanner:
         autonomous_planning = True
         trigger_threshold = 0.72
@@ -4350,6 +4899,7 @@ async def test_epistemic_recovery_is_not_forced_below_threshold_after_plan_failu
         INITIATIVE,
         FixedGenerator("Повтори запрос: сейчас ответ не отправился."),
         semantic_consultant=UnavailablePlanner(),  # type: ignore[arg-type]
+        arbitration_repository=NegativeFeedbackRepository() if learned_penalty else None,
         arbitration_mode="active",
         arbitration_minimum_score=0.45,
         productive_only_replies=True,
@@ -4361,7 +4911,8 @@ async def test_epistemic_recovery_is_not_forced_below_threshold_after_plan_failu
     )
 
     assert prepared is not None
-    assert prepared.text == "Я не могу сформулировать связный ответ."
+    assert prepared.text == "Я не знаю ответа."
+    assert "сформулировать" not in prepared.text.casefold()
     assert prepared.response_source == "arbitrated:semantic_recovery"
 
 
@@ -4567,6 +5118,139 @@ async def test_productive_scene_inquiry_reasons_before_answering() -> None:
     assert "похоже" in prepared.text.casefold()
     assert "вероятно" in prepared.text.casefold()
     assert planner.calls == 0
+
+
+@pytest.mark.parametrize("question,answer,expected", [
+    ("Что ты подразумеваешь под «салфетка»?", "Это бумага такая для гигиены",
+     "Салфетка является бумагой для гигиены?"),
+    ("Кто открыл дверь?", "Маша", "Маша открыла дверь?"),
+    ("Что ты открыл?", "Дверь", "Ты открыл дверь?"),
+    ("Где лежит ключ?", "На столе", "Ключ лежит на столе?"),
+])
+async def test_user_definition_answers_previous_lexical_question_productively(
+    question, answer, expected,
+) -> None:
+    previous = event(
+        mentioned=False, author_is_bot=True, actor_id=123,
+        content=question,
+        event_id="discord:message:definition-question",
+    )
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(channel_events=(previous,)),
+        FakeArchiveRepository(), EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE,
+        FixedGenerator(""), arbitration_mode="active", arbitration_minimum_score=0.45,
+        productive_only_replies=True, enabled=True,
+    )
+    prepared = await service.prepare_reply(event(
+        mentioned=True, content=f"<@123> {answer}",
+    ))
+    assert prepared is not None
+    assert prepared.text == expected
+
+
+@pytest.mark.parametrize("report,prompt,expected", [
+    ("Я вчера потерял зюзюбрик", "Когда я его потерял?", "вчера"),
+    ("Я потерял зюзюбрик в парке", "Где я его потерял?", "в парке"),
+])
+async def test_event_slot_answer_does_not_require_unknown_object_definition(
+    report, prompt, expected,
+):
+    previous = replace(event(mentioned=True, content=report, event_id="prior", bot_user_id=123),
+                       timestamp=NOW - timedelta(seconds=5))
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(channel_events=(previous,)), FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        arbitration_mode="active", productive_only_replies=True, enabled=True,
+    )
+    prepared = await service.prepare_reply(event(mentioned=True, content=prompt, bot_user_id=123))
+    assert prepared is not None
+    assert expected in prepared.text
+    assert "зюзюбрик" in prepared.text
+    assert not prepared.text.endswith("?")
+
+
+async def test_unknown_event_object_does_not_trigger_foreground_dictionary_question():
+    lexicon = UnknownLexicon()
+    reference = SimpleNamespace(refresh_word=AsyncMock(return_value=None))
+    current = event(mentioned=True, content="Я вчера потерял зюзюбрик", bot_user_id=123)
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(), FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        lexicon=lexicon, russian_reference=reference, arbitration_mode="active",
+        productive_only_replies=True, enabled=True,
+    )
+    prepared = await service.prepare_reply(current)
+    assert prepared is not None
+    assert "подразумеваешь" not in prepared.text
+    assert "зюзюбрик" in prepared.text
+    reference.refresh_word.assert_not_awaited()
+
+
+async def test_claim_explanation_and_challenge_keep_context_across_turns():
+    class ConversationRepository(FakeRepository):
+        async def intent_for_event(self, event_id):
+            return self.stored_intent
+
+    memory = FakeMemory(channel_events=(event(
+        mentioned=False, author_is_bot=True, actor_id=123,
+        content="Да, считаю я себя хищником.", event_id="discord:message:initial-claim",
+    ),))
+    service = SafeMentionReplyService(
+        ConversationRepository(intent()), memory, FakeArchiveRepository(),
+        EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        arbitration_mode="active", productive_only_replies=True, enabled=True,
+    )
+    for index, prompt in enumerate((
+        "А почему так считаешь?",
+        "Ну типо почему ты так себя представляешь",
+        "Но ты сказал, что ты хищник",
+    )):
+        current = event(mentioned=True, content=f"<@123> {prompt}",
+                        event_id=f"discord:message:followup-{index}")
+        prepared = await service.prepare_reply(current)
+        assert prepared is not None
+        assert "подразумеваешь" not in prepared.text
+        assert not prepared.text.endswith("?")
+        if index == 2:
+            assert "хищником" in prepared.text
+            assert "говорил" in prepared.text
+        memory.channel_events = (*memory.channel_events, current, event(
+            mentioned=False, author_is_bot=True, actor_id=123, content=prepared.text,
+            event_id=f"discord:message:answer-{index}",
+        ))
+
+
+@pytest.mark.parametrize("prompt,expected_goal", [
+    ("А почему так считаешь?", "reason"),
+    ("Ну типо почему ты так себя представляешь", "reason"),
+    ("Но ты сказал, что ты хищник", "review"),
+])
+@pytest.mark.parametrize("autonomous", [False, True])
+async def test_own_claim_followups_do_not_degrade_to_word_definitions(
+    prompt, expected_goal, autonomous,
+):
+    previous = event(
+        mentioned=False, author_is_bot=True, actor_id=123,
+        content="Да, считаю я себя хищником.", event_id="discord:message:own-claim",
+    )
+    service = SafeMentionReplyService(
+        FakeRepository(intent()), FakeMemory(channel_events=(previous,)),
+        FakeArchiveRepository(), EXPRESSION_ENGINE, EXPERIENCE, INITIATIVE, FixedGenerator(""),
+        arbitration_mode="active", arbitration_minimum_score=0.45,
+        productive_only_replies=True, enabled=True,
+    )
+    service._autonomous_planning_required = autonomous
+    prepared = await service.prepare_reply(event(mentioned=True, content=f"<@123> {prompt}"))
+    assert prepared is not None
+    assert "подразумеваешь" not in prepared.text
+    assert not prepared.text.endswith("?")
+    if expected_goal == "review":
+        assert "хищником" in prepared.text
+        assert "говорил" in prepared.text
+        assert "обоснован" in prepared.text
+    else:
+        assert any(term in prepared.text for term in ("причин", "основан"))
+        assert prepared.text != "Нет, я не представляю себя."
 
 
 async def test_emotional_clarification_repairs_runtime_answer_instead_of_reusing_it() -> None:

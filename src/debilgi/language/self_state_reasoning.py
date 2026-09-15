@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from debilgi.language.content import content_lemmas
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
@@ -27,7 +27,6 @@ _STATE_PREDICATES = {
     "affective_state": frozenset({"чувствовать", "ощущать"}),
     "threat_response": frozenset({"бояться", "пугаться", "страшиться"}),
 }
-_NON_ATTESTED_SELF_TRAITS = frozenset({"осознанный", "сознательный"})
 _COGNITIVE_LEVEL_TARGETS = frozenset(
     {"мышление", "рассуждение", "интеллект", "анализ"}
 )
@@ -252,24 +251,9 @@ def reason_about_self_state(
         )
 
     if frame.state == "self_assessment":
-        trait = frame.target.head.lemma if frame.target is not None else ""
-        actual = bool(
-            understanding.sufficient
-            and frame.target is not None
-            and trait not in _NON_ATTESTED_SELF_TRAITS
-        )
-        thought = _self_assessment_thought(frame, actual)
         return SelfStateResolution(
-            thought,
-            frame.state,
-            actual,
-            min(0.94, frame.confidence * 0.84 + 0.12),
-            (
-                "local_self_assessment",
-                "trait_not_supported_by_self_model"
-                if trait in _NON_ATTESTED_SELF_TRAITS
-                else "structural_parse_sufficient",
-            ),
+            None, frame.state, None, frame.confidence * 0.6,
+            ("requires_contextual_owned_position",),
         )
 
     target_terms = set(frame.target_lemmas)
@@ -694,6 +678,17 @@ def _nominal_self_role_frame(
     target = _nominal_self_role_target(structure, frame)
     if target is None:
         return None
+    if target.head.part_of_speech == 'adjective':
+        # In "ты тупой" the adjective is a nominative predicate, not a
+        # feminine genitive modifier. Resolve syncretism from this clause role.
+        genders = [gender for gender in ('masculine', 'feminine', 'neuter')
+                   if DEFAULT_MORPHOLOGY.inflect(
+                       target.head.lemma, case='nominative', number='singular', gender=gender
+                   ) == target.head.surface.casefold()]
+        if len(genders) == 1:
+            features = dict(target.head.features)
+            features.update(case='nominative', gender=genders[0], number='singular')
+            target = replace(target, head=replace(target.head, features=tuple(features.items())))
     return SelfStateFrame(
         state="self_role_assessment",
         predicate_lemma="считать",

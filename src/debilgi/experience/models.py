@@ -30,6 +30,7 @@ class PreparedReply:
     arbitration_weight_version: int = 0
     semantic_reply_plan_id: str | None = None
     processing_outcome: ProcessingOutcome | None = None
+    assertion_experience: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)

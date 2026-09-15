@@ -50,6 +50,23 @@ def test_one_semantic_graph_productively_realizes_different_lexemes() -> None:
     assert idea.role_order == ("subject", "predicate", "direct_object")
 
 
+def test_plural_complement_does_not_inherit_dictionary_lemma_gender() -> None:
+    thought = ClauseThought(
+        predicate=ConceptLexeme("считать", "считать", "verb"),
+        dependencies=(
+            SemanticDependency("subject", ConceptArgument(ConceptLexeme("я", "я", "pronoun"))),
+            SemanticDependency("direct_object", ConceptArgument(
+                ConceptLexeme("результат", "результаты", "noun", (("number", "plural"),)),
+            )),
+            SemanticDependency("predicate_complement", ConceptArgument(
+                ConceptLexeme("хороший", "хороший", "adjective", (("number", "plural"),)),
+            )),
+        ),
+        confidence=0.9,
+    )
+    assert realize_thought(thought)[0].text == "Я считаю результаты хорошими."
+
+
 def test_observed_dependency_order_contains_no_authored_words() -> None:
     observed = DependencyPattern(
         ("direct_object", "subject", "predicate"),

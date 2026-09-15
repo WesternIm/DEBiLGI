@@ -5,12 +5,15 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from debilgi.language.addressing import DEFAULT_ADDRESSING
 from debilgi.language.character_markov import normalize_word
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
 from debilgi.language.tokenizer import tokenize
+
+if TYPE_CHECKING:
+    from debilgi.language.productive_nlg import ClauseThought
 
 _USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
 _ROLE_MENTION_RE = re.compile(r"<@&(\d+)>")
@@ -179,6 +182,37 @@ def analyze_entities(text: str, payload: Mapping[str, Any]) -> EntityAnalysis:
         mentions=tuple(dict.fromkeys(found)),
         action_terms=tuple(dict.fromkeys(actions)),
         object_terms=tuple(dict.fromkeys(objects)),
+    )
+
+
+def identity_thought(prompt: str, payload: Mapping[str, Any]) -> ClauseThought | None:
+    """Realize a gateway name as a proposition rather than an authored reply."""
+    # The structural parser consumes entities; load realization only at call time.
+    from debilgi.language.productive_nlg import (
+        ClauseThought,
+        ConceptArgument,
+        ConceptLexeme,
+        SemanticDependency,
+    )
+    normalized = " ".join(prompt.casefold().replace("ё", "е").strip(" .!…").split())
+    if _BOT_IDENTITY_RE.fullmatch(normalized):
+        subject, record = "я", payload.get("bot_identity")
+    elif _SPEAKER_IDENTITY_RE.fullmatch(normalized):
+        subject, record = "ты", payload.get("author_identity")
+    else:
+        return None
+    if not isinstance(record, Mapping) or not _identity_aliases(record):
+        return None
+    name = _identity_label(record)
+    return ClauseThought(
+        predicate=ConceptLexeme("называться", "называться", "verb", (("tense", "present"),)),
+        dependencies=(
+            SemanticDependency("subject", ConceptArgument(
+                ConceptLexeme(subject, subject, "pronoun"))),
+            SemanticDependency("predicate_complement", ConceptArgument(
+                ConceptLexeme(name, name, "noun", entity_kind="discord_identity"))),
+        ), predicate_class="copular", confidence=0.99,
+        evidence=(f"gateway_identity:{record.get('id')}:{name}",),
     )
 
 

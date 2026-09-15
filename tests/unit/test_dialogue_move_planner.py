@@ -41,17 +41,17 @@ def test_expressive_fragment_produces_competing_non_lexical_moves() -> None:
     assert {plan.semantic_origin for plan in plans} == {"scaffold"}
 
 
-def test_self_label_stance_changes_with_dialogue_markers() -> None:
+def test_self_label_stance_requires_evidence_beyond_dialogue_markers() -> None:
     confirmation = _plans("ты же круто, да?")
     challenge = _plans("ты чё герой что-ли?")
 
     assert len(confirmation) >= 2
     assert len(challenge) >= 2
-    assert {plan.stance for plan in confirmation} == {"support"}
-    assert {plan.stance for plan in challenge} == {"oppose"}
+    assert {plan.stance for plan in confirmation} == {"inspect"}
+    assert {plan.stance for plan in challenge} == {"inspect"}
     assert {plan.strategy for plan in confirmation} >= {
-        "contextual_self_assessment",
-        "evaluation_stance",
+        "withhold_unsupported_label",
+        "ask_for_evidence",
     }
 
 
@@ -130,6 +130,14 @@ def test_underspecified_self_reflection_question_describes_active_process() -> N
     }
     assert surfaces == {"Я анализирую контекст."}
     assert {plan.semantic_origin for plan in plans} == {"derived"}
+
+
+def test_topical_opinion_is_not_replaced_with_generic_process_description():
+    for prompt in ("что думаешь о ножницах", "что думаешь о космосе"):
+        assert not any(
+            plan.strategy == "ground_self_reflection_in_active_process"
+            for plan in _plans(prompt)
+        )
 
 
 def test_attention_call_is_a_grounded_local_acknowledgement() -> None:

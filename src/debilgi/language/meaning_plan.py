@@ -17,7 +17,7 @@ from debilgi.language.structured_utterance import (
     TokenInterpretation,
     analyze_structured_utterance,
 )
-from debilgi.language.surface_coherence import evaluate_surface
+from debilgi.language.surface_coherence import COMPOSED_SURFACE_SOFT_ISSUES, evaluate_surface
 from debilgi.language.valency import (
     assess_predicate_valency,
     governed_object_case,
@@ -228,7 +228,9 @@ def build_response_meaning_plan(
     )
 
 
-def realize_response_meaning(plan: ResponseMeaningPlan) -> str | None:
+def realize_response_meaning(
+    plan: ResponseMeaningPlan, *, allow_rough: bool = False,
+) -> str | None:
     """Render complete propositions; return no candidate for an incomplete frame."""
 
     if not plan.renderable:
@@ -254,6 +256,8 @@ def realize_response_meaning(plan: ResponseMeaningPlan) -> str | None:
         rendered.append(sentence)
     text = " ".join(rendered)
     surface = evaluate_surface(text)
+    if allow_rough and not (set(surface.hard_issues) - COMPOSED_SURFACE_SOFT_ISSUES):
+        return text or None
     return text if not surface.hard_issues and surface.score >= 0.72 else None
 
 

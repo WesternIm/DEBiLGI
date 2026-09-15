@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from debilgi.language.content import content_lemmas
+from debilgi.language.dialogue_obligations import DialogueExchange, resolve_dialogue_exchange
 from debilgi.language.lexical_matching import same_lexical_family
 from debilgi.language.repair_signals import signals_prior_answer_correction
 from debilgi.language.structured_utterance import (
@@ -95,6 +96,7 @@ class DialogueStateAnalysis:
     added_context_terms: tuple[str, ...]
     confidence: float
     repair_target: str | None
+    exchange: DialogueExchange | None = None
 
     @property
     def unresolved_references(self) -> tuple[ReferenceResolution, ...]:
@@ -166,6 +168,7 @@ def analyze_dialogue_state(
         added_context_terms=added_terms,
         confidence=min(1.0, topic.confidence * 0.56 + reference_confidence * 0.44),
         repair_target=repair_target,
+        exchange=resolve_dialogue_exchange(prompt, recent_messages),
     )
 
 

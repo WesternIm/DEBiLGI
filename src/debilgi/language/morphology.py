@@ -348,6 +348,7 @@ class RussianMorphology:
                     return reading
         return self.best(normalized)
 
+    @lru_cache(maxsize=512)  # noqa: B019 - immutable readings, bounded shared parse cache
     def analyze_sentence(self, text: str) -> SentenceAnalysis:
         tokens = tokenize(text)
         alternatives = tuple(self.parse_word(token) for token in tokens)

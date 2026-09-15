@@ -8,9 +8,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from debilgi.language.character_markov import normalize_word
+from debilgi.language.comprehension_tasks import ComprehensionTask, plan_comprehension
 from debilgi.language.content import content_lemmas
 from debilgi.language.entities import EntityAnalysis, EntityMention
 from debilgi.language.function_words import service_word_reason
+from debilgi.language.lexical_gaps import nonblocking_event_terms, nonblocking_reference_terms
 from debilgi.language.lexicon import WordAnalysis
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
 from debilgi.language.structured_utterance import analyze_structured_utterance
@@ -26,6 +28,8 @@ class WordRelation:
     relation: str
     target: str
     kind: str
+    source_sense_id: str | None = None
+    target_sense_id: str | None = None
 
     def terms(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys((self.source, self.relation, self.target)))
@@ -41,6 +45,13 @@ class UtteranceUnderstanding:
     comprehension_score: float
     sufficient: bool
     entities: tuple[EntityMention, ...] = ()
+    referential_unknown_terms: tuple[str, ...] = ()
+    nonblocking_unknown_terms: tuple[str, ...] = ()
+    task: ComprehensionTask | None = None
+
+    @property
+    def blocking_unknown_terms(self) -> tuple[str, ...]:
+        return tuple(t for t in self.unknown_terms if t not in self.nonblocking_unknown_terms)
 
     @property
     def subject_phrase(self) -> str:
@@ -90,6 +101,9 @@ class UtteranceUnderstandingRepository:
                             "relation": item.relation,
                             "target": item.target,
                             "kind": item.kind,
+                            **({"source_sense_id": item.source_sense_id,
+                                "target_sense_id": item.target_sense_id}
+                               if item.source_sense_id is not None else {}),
                         }
                         for item in understanding.relations
                     )
@@ -143,6 +157,15 @@ def understand_utterance(
         set(unknown_terms),
         resolved_bindings=resolved_bindings,
     )
+    relations = tuple(dict.fromkeys((
+        *relations,
+        *(WordRelation(item.lemma or item.normalized_form, predicate, target, "lexical_definition")
+          for item in analyses if not item.typed_relations
+          for predicate, target in item.semantic_relations),
+        *(WordRelation(item.lemma or item.normalized_form, link.relation, link.target,
+                       "ruwordnet", item.sense_id, link.target_id)
+          for item in analyses for link in item.typed_relations),
+    )))
     recent_terms = {
         term for message in context_messages[-5:] for term in content_lemmas(message)
     }
@@ -154,25 +177,16 @@ def understand_utterance(
             )
         )
     )
-    total = max(1, len(analyses))
-    known_ratio = len(known_terms) / total
-    unknown_ratio = len(unknown_terms) / total
-    relation_score = min(1.0, len(relations) / 2.0)
-    context_score = min(1.0, len(context_links) / 2.0)
-    comprehension_score = min(
-        1.0,
-        known_ratio * 0.58 + relation_score * 0.27 + context_score * 0.15,
-    )
-    has_semantic_evidence = bool(known_terms or relations or context_links)
-    sufficient = has_semantic_evidence and comprehension_score >= 0.25 and (
-        not unknown_terms
-        or (
-            bool(known_terms)
-            and unknown_ratio <= 0.5
-            and bool(relations or context_links)
-        )
-        or (len(known_terms) >= 2 and unknown_ratio <= 0.4)
-    )
+    task = plan_comprehension(prompt, analyses, context_messages, resolved_bindings)
+    comprehension_score = task.comprehension_score
+    sufficient = task.interpretation_ready
+    structure = analyze_structured_utterance(prompt)
+    lexical_gaps = tuple(dict.fromkeys(
+        item.lemma or item.normalized_form for item in analyses if item.requires_lexical_study
+    ))
+    references = nonblocking_reference_terms(structure, lexical_gaps)
+    nonblocking = nonblocking_event_terms(structure, lexical_gaps)
+    nonblocking = tuple(dict.fromkeys((*nonblocking, *task.incidental_terms)))
     return UtteranceUnderstanding(
         content_terms=content_terms,
         known_terms=known_terms,
@@ -182,6 +196,9 @@ def understand_utterance(
         comprehension_score=comprehension_score,
         sufficient=sufficient,
         entities=entity_analysis.mentions if entity_analysis is not None else (),
+        referential_unknown_terms=references,
+        nonblocking_unknown_terms=nonblocking,
+        task=task,
     )
 
 

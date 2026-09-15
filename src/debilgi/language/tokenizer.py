@@ -45,6 +45,7 @@ def tokenize(text: str, *, max_tokens: int = 500, max_token_length: int = 100) -
     if max_tokens <= 0 or max_token_length <= 0:
         raise ValueError("token limits must be positive")
     normalized = normalize_discord_markup(text).lower()
+    normalized = re.sub(r"(?<!\w)всмысле(?!\w)", "в смысле", normalized)
     tokens = _TOKEN_RE.findall(normalized)
     return tuple(token[:max_token_length] for token in tokens[:max_tokens])
 

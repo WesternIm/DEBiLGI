@@ -35,6 +35,15 @@ class KnowledgeConcept:
 
 
 @dataclass(frozen=True, slots=True)
+class KnowledgeGrounding:
+    """Keep reference definitions identifiable when they enter dialogue memory."""
+
+    facts: tuple[str, ...] = ()
+    exact_answer: str | None = None
+    definitions: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class KnowledgeDecision:
     should_query: bool
     query: str | None

@@ -151,6 +151,16 @@ class EventRepository:
             (event_id,),
         )
 
+    async def retry_processing(self, event_id: str, error: str, max_attempts: int) -> bool:
+        """Reserve another attempt without releasing ownership to another worker."""
+        cursor = await self._database.execute(
+            """UPDATE event_processing
+               SET attempts = attempts + 1, last_error = ?
+               WHERE event_id = ? AND status = 'processing' AND attempts < ?""",
+            (error[:1000], event_id, max_attempts),
+        )
+        return cursor.rowcount == 1
+
     async def mark_failed(self, event_id: str, error: str) -> None:
         await self._database.execute(
             """

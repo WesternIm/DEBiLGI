@@ -7,6 +7,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 _DIAGNOSTIC_LOGGERS = {
+    "debilgi": "runtime.log",
     "debilgi.reply_failures": "reply-fallback.log",
     "debilgi.topic_continuity": "topic-continuity.log",
     "debilgi.identity_replies": "identity-replies.log",
@@ -59,4 +60,5 @@ def configure_logging(level: str = "INFO", diagnostics_directory: Path | None = 
         handler.setFormatter(formatter)
         diagnostic_logger.addHandler(handler)
         diagnostic_logger.setLevel(logging.INFO)
-        diagnostic_logger.propagate = False
+        # General lifecycle failures remain visible in the launch console too.
+        diagnostic_logger.propagate = logger_name == "debilgi"

@@ -19,6 +19,15 @@ def _understanding(*known: str) -> UtteranceUnderstanding:
     )
 
 
+def test_understanding_an_evaluation_is_not_evidence_that_it_is_true() -> None:
+    frame = analyze_self_state(analyze_structured_utterance('Ты считаешь себя тупым?'))
+    assert frame is not None
+    result = reason_about_self_state(frame, _understanding('считать', 'тупой'))
+    assert result.actual is None
+    assert result.thought is None
+    assert result.evidence == ('requires_contextual_owned_position',)
+
+
 def test_self_understanding_question_is_resolved_from_context_then_realized() -> None:
     frame = analyze_self_state(analyze_structured_utterance("А ты понял идею?"))
 

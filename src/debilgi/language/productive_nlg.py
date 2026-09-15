@@ -770,6 +770,8 @@ def _render_argument(argument: ConceptArgument, *, case: str | None) -> str:
         requested["case"] = case
     if head_features.get("number"):
         requested["number"] = head_features["number"]
+    if argument.head.part_of_speech == 'adjective' and head_features.get('gender'):
+        requested['gender'] = head_features['gender']
     head = (
         argument.head.surface
         if argument.head.entity_kind is not None or head_features.get("indeclinable") == "true"
@@ -816,4 +818,6 @@ def _inferred_head_features(head: ConceptLexeme) -> dict[str, str]:
     if reading is not None:
         inferred.update(reading.features())
     inferred.update(dict(head.features))
+    if inferred.get("number") == "plural":
+        inferred.pop("gender", None)
     return inferred

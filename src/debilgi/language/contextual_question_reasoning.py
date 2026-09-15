@@ -289,32 +289,6 @@ def reason_about_contextual_question(
             target_terms,
         )
 
-    if question_markers & _CAUSE_MARKERS and (
-        _asks_why_epistemic_state(structure)
-        or bool(lemmas & _RESPONSE_CAUTION_TERMS)
-        or _antecedent_has_epistemic_gap(antecedent_structure)
-    ):
-        evidence = (
-            "cause_follow_up",
-            "antecedent_epistemic_gap",
-            "overcautious_threshold_identified",
-        )
-        return ContextualQuestionResolution(
-            "overcautious_response_cause",
-            _overcautious_response_thought(evidence),
-            0.94,
-            evidence,
-            antecedent,
-            target_terms,
-            (
-                DependencyPattern(
-                    ("subject", "manner", "predicate", "cause"),
-                    confidence=0.98,
-                    evidence_count=10,
-                    source="response_style_cause_explanation",
-                ),
-            ),
-        )
     return None
 
 
@@ -747,39 +721,6 @@ def _non_fabrication_thought(evidence: tuple[str, ...]) -> ClauseThought:
     )
 
 
-def _overcautious_response_thought(evidence: tuple[str, ...]) -> ClauseThought:
-    return ClauseThought(
-        predicate=_verb("отвечать", "отвечаю"),
-        dependencies=(
-            SemanticDependency("subject", _speaker()),
-            SemanticDependency(
-                "manner",
-                ConceptArgument(
-                    ConceptLexeme(
-                        "слишком осторожно",
-                        "слишком осторожно",
-                        "adverb",
-                        entity_kind="fixed_phrase",
-                    )
-                ),
-            ),
-            SemanticDependency(
-                "cause",
-                ConceptArgument(
-                    ConceptLexeme("порог", "порога", "noun"),
-                    modifiers=(
-                        ConceptLexeme("завышенный", "завышенного", "adjective"),
-                    ),
-                    preposition="из-за",
-                    grammatical_case="genitive",
-                ),
-            ),
-        ),
-        confidence=0.94,
-        evidence=evidence,
-    )
-
-
 def _unresolved_reason_thought(evidence: tuple[str, ...]) -> ClauseThought:
     """Represent an unresolved reason without exposing evidence bookkeeping."""
 
@@ -1202,7 +1143,7 @@ def _antecedent_has_location(structure: StructuredUtterance) -> bool:
     if _all_lemmas(structure) & location_words:
         return True
     return any(
-        complement.role in {"location", "source", "destination"}
+        complement.role in {"location", "location_or_destination", "source", "destination"}
         for clause in structure.clauses
         for complement in clause.complements
     )

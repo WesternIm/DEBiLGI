@@ -74,8 +74,23 @@ _DEICTIC_LOOKUP_OBJECTS = frozenset(
 def media_article_reasons(result: WikipediaResult) -> tuple[str, ...]:
     """Return metadata/intro markers that identify a media work."""
 
-    evidence = normalize_key(" ".join((result.title, result.extract, *result.categories)))
-    return tuple(dict.fromkeys(marker for marker in MEDIA_ARTICLE_MARKERS if marker in evidence))
+    return media_text_reasons(" ".join((result.title, result.extract, *result.categories)))
+
+
+def media_text_reasons(text: str) -> tuple[str, ...]:
+    evidence = normalize_key(text)
+    reasons = [marker for marker in MEDIA_ARTICLE_MARKERS if marker in evidence]
+    # Whole inflected words: "опера" must not match "операция" or "оператор".
+    for marker, pattern in (
+        ("опера", r"\bопер(?:а|ы|е|у|ой|ою|ам|ами|ах)?\b"),
+        ("балет", r"\bбалет(?:а|ы|е|у|ом|ов|ам|ами|ах)?\b"),
+        ("пьеса", r"\bпьес(?:а|ы|е|у|ой|ою|ам|ами|ах)?\b"),
+        ("оперетта", r"\bоперетт(?:а|ы|е|у|ой|ою|ам|ами|ах)?\b"),
+        ("спектакль", r"\bспектакл(?:ь|я|и|е|ю|ем|ей|ям|ями|ях)\b"),
+    ):
+        if re.search(pattern, evidence):
+            reasons.append(marker)
+    return tuple(dict.fromkeys(reasons))
 
 
 class KnowledgeQueryPolicy:
