@@ -69,6 +69,13 @@ class SelfDatasetRepository:
         status = "rejected" if quality <= 0.25 else "candidate"
         now = created_at.isoformat()
         async with self._database.transaction() as connection:
+            existing = await (await connection.execute(
+                """SELECT example_id FROM learning_example_sources
+                   WHERE guild_id = ? AND source_event_id = ?""",
+                (prompt.guild_id, prompt.event_id),
+            )).fetchone()
+            if existing is not None:
+                return str(existing['example_id'])
             await connection.execute(
                 """INSERT INTO learning_instruction_examples (
                     example_id, guild_id, channel_id, user_id, source_event_id,

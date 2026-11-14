@@ -253,6 +253,10 @@ def analyze_causal_query(
     normalized = cleaned.casefold().replace("ё", "е")
     normalized_syntax = " ".join(re.sub(r"[,;:]+", " ", normalized).split())
     asks_cause = bool(
+        any(c.question_target_index is not None
+            and structure.tokens[c.question_target_index].lemma == "почему"
+            for c in structure.clauses)
+        or
         lemma_set & {"почему", "причина"}
         or normalized.startswith("почему ")
         or normalized.rstrip(" ?!") == "почему"

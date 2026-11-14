@@ -99,6 +99,8 @@ def reason_about_contextual_question(
     antecedent_structure = (
         analyze_structured_utterance(antecedent) if antecedent is not None else None
     )
+    if _colloquial_cause_follow_up(structure, antecedent_structure):
+        question_markers = frozenset((*question_markers, "почему"))
     target_terms = tuple(content_lemmas(antecedent))[-3:] if antecedent else ()
 
     if _asks_about_current_conversational_intent(structure):
@@ -219,9 +221,8 @@ def reason_about_contextual_question(
             ),
         )
 
-    if (
-        question_markers & _CAUSE_MARKERS
-        and _antecedent_is_negative_self_assessment(antecedent_structure)
+    if question_markers & _CAUSE_MARKERS and _antecedent_is_negative_self_assessment(
+        antecedent_structure
     ):
         evidence = (
             "cause_follow_up",
@@ -259,11 +260,7 @@ def reason_about_contextual_question(
             target_terms,
         )
 
-    if (
-        antecedent_structure is not None
-        and lemmas & {"если"}
-        and _is_elliptical(structure)
-    ):
+    if antecedent_structure is not None and lemmas & {"если"} and _is_elliptical(structure):
         evidence = ("conditional_follow_up", "antecedent_restored")
         return ContextualQuestionResolution(
             "conditional_verification",
@@ -274,9 +271,7 @@ def reason_about_contextual_question(
             target_terms,
         )
 
-    if question_markers & _PURPOSE_MARKERS and _antecedent_has_epistemic_gap(
-        antecedent_structure
-    ):
+    if question_markers & _PURPOSE_MARKERS and _antecedent_has_epistemic_gap(antecedent_structure):
         evidence = ("purpose_follow_up", "antecedent_epistemic_gap")
         return ContextualQuestionResolution(
             "epistemic_purpose",
@@ -287,32 +282,6 @@ def reason_about_contextual_question(
             target_terms,
         )
 
-    if question_markers & _CAUSE_MARKERS and (
-        _asks_why_epistemic_state(structure)
-        or bool(lemmas & _RESPONSE_CAUTION_TERMS)
-        or _antecedent_has_epistemic_gap(antecedent_structure)
-    ):
-        evidence = (
-            "cause_follow_up",
-            "antecedent_epistemic_gap",
-            "overcautious_threshold_identified",
-        )
-        return ContextualQuestionResolution(
-            "overcautious_response_cause",
-            _overcautious_response_thought(evidence),
-            0.94,
-            evidence,
-            antecedent,
-            target_terms,
-            (
-                DependencyPattern(
-                    ("subject", "manner", "predicate", "cause"),
-                    confidence=0.98,
-                    evidence_count=10,
-                    source="response_style_cause_explanation",
-                ),
-            ),
-        )
     return None
 
 
@@ -439,6 +408,7 @@ def epistemic_gap_candidates_for_question(
                     "state_unresolved_answer",
                     _cannot_answer_current_question_thought(
                         (*base_evidence, "topic_evidence_missing"),
+                        target=target,
                     ),
                     0.68,
                 ),
@@ -557,9 +527,7 @@ def _unspecified_location_thought(
                 "location",
                 ConceptArgument(
                     ConceptLexeme("фраза", "фразе", "noun"),
-                    modifiers=(
-                        ConceptLexeme("предыдущий", "предыдущей", "adjective"),
-                    ),
+                    modifiers=(ConceptLexeme("предыдущий", "предыдущей", "adjective"),),
                     preposition="в",
                     grammatical_case="prepositional",
                 ),
@@ -741,39 +709,6 @@ def _non_fabrication_thought(evidence: tuple[str, ...]) -> ClauseThought:
         ),
         negated=True,
         confidence=0.90,
-        evidence=evidence,
-    )
-
-
-def _overcautious_response_thought(evidence: tuple[str, ...]) -> ClauseThought:
-    return ClauseThought(
-        predicate=_verb("отвечать", "отвечаю"),
-        dependencies=(
-            SemanticDependency("subject", _speaker()),
-            SemanticDependency(
-                "manner",
-                ConceptArgument(
-                    ConceptLexeme(
-                        "слишком осторожно",
-                        "слишком осторожно",
-                        "adverb",
-                        entity_kind="fixed_phrase",
-                    )
-                ),
-            ),
-            SemanticDependency(
-                "cause",
-                ConceptArgument(
-                    ConceptLexeme("порог", "порога", "noun"),
-                    modifiers=(
-                        ConceptLexeme("завышенный", "завышенного", "adjective"),
-                    ),
-                    preposition="из-за",
-                    grammatical_case="genitive",
-                ),
-            ),
-        ),
-        confidence=0.94,
         evidence=evidence,
     )
 
@@ -992,32 +927,49 @@ def _no_person_attribution_thought(
 
 def _cannot_answer_current_question_thought(
     evidence: tuple[str, ...],
+    *,
+    target: ConceptArgument | None = None,
 ) -> ClauseThought:
     """Tie the final recovery to the whole question, not an isolated noun."""
 
-    return ClauseThought(
-        predicate=_verb("мочь", "могу"),
-        dependencies=(
-            SemanticDependency("subject", _speaker()),
-            SemanticDependency(
-                "action_complement",
-                ConceptArgument(ConceptLexeme("ответить", "ответить", "verb")),
-            ),
-            SemanticDependency(
-                "location",
-                ConceptArgument(
-                    ConceptLexeme(
-                        "вопрос",
-                        "вопрос",
-                        "noun",
-                        (("number", "singular"), ("gender", "masculine")),
-                    ),
-                    modifiers=(ConceptLexeme("этот", "этот", "adjective"),),
-                    preposition="на",
-                    grammatical_case="accusative",
+    dependencies = [
+        SemanticDependency("subject", _speaker()),
+        SemanticDependency(
+            "action_complement",
+            ConceptArgument(ConceptLexeme("ответить", "ответить", "verb")),
+        ),
+        SemanticDependency(
+            "location",
+            ConceptArgument(
+                ConceptLexeme(
+                    "вопрос",
+                    "вопрос",
+                    "noun",
+                    (("number", "singular"), ("gender", "masculine")),
                 ),
+                modifiers=(ConceptLexeme("этот", "этот", "adjective"),),
+                preposition="на",
+                grammatical_case="accusative",
             ),
         ),
+    ]
+    if target is not None:
+        # Preserve the requested subject in the recovery meaning.  This gives
+        # arbitration a real topical anchor without storing a reply phrase.
+        dependencies.append(
+            SemanticDependency(
+                "topic",
+                ConceptArgument(
+                    target.head,
+                    modifiers=target.modifiers,
+                    preposition="о",
+                    grammatical_case="prepositional",
+                ),
+            )
+        )
+    return ClauseThought(
+        predicate=_verb("мочь", "могу"),
+        dependencies=tuple(dependencies),
         negated=True,
         confidence=0.70,
         evidence=evidence,
@@ -1055,9 +1007,7 @@ def _antecedent_has_epistemic_gap(
     if structure is None:
         return False
     lemmas = _all_lemmas(structure)
-    has_gap_predicate = bool(
-        lemmas & (_EPISTEMIC_PREDICATES | {"хватать", "ответ", "ответить"})
-    )
+    has_gap_predicate = bool(lemmas & (_EPISTEMIC_PREDICATES | {"хватать", "ответ", "ответить"}))
     has_negation = bool(lemmas & {"не", "нет", "недостаточно"}) or any(
         clause.negated for clause in structure.clauses
     )
@@ -1074,9 +1024,7 @@ def _antecedent_is_negative_self_assessment(
             continue
         predicate = structure.tokens[frame.predicate_index].lemma
         subjects = {structure.tokens[index].lemma for index in frame.subject_indices}
-        direct_objects = {
-            structure.tokens[index].lemma for index in frame.direct_object_indices
-        }
+        direct_objects = {structure.tokens[index].lemma for index in frame.direct_object_indices}
         occupied = {
             *frame.subject_indices,
             *frame.direct_object_indices,
@@ -1085,8 +1033,7 @@ def _antecedent_is_negative_self_assessment(
         }
         has_assessment_target = bool(frame.predicate_complement_indices) or any(
             index not in occupied
-            and structure.tokens[index].part_of_speech
-            in {"adjective", "noun", "participle"}
+            and structure.tokens[index].part_of_speech in {"adjective", "noun", "participle"}
             for index in range(frame.token_start, frame.token_end)
         )
         if (
@@ -1110,8 +1057,7 @@ def _antecedent_denies_external_action(
     if not negated:
         return False
     return any(
-        token.part_of_speech == "verb"
-        and action_requires_external_agency(token.lemma)
+        token.part_of_speech == "verb" and action_requires_external_agency(token.lemma)
         for token in structure.tokens
     )
 
@@ -1200,7 +1146,7 @@ def _antecedent_has_location(structure: StructuredUtterance) -> bool:
     if _all_lemmas(structure) & location_words:
         return True
     return any(
-        complement.role in {"location", "source", "destination"}
+        complement.role in {"location", "location_or_destination", "source", "destination"}
         for clause in structure.clauses
         for complement in clause.complements
     )
@@ -1295,8 +1241,7 @@ def _question_markers(structure: StructuredUtterance) -> frozenset[str]:
     markers = {
         token.lemma
         for token in structure.tokens
-        if token.semantic_role == "question_target"
-        or token.lemma in _QUESTION_LEMMAS
+        if token.semantic_role == "question_target" or token.lemma in _QUESTION_LEMMAS
     }
     lemmas = {token.lemma for token in structure.tokens}
     if markers & {"какой", "что"} and lemmas & {"причина", "основание", "повод"}:
@@ -1304,6 +1249,33 @@ def _question_markers(structure: StructuredUtterance) -> frozenset[str]:
     if markers & {"какой", "что"} and lemmas & {"цель", "смысл"}:
         markers.add("зачем")
     return frozenset(markers)
+
+
+def _colloquial_cause_follow_up(
+    current: StructuredUtterance,
+    antecedent: StructuredUtterance | None,
+) -> bool:
+    """Resolve colloquial ``чего не ...`` as why only when context disambiguates it."""
+
+    if antecedent is None:
+        return False
+    has_colloquial_marker = any(
+        token.surface.casefold().replace("ё", "е") == "чего" for token in current.tokens
+    )
+    current_negated = "не" in _all_lemmas(current) or any(
+        clause.negated for clause in current.clauses
+    )
+    if not has_colloquial_marker or not current_negated:
+        return False
+    current_predicate = _main_predicate(current)
+    antecedent_predicate = _main_predicate(antecedent)
+    if current_predicate is None or antecedent_predicate is None:
+        return False
+    if current_predicate == antecedent_predicate:
+        return True
+    return bool(
+        current_predicate in {"мочь", "уметь"} and _antecedent_denies_external_action(antecedent)
+    )
 
 
 def _all_lemmas(structure: StructuredUtterance) -> frozenset[str]:
@@ -1345,8 +1317,7 @@ def _is_question(structure: StructuredUtterance) -> bool:
         if link.relation.startswith("ccomp")
     }
     return any(
-        clause.clause_kind == "question"
-        and clause.clause_index not in embedded_clause_indices
+        clause.clause_kind == "question" and clause.clause_index not in embedded_clause_indices
         for clause in structure.clauses
     )
 

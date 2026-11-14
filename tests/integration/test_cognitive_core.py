@@ -165,8 +165,8 @@ async def test_difference_episode_causal_trace_and_raw_retention(
         "decision",
     ]
     assert intent.executed_at is None and intent.shadow_only
-    assert intents[1].actual_outcome == EventType.MESSAGE_REPLIED.value
-    assert intents[1].evaluated_at == reply.utc_timestamp
+    assert intents[1].actual_outcome is None
+    assert intents[1].evaluated_at is None
 
     await core.maintenance_once(reply.utc_timestamp + timedelta(seconds=2))
     restored = await events.get(first.event_id)

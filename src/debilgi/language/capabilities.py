@@ -133,6 +133,7 @@ _EXTERNAL_ACTIONS = frozenset(
         "играть",
         "копать",
         "летать",
+        "лететь",
         "нести",
         "носить",
         "открыть",
@@ -170,6 +171,28 @@ _RESOURCE_USE_ACTIONS = frozenset(
         "применять",
         "юзать",
     }
+)
+_ACTION_PREFIXES = (
+    "пере",
+    "пред",
+    "при",
+    "про",
+    "под",
+    "над",
+    "раз",
+    "рас",
+    "вз",
+    "вс",
+    "вы",
+    "до",
+    "за",
+    "на",
+    "об",
+    "от",
+    "по",
+    "с",
+    "у",
+    "в",
 )
 _LEARNED_INTERNAL_CAPABILITY_MARKERS = frozenset(
     {
@@ -404,6 +427,9 @@ def assess_capability_question(
     """Ground self-directed capability, experience and external-action requests."""
 
     for frame in reversed(structure.clauses):
+        if (frame.question_target_index is not None
+                and structure.tokens[frame.question_target_index].lemma == "почему"):
+            continue  # A reason request cannot be answered by a capability yes/no.
         if frame.predicate_index is None:
             continue
         predicate = structure.tokens[frame.predicate_index]
@@ -562,15 +588,33 @@ def assess_capability_question(
         if predicate.lemma in _CAPABILITY_PREDICATES:
             action = next(
                 (
-                    token
-                    for token in structure.tokens[frame.predicate_index + 1 : frame.token_end]
-                    if token.part_of_speech == "verb" and "INFN" in token.grammemes
+                    structure.tokens[index]
+                    for index in frame.action_complement_indices
+                    if index != frame.predicate_index
+                    and structure.tokens[index].part_of_speech == "verb"
                 ),
                 None,
             )
-            if action is None or subject is None:
+            if action is None:
+                action = next(
+                    (
+                        token
+                        for token in structure.tokens[frame.token_start : frame.token_end]
+                        if token.index != frame.predicate_index
+                        and token.part_of_speech == "verb"
+                        and "INFN" in token.grammemes
+                    ),
+                    None,
+                )
+            context_action, context_object = _context_action(context_messages)
+            action_lemma = action.lemma if action is not None else context_action
+            if action_lemma is None or subject is None:
                 continue
-            action_object = _action_object(structure, frame, subject.index)
+            action_object = (
+                _action_object(structure, frame, subject.index)
+                or context_object
+                or _context_action_object(context_messages)
+            )
         elif (
             addressed_bot
             and frame.clause_kind == "command"
@@ -655,22 +699,22 @@ def assess_capability_question(
             continue
         if subject.lemma in {"ты", "вы"}:
             abstract_internal_state = bool(
-                action.lemma in _NON_ACTION_STATES
+                action_lemma in _NON_ACTION_STATES
                 and action_object is not None
                 and action_object.head.lemma in _ABSTRACT_INTERNAL_OBJECTS
             )
-            if action.lemma in _COMPUTATIONAL_ACTIONS:
+            if action_lemma in _COMPUTATIONAL_ACTIONS:
                 supported = True
                 reason = "internal_computational_action"
             elif abstract_internal_state:
                 supported = True
                 reason = "internal_cognitive_or_evaluative_state"
-            elif action_requires_external_agency(action.lemma):
+            elif action_requires_external_agency(action_lemma):
                 supported = False
                 reason = "action_requires_unavailable_external_agency"
             elif (
                 learned_support := _learned_capability_support(
-                    action.lemma,
+                    action_lemma,
                     action_object,
                     knowledge_facts,
                 )
@@ -691,7 +735,7 @@ def assess_capability_question(
                 subject.lemma,
                 subject.surface,
                 "bot",
-                action.lemma,
+                action_lemma,
                 supported,
                 reason,
                 0.96 if supported else 0.92,
@@ -699,12 +743,15 @@ def assess_capability_question(
                 "capability",
                 action_object,
             )
-        if subject.lemma in _KNOWN_HUMAN_SUBJECTS and action.lemma in _UNASSISTED_HUMAN_LIMITS:
+        if (
+            subject.lemma in _KNOWN_HUMAN_SUBJECTS
+            and action_lemma in _UNASSISTED_HUMAN_LIMITS
+        ):
             return CapabilityAssessment(
                 subject.lemma,
                 subject.surface,
                 "person",
-                action.lemma,
+                action_lemma,
                 False,
                 "human_requires_technology",
                 0.94,
@@ -765,17 +812,17 @@ def realize_capability_assessment(assessment: CapabilityAssessment | None) -> st
 def action_requires_external_agency(action_lemma: str) -> bool:
     """Separate internal language work from bodily or world-changing actions."""
 
-    return action_lemma.casefold() in _EXTERNAL_ACTIONS if action_lemma else False
+    return _action_in_semantic_family(action_lemma, _EXTERNAL_ACTIONS)
 
 
 def action_requires_personal_world_history(action_lemma: str) -> bool:
     """Return whether an action needs embodiment or an external account history."""
 
-    normalized = action_lemma.casefold()
-    return normalized in (
+    return _action_in_semantic_family(
+        action_lemma,
         _EXTERNAL_ACTIONS
         | _OBJECT_SENSITIVE_EXTERNAL_ACTIONS
-        | _RESOURCE_USE_ACTIONS
+        | _RESOURCE_USE_ACTIONS,
     )
 
 
@@ -795,7 +842,7 @@ def _appraise_personal_desire(
             ("novelty", 0.20),
             ("arousal", 0.16),
         )
-    elif action_lemma in _COMPUTATIONAL_ACTIONS:
+    elif _action_in_semantic_family(action_lemma, _COMPUTATIONAL_ACTIONS):
         domain = "cognitive_activity"
         drive_weights = (
             ("curiosity", 0.34),
@@ -849,7 +896,10 @@ def _object_sensitive_external_action(
 ) -> bool:
     """Resolve embodied/polysemous actions from the object's learned type."""
 
-    if action_lemma.casefold() not in _OBJECT_SENSITIVE_EXTERNAL_ACTIONS or action_object is None:
+    if not _action_in_semantic_family(
+        action_lemma,
+        _OBJECT_SENSITIVE_EXTERNAL_ACTIONS,
+    ) or action_object is None:
         return False
     object_lemma = action_object.head.lemma.casefold()
     terms: set[str] = set()
@@ -870,6 +920,47 @@ def _object_sensitive_external_action(
         )
     object_class, _, _ = classify_object_terms(terms)
     return object_class == "physical"
+
+
+def _action_in_semantic_family(
+    action_lemma: str,
+    anchors: frozenset[str],
+) -> bool:
+    """Match aspectual and prefixed Russian verbs to one semantic action class."""
+
+    if not action_lemma:
+        return False
+    return any(
+        candidate == anchor
+        or same_lexical_family(
+            candidate,
+            anchor,
+            minimum_prefix=4,
+            minimum_similarity=0.62,
+        )
+        for candidate in _action_family_forms(action_lemma)
+        for anchor in anchors
+    )
+
+
+def _action_family_forms(action_lemma: str) -> frozenset[str]:
+    """Produce conservative base candidates without pretending to be a stemmer."""
+
+    normalized = action_lemma.casefold().replace("ё", "е").strip()
+    if not normalized:
+        return frozenset()
+    initial = normalized.removesuffix("ся").removesuffix("сь")
+    forms = {normalized, initial}
+    frontier = {initial}
+    for _ in range(2):
+        reduced: set[str] = set()
+        for form in frontier:
+            for prefix in _ACTION_PREFIXES:
+                if form.startswith(prefix) and len(form) - len(prefix) >= 4:
+                    reduced.add(form[len(prefix) :])
+        forms.update(reduced)
+        frontier = reduced
+    return frozenset(forms)
 
 
 def _learned_capability_support(
@@ -1084,6 +1175,17 @@ def _context_action(
                 if predicate.lemma in (_CAPABILITY_PREDICATES | {"хотеть"})
                 else predicate
             )
+            if action is None and predicate.lemma in (_CAPABILITY_PREDICATES | {"хотеть"}):
+                action = next(
+                    (
+                        token
+                        for token in structure.tokens[frame.token_start : frame.token_end]
+                        if token.index != frame.predicate_index
+                        and token.part_of_speech == "verb"
+                        and "INFN" in token.grammemes
+                    ),
+                    None,
+                )
             if (
                 action is None
                 or action.part_of_speech != "verb"

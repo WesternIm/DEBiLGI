@@ -35,11 +35,7 @@ class PragmaticAnalysis:
     @property
     def uncertainty(self) -> float:
         return max(
-            (
-                cue.intensity
-                for cue in self.cues
-                if cue.function in {"uncertainty", "hesitation"}
-            ),
+            (cue.intensity for cue in self.cues if cue.function in {"uncertainty", "hesitation"}),
             default=0.0,
         )
 
@@ -49,8 +45,7 @@ class PragmaticAnalysis:
             (
                 cue.intensity
                 for cue in self.cues
-                if cue.category
-                in {"interjection", "emoji", "expressive_punctuation"}
+                if cue.category in {"interjection", "emoji", "expressive_punctuation"}
             ),
             default=0.0,
         )
@@ -122,9 +117,7 @@ _DISCOURSE_MARKERS: dict[str, tuple[str, float]] = {
     "хули": ("coarse_emphasis", 0.78),
 }
 
-_GREETINGS = frozenset(
-    {"привет", "здравствуй", "здравствуйте", "дарова", "здорово", "хай", "ку"}
-)
+_GREETINGS = frozenset({"привет", "здравствуй", "здравствуйте", "дарова", "здорово", "хай", "ку"})
 _REDUPLICATION_FUNCTIONS: dict[str, tuple[str, float]] = {
     "бла": ("dismissive_placeholder", 0.68),
     "да": ("emphatic_affirmation", 0.78),
@@ -193,6 +186,19 @@ def _construction_cues(words: tuple[str, ...]) -> tuple[PragmaticCue, ...]:
     """Recognize reusable conversational constructions above individual words."""
 
     cues: list[PragmaticCue] = []
+    if (
+        ("разве" in words and bool(set(words) & {"ответ", "объяснение", "решение"}))
+        or words in {("в", "смысле"), ("всмысле",)}
+    ):
+        cues.append(
+            PragmaticCue(
+                " ".join(words),
+                "construction",
+                "prior_answer_challenge",
+                0.94,
+                0.84,
+            )
+        )
     if len(words) >= 3 and words[0] in {"ты", "вы"} and words[1] == "что":
         cues.append(
             PragmaticCue(
@@ -296,6 +302,8 @@ def _expressive_cue(
             return PragmaticCue(word, "particle", "emphatic_affirmation", 0.92, 0.78)
         if canonical in {"нет", "не"}:
             return PragmaticCue(word, "particle", "emphatic_rejection", 0.92, 0.82)
+    if re.fullmatch(r"ау+", word):
+        return PragmaticCue(word, "interjection", "attention_call", 0.92, 0.74)
     if re.fullmatch(r"хм+", word):
         return PragmaticCue(word, "interjection", "hesitation", 0.86, 0.68)
     if _LAUGHTER_RE.fullmatch(word):
@@ -335,9 +343,7 @@ def analyze_pragmatics(text: str) -> PragmaticAnalysis:
             if any(position in occupied for position in range(index, index + width)):
                 continue
             if words[index : index + width] == phrase:
-                cues.append(
-                    PragmaticCue(" ".join(phrase), "particle", function, 0.92, intensity)
-                )
+                cues.append(PragmaticCue(" ".join(phrase), "particle", function, 0.92, intensity))
                 occupied.update(range(index, index + width))
     for index, (word, raw_word, normalized) in enumerate(
         zip(words, raw_words, normalized_words, strict=True)
@@ -358,4 +364,11 @@ def analyze_pragmatics(text: str) -> PragmaticAnalysis:
             category = "interjection_particle" if word == "ну" else "discourse_marker"
             confidence = 0.66 if word == "ну" else 0.82
             cues.append(PragmaticCue(word, category, function, confidence, intensity))
+    # An infinitive before a detached opening comma can be an exclamation.
+    # Its ordinary lexical use inside a clause retains its verb reading.
+    opening = re.match(r"\s*(ебать|охуеть|ахуеть)\s*[,!]\s*\S", text, re.IGNORECASE)
+    if opening is not None and len(words) >= 3:
+        cues.append(
+            PragmaticCue(opening.group(1).casefold(), "interjection", "coarse_emphasis", 0.9, 0.85)
+        )
     return PragmaticAnalysis(tuple(cues))

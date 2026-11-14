@@ -50,3 +50,19 @@ def test_explicit_confirmation_is_the_only_strong_positive_text_signal() -> None
     assert feedback.kind == "explicit_confirmation"
     assert feedback.reward == 1.0
     assert feedback.is_learnable()
+
+
+def test_elliptical_claim_correction_is_negative_feedback_for_replied_answer() -> None:
+    feedback = FeedbackAttributor().attribute(message("Ты сказал делал"))
+
+    assert feedback.kind == "contextual_correction"
+    assert feedback.reward == -0.85
+    assert feedback.attribution_confidence == 0.86
+    assert feedback.is_learnable()
+
+
+def test_plain_report_of_truth_is_not_mistaken_for_a_correction() -> None:
+    feedback = FeedbackAttributor().attribute(message("Ты сказал правду"))
+
+    assert feedback.kind == "conversation_continued"
+    assert feedback.reward == 0.0

@@ -2,6 +2,12 @@ from debilgi.language.surface_coherence import evaluate_surface
 from debilgi.language.surface_policy import internal_surface_reason
 
 
+def test_document_bullet_is_not_a_conversational_surface():
+    result = evaluate_surface("* создание: первый том написан в тюрьме.")
+
+    assert "document_fragment" in result.hard_issues
+
+
 def test_rejects_logged_markov_splices() -> None:
     broken = (
         ". суть: ауу, но не буду но она ещё разобрал?.",
@@ -76,3 +82,8 @@ def test_position_reason_is_not_mistaken_for_internal_evidence_bookkeeping() -> 
 
     assert internal_surface_reason(text) is None
     assert evaluate_surface(text).learnable
+
+
+def test_genitive_object_is_licensed_by_negation_only() -> None:
+    assert "governed_case_mismatch" not in evaluate_surface("Я не имею желудка.").hard_issues
+    assert "governed_case_mismatch" in evaluate_surface("Я имею желудка.").hard_issues

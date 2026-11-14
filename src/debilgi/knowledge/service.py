@@ -11,13 +11,18 @@ from typing import Protocol
 
 from debilgi.cognition.core_repository import CognitiveRepository
 from debilgi.events.models import Event
-from debilgi.knowledge.models import KnowledgeConcept, KnowledgeDecision, WikipediaResult
+from debilgi.knowledge.models import (
+    KnowledgeConcept,
+    KnowledgeDecision,
+    KnowledgeGrounding,
+    WikipediaResult,
+)
 from debilgi.knowledge.policy import (
-    MEDIA_ARTICLE_MARKERS,
     KnowledgeQueryPolicy,
     canonical_lexical_query,
     is_deictic_lookup_query,
     media_article_reasons,
+    media_text_reasons,
 )
 from debilgi.knowledge.repository import KnowledgeRepository
 from debilgi.knowledge.text import normalize_key
@@ -79,6 +84,11 @@ _MEDIA_CONTEXT_TERMS = frozenset(
         "роман",
         "шоу",
         "аниме",
+        "опера",
+        "балет",
+        "пьеса",
+        "оперетта",
+        "спектакль",
     }
 )
 class KnowledgeAcquisitionService:
@@ -240,8 +250,11 @@ class KnowledgeAcquisitionService:
             await asyncio.sleep(min(0.04, remaining))
 
     async def context_for_text(self, value: str) -> tuple[str, ...]:
+        return (await self._context_evidence(value)).facts
+
+    async def _context_evidence(self, value: str) -> KnowledgeGrounding:
         if not self.enabled:
-            return ()
+            return KnowledgeGrounding()
         signals = _lookup_signals(
             value,
             next(iter(content_lemmas(value)), value),
@@ -260,15 +273,21 @@ class KnowledgeAcquisitionService:
             if any(_title_matches_query(term, concept.title) for term in terms)
             if signals.media_context or not _concept_is_media(concept)
         )
-        return self._format_concepts(relevant)
+        return self._grounding(relevant)
 
     async def grounding_for_event(
         self, event: Event, prompt: str
     ) -> tuple[tuple[str, ...], str | None]:
+        evidence = await self.grounding_evidence_for_event(event, prompt)
+        return evidence.facts, evidence.exact_answer
+
+    async def grounding_evidence_for_event(
+        self, event: Event, prompt: str
+    ) -> KnowledgeGrounding:
         """Return facts plus an exact answer only for an intentional lookup event."""
 
         if not self.enabled:
-            return (), None
+            return KnowledgeGrounding()
         await self.wait_for_event(event.event_id)
         resolved = await self.repository.resolved_lookup_for_event(event.event_id)
         if resolved is not None:
@@ -282,10 +301,28 @@ class KnowledgeAcquisitionService:
                     query,
                     looked_up.title,
                 )
-                return await self.context_for_text(prompt), None
-            facts = self._format_concepts((looked_up,))
-            return facts, (facts[0] if facts else None)
-        return await self.context_for_text(prompt), None
+                return await self._context_evidence(prompt)
+            signals = _lookup_signals(prompt, query, dictionary_available=self._dictionary_enabled)
+            if _concept_is_media(looked_up) and not signals.media_context:
+                return await self._context_evidence(prompt)
+            # Keep the queried alias (e.g. "гта 5") as the requested subject.
+            return self._grounding((looked_up,), exact=True, subject=query)
+        return await self._context_evidence(prompt)
+
+    @classmethod
+    def _grounding(
+        cls, concepts: tuple[KnowledgeConcept, ...], *, exact: bool = False,
+        subject: str | None = None,
+    ) -> KnowledgeGrounding:
+        facts = cls._format_concepts(concepts)
+        return KnowledgeGrounding(
+            facts=facts,
+            exact_answer=facts[0] if exact and facts else None,
+            definitions=tuple(
+                (subject or concept.title, concise_reference(concept.definition))
+                for concept in concepts if concept.definition.strip()
+            ),
+        )
 
     async def internalize_consulted_fact(
         self,
@@ -542,8 +579,6 @@ class KnowledgeAcquisitionService:
         reason = (
             "explicit_media_context"
             if signals.media_context
-            else "capitalized_title_fallback"
-            if media_article_reasons(result) and not signals.lowercase_surface
             else "dictionary_miss"
         )
         selection_logger.info(
@@ -563,7 +598,6 @@ class KnowledgeAcquisitionService:
         self, query: str, signals: LookupSignals
     ) -> WikipediaResult | None:
         candidate_search = getattr(self.source, "search_candidates", None)
-        capitalized_media_fallback: WikipediaResult | None = None
         for search_query in _encyclopedia_query_variants(query):
             if callable(candidate_search):
                 # MediaWiki ranking often puts an exact numbered title behind
@@ -588,18 +622,6 @@ class KnowledgeAcquisitionService:
                     continue
                 media_reasons = media_article_reasons(result)
                 if media_reasons and not signals.media_context:
-                    if not signals.lowercase_surface and not signals.conflict_lemma:
-                        capitalized_media_fallback = capitalized_media_fallback or result
-                        selection_logger.info(
-                            "query=%r deferred_article=%r "
-                            "reason=capitalized_media_fallback "
-                            "media_markers=%s categories=%s",
-                            query,
-                            result.title,
-                            media_reasons,
-                            result.categories,
-                        )
-                        continue
                     selection_logger.info(
                         "query=%r rejected_article=%r reason=media_without_context "
                         "media_markers=%s categories=%s",
@@ -610,7 +632,7 @@ class KnowledgeAcquisitionService:
                     )
                     continue
                 return result
-        return capitalized_media_fallback
+        return None
 
     @staticmethod
     def _format_concepts(concepts: tuple[KnowledgeConcept, ...]) -> tuple[str, ...]:
@@ -715,8 +737,9 @@ def _looks_like_named_media_query(query: str) -> bool:
 
 
 def _concept_is_media(concept: KnowledgeConcept) -> bool:
-    evidence = normalize_key(f"{concept.title} {concept.definition}")
-    return any(marker in evidence for marker in MEDIA_ARTICLE_MARKERS)
+    return concept.source == "wikipedia" and bool(
+        media_text_reasons(f"{concept.title} {concept.definition}")
+    )
 
 
 def concise_reference(definition: str) -> str:
@@ -753,7 +776,9 @@ def _title_matches_query(query: str, title: str) -> bool:
     for variant in variants:
         if not variant:
             continue
-        if title_key == variant or title_key.startswith(f"{variant} "):
+        if title_key == variant or (
+            len(query_key.split()) > 1 and title_key.startswith(f"{variant} ")
+        ):
             return True
     if len(query_key.split()) > 1:
         query_words = set(query_key.split())

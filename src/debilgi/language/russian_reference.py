@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 import re
 import socket
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import aiohttp
@@ -20,6 +23,7 @@ from debilgi.language.lexical_matching import fuzzy_match_allowed
 from debilgi.language.lexicon import LexiconService
 from debilgi.storage.database import Database
 
+logger = logging.getLogger(__name__)
 _MESSAGE_TYPES = {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}
 _CYRILLIC_WORD_RE = re.compile(r"^[а-яё-]{2,48}$", re.IGNORECASE)
 _LANGUAGE_HEADING_RE = re.compile(r"(?m)^=\s*\{\{-[a-z-]+-\}\}\s*=$")
@@ -81,6 +85,28 @@ class RemoteLexeme:
     examples: tuple[str, ...] = ()
 
 
+class WiktionaryUnavailable(aiohttp.ClientError):
+    """An operational failure, never evidence that a word is absent."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _retry_after_seconds(value: str | None, default: float = 60.0) -> float:
+    if value:
+        try:
+            return max(default, float(int(value)))
+        except ValueError:
+            try:
+                return max(
+                    default, (parsedate_to_datetime(value) - datetime.now(UTC)).total_seconds()
+                )
+            except (ValueError, TypeError, OverflowError):
+                pass
+    return default
+
+
 class WiktionaryClient:
     def __init__(
         self,
@@ -91,6 +117,10 @@ class WiktionaryClient:
         self.user_agent = user_agent
         self.timeout_seconds = timeout_seconds
         self._session: aiohttp.ClientSession | None = None
+        self._request_lock = asyncio.Lock()
+        self._next_request_at = 0.0
+        self._retry_at = 0.0
+        self._failure: WiktionaryUnavailable | None = None
 
     @property
     def endpoint(self) -> str:
@@ -157,16 +187,65 @@ class WiktionaryClient:
             "utf8": "1",
             "maxlag": "5",
         }
-        async with self._session.get(self.endpoint, params=parameters) as response:
-            if response.status == 404:
-                return None
-            response.raise_for_status()
-            payload = await response.json(content_type=None)
+        payload = await self._request(parameters)
         return parse_wiktionary_payload(word, payload)
 
-    async def _search_candidate(
-        self, word: str, search_terms: tuple[str, ...]
-    ) -> str | None:
+    async def _request(self, parameters: dict[str, str]) -> dict[str, Any]:
+        """Serialize all workers and share server backoff across words and actions."""
+        assert self._session is not None
+        async with self._request_lock:
+            if self._failure is not None and time.monotonic() < self._retry_at:
+                raise WiktionaryUnavailable(str(self._failure), status=self._failure.status)
+            delay = self._next_request_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                async with self._session.get(self.endpoint, params=parameters) as response:
+                    if response.status == 403:
+                        self._retry_at = float("inf")
+                        raise WiktionaryUnavailable(
+                            "Wikimedia denied access (403). Check the bot User-Agent/contact "
+                            "and Wikimedia robot policy; resolve access before restarting.",
+                            status=403,
+                        )
+                    if response.status == 429 or response.status >= 500:
+                        self._retry_at = time.monotonic() + _retry_after_seconds(
+                            response.headers.get("Retry-After")
+                        )
+                        raise WiktionaryUnavailable(
+                            "Wikimedia requested backoff", status=response.status
+                        )
+                    response.raise_for_status()
+                    payload = await response.json(content_type=None)
+                    if not isinstance(payload, dict):
+                        raise WiktionaryUnavailable("Invalid Wikimedia API response")
+                    error = payload.get("error")
+                    if isinstance(error, dict):
+                        code = error.get("code")
+                        if code == "missingtitle" and parameters.get("action") == "parse":
+                            return payload
+                        self._retry_at = time.monotonic() + _retry_after_seconds(
+                            response.headers.get("Retry-After")
+                        )
+                        raise WiktionaryUnavailable(f"Wikimedia API error: {code}")
+                    expected = "parse" if parameters.get("action") == "parse" else "query"
+                    if not isinstance(payload.get(expected), dict):
+                        raise WiktionaryUnavailable(f"Missing Wikimedia API field: {expected}")
+                    self._failure = None
+                    return payload
+            except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
+                failure = (
+                    exc
+                    if isinstance(exc, WiktionaryUnavailable)
+                    else WiktionaryUnavailable(str(exc), status=getattr(exc, "status", None))
+                )
+                self._failure = failure
+                self._retry_at = max(self._retry_at, time.monotonic() + 60.0)
+                raise failure from None
+            finally:
+                self._next_request_at = time.monotonic() + 1.0
+
+    async def _search_candidate(self, word: str, search_terms: tuple[str, ...]) -> str | None:
         assert self._session is not None
         for search_term in search_terms:
             parameters = {
@@ -180,11 +259,7 @@ class WiktionaryClient:
                 "utf8": "1",
                 "maxlag": "5",
             }
-            async with self._session.get(self.endpoint, params=parameters) as response:
-                if response.status in {403, 429}:
-                    return None
-                response.raise_for_status()
-                payload = await response.json(content_type=None)
+            payload = await self._request(parameters)
             query = payload.get("query") if isinstance(payload, dict) else None
             raw_results = query.get("search") if isinstance(query, dict) else None
             titles = (
@@ -223,6 +298,7 @@ class RussianReferenceService:
         self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=max(1, queue_limit))
         self._queued: set[str] = set()
         self._workers: list[asyncio.Task[None]] = []
+        self._inflight: dict[str, asyncio.Task[RemoteLexeme | None]] = {}
 
     async def start(self) -> None:
         if self.enabled and not self._workers:
@@ -241,6 +317,12 @@ class RussianReferenceService:
             worker.cancel()
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
+        inflight = tuple(self._inflight.values())
+        for task in inflight:
+            task.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+        self._inflight.clear()
         await self._client.close()
 
     async def observe(self, event: Event) -> None:
@@ -287,6 +369,7 @@ class RussianReferenceService:
             return False
         self._queued.add(normalized)
         return True
+
     async def refresh_word(self, word: str) -> RemoteLexeme | None:
         """Resolve one word now; useful for explicit diagnostics and deterministic tests."""
 
@@ -295,7 +378,14 @@ class RussianReferenceService:
             return None
         try:
             result = await self._client.lookup(normalized)
-        except (aiohttp.ClientError, TimeoutError, OSError):
+        except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+            logger.warning(
+                "Dictionary lookup failed for %r: %s status=%s: %s",
+                normalized,
+                type(exc).__name__,
+                getattr(exc, "status", None),
+                exc,
+            )
             await self._record(normalized, "error", None)
             return None
         if result is None or not result.meanings:
@@ -319,8 +409,14 @@ class RussianReferenceService:
         normalized = normalize_word(word)
         if not _CYRILLIC_WORD_RE.fullmatch(normalized):
             return None
-        if await self._needs_refresh(normalized):
-            return await self.refresh_word(normalized)
+        if self.enabled and await self._needs_refresh(normalized):
+            task = self._inflight.get(normalized)
+            if task is None:
+                task = asyncio.create_task(self.refresh_word(normalized))
+                self._inflight[normalized] = task
+                task.add_done_callback(lambda done: self._finish_lookup(normalized, done))
+            # A foreground budget expiring must not cancel the shared lookup.
+            return await asyncio.shield(task)
         row = await self._database.fetchone(
             """SELECT source, status, source_url, part_of_speech, meanings_json
                FROM language_reference_lookups WHERE normalized_form = ?""",
@@ -333,25 +429,51 @@ class RussianReferenceService:
             return None
         return RemoteLexeme(
             word=normalized,
-            part_of_speech=(
-                str(row["part_of_speech"]) if row["part_of_speech"] else None
-            ),
+            part_of_speech=(str(row["part_of_speech"]) if row["part_of_speech"] else None),
             meanings=meanings,
             source_url=str(row["source_url"] or ""),
         )
+
+    def _finish_lookup(self, word: str, task: asyncio.Task) -> None:
+        if self._inflight.get(word) is task:
+            self._inflight.pop(word, None)
+        if not task.cancelled():
+            task.exception()  # observe an exception even if all waiters timed out
+
+    async def retry_delay_for(self, words: tuple[str, ...]) -> int | None:
+        """Expose pending/error state without treating a missing entry as an outage."""
+        if not self.enabled:
+            return None
+        delays = []
+        for word in words:
+            normalized = normalize_word(word)
+            if normalized in self._inflight or normalized in self._queued:
+                delays.append(5)
+                continue
+            row = await self._database.fetchone(
+                "SELECT status, checked_at FROM language_reference_lookups WHERE normalized_form=?",
+                (normalized,),
+            )
+            if row is not None and row["status"] == "error":
+                checked = datetime.fromisoformat(str(row["checked_at"]))
+                if checked.tzinfo is None:
+                    checked = checked.replace(tzinfo=UTC)
+                remaining = 300 - (datetime.now(UTC) - checked).total_seconds()
+                delays.append(max(1, int(remaining) + 1))
+        return min(delays) if delays else None
 
     async def _run(self) -> None:
         while True:
             word = await self._queue.get()
             try:
-                await self.refresh_word(word)
+                await self.resolve_for_context(word)
             finally:
                 self._queued.discard(word)
                 self._queue.task_done()
 
     async def _needs_refresh(self, normalized: str) -> bool:
         row = await self._database.fetchone(
-            "SELECT checked_at FROM language_reference_lookups WHERE normalized_form = ?",
+            "SELECT checked_at, status FROM language_reference_lookups WHERE normalized_form = ?",
             (normalized,),
         )
         if row is None:
@@ -359,11 +481,16 @@ class RussianReferenceService:
         checked_at = datetime.fromisoformat(str(row["checked_at"]))
         if checked_at.tzinfo is None:
             checked_at = checked_at.replace(tzinfo=UTC)
-        return datetime.now(UTC) - checked_at >= self.refresh_after
+        refresh_after = (
+            min(self.refresh_after, timedelta(minutes=5))
+            if row["status"] == "error"
+            else min(self.refresh_after, timedelta(days=1))
+            if row["status"] == "missing"
+            else self.refresh_after
+        )
+        return datetime.now(UTC) - checked_at >= refresh_after
 
-    async def _record(
-        self, normalized: str, status: str, result: RemoteLexeme | None
-    ) -> None:
+    async def _record(self, normalized: str, status: str, result: RemoteLexeme | None) -> None:
         source = "ru_wiktionary_derived" if result and result.derived_from else "ru_wiktionary"
         await self._database.execute(
             """INSERT INTO language_reference_lookups (
@@ -426,9 +553,7 @@ def parse_wiktionary_payload(word: str, payload: Any) -> RemoteLexeme | None:
     sections: list[tuple[str | None, str]] = []
     if headings:
         for index, heading in enumerate(headings):
-            section_end = (
-                headings[index + 1].start() if index + 1 < len(headings) else len(russian)
-            )
+            section_end = headings[index + 1].start() if index + 1 < len(headings) else len(russian)
             sections.append(
                 (heading.group(1).casefold().strip(), russian[heading.end() : section_end])
             )

@@ -62,6 +62,12 @@ class Settings:
     database_path: Path
     migrations_path: Path
     log_level: str = "INFO"
+    slovnet_enabled: bool = False
+    ruwordnet_enabled: bool = False
+    ruwordnet_path: Path = field(default_factory=lambda: (
+        _project_root() / "data/models/ruwordnet/ruwordnet-2021.db"
+    ))
+    slovnet_model_dir: Path = field(default_factory=lambda: _project_root() / "data/models/slovnet")
     sync_commands: bool = False
     dev_guild_id: int | None = None
     test_replies_enabled: bool = False
@@ -223,6 +229,14 @@ class Settings:
                 )
 
         return cls(
+            ruwordnet_enabled=_bool_from_env("DEBILGI_RUWORDNET_ENABLED"),
+            ruwordnet_path=_path_from_env(
+                "DEBILGI_RUWORDNET_PATH", "data/models/ruwordnet/ruwordnet-2021.db", root,
+            ),
+            slovnet_enabled=_bool_from_env("DEBILGI_SLOVNET_ENABLED"),
+            slovnet_model_dir=_path_from_env(
+                "DEBILGI_SLOVNET_MODEL_DIR", "data/models/slovnet", root,
+            ),
             discord_token=os.getenv("DISCORD_TOKEN") or None,
             database_path=_path_from_env("DEBILGI_DATABASE_PATH", "data/debilgi.sqlite3", root),
             migrations_path=_path_from_env("DEBILGI_MIGRATIONS_PATH", "migrations", root),

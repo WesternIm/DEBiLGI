@@ -25,10 +25,9 @@ def test_epistemic_follow_ups_select_different_semantic_actions() -> None:
         "epistemic_purpose",
         "Я не выдумываю ответ.",
     )
-    assert _resolve("Почему же не знаешь?", previous) == (
-        "overcautious_response_cause",
-        "Я слишком осторожно отвечаю из-за завышенного порога.",
-    )
+    assert reason_about_contextual_question(
+        analyze_structured_utterance("Почему же не знаешь?"), (previous,)
+    ) is None
     assert _resolve("А хотел бы знать?", previous) == (
         "epistemic_desire",
         "Да, я хочу это узнать.",
@@ -131,6 +130,23 @@ def test_reason_follow_up_uses_embodiment_instead_of_generic_evidence_gap() -> N
     assert realize_thought(resolution.thought)[0].text == "У меня нет тела."
 
 
+def test_colloquial_chego_is_a_cause_only_when_previous_answer_disambiguates_it() -> None:
+    resolution = reason_about_contextual_question(
+        analyze_structured_utterance("А чего не можешь то а?"),
+        ("Я не могу лететь.",),
+    )
+
+    assert resolution is not None
+    assert resolution.kind == "embodiment_cause"
+    assert realize_thought(resolution.thought)[0].text == "У меня нет тела."
+
+    independent = reason_about_contextual_question(
+        analyze_structured_utterance("Чего не можешь найти?"),
+        ("Мы обсуждали ключ.",),
+    )
+    assert independent is None
+
+
 def test_reason_follow_up_to_self_position_stays_in_the_conversation() -> None:
     resolution = reason_about_contextual_question(
         analyze_structured_utterance("А почему так?"),
@@ -150,12 +166,8 @@ def test_reason_follow_up_to_old_epistemic_fallback_does_not_repeat_it() -> None
         ("Я не могу ответить на этот вопрос.",),
     )
 
-    assert resolution is not None
-    assert resolution.kind == "overcautious_response_cause"
-    assert "не могу ответить" not in realize_thought(
-        resolution.thought,
-        resolution.patterns,
-    )[0].text.casefold()
+    # Textual uncertainty is not evidence of a runtime threshold failure.
+    assert resolution is None
 
 
 def test_location_follow_up_exposes_the_missing_slot_instead_of_inventing_it() -> None:
@@ -191,15 +203,11 @@ def test_epistemic_action_is_not_misclassified_as_bodily_action() -> None:
         ("Не определил я отношение к имени.",),
     )
 
-    assert resolution is not None
-    assert resolution.kind == "overcautious_response_cause"
-    assert "external_action_requires_body" not in resolution.evidence
-    assert realize_thought(resolution.thought, resolution.patterns)[0].text == (
-        "Я слишком осторожно отвечаю из-за завышенного порога."
-    )
+    # Textual uncertainty is not evidence of a runtime threshold failure.
+    assert resolution is None
 
 
-def test_criticism_after_no_data_reply_gets_a_cause_not_another_no_data_reply() -> None:
+def test_criticism_after_no_data_reply_does_not_establish_its_cause() -> None:
     resolution = reason_about_contextual_question(
         analyze_structured_utterance(
             "Да почему ты такой пугливый в ответах?"
@@ -207,11 +215,8 @@ def test_criticism_after_no_data_reply_gets_a_cause_not_another_no_data_reply() 
         ("У меня нет достаточных данных.",),
     )
 
-    assert resolution is not None
-    assert resolution.kind == "overcautious_response_cause"
-    surface = realize_thought(resolution.thought, resolution.patterns)[0].text
-    assert surface == "Я слишком осторожно отвечаю из-за завышенного порога."
-    assert "недостаточ" not in surface.casefold()
+    # Textual uncertainty is not evidence of a runtime threshold failure.
+    assert resolution is None
 
 
 def test_counterevidence_revises_a_denied_internal_capability() -> None:

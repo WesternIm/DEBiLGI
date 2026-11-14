@@ -21,7 +21,11 @@ _CONNECTORS = frozenset(
 )
 _SAFE_SHORT_ROLES = frozenset({"interjection", "predicate", "adverb"})
 _MALFORMED_PUNCTUATION_RE = re.compile(r"(?:\?\.|!\.|\.\?|\.!|,\.|\.,|;\.|:\.)")
+_DOCUMENT_MARKER_RE = re.compile(r"^(?:#{1,6}|[*+-])\s+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+
+# A case ending may be rough while the composed semantic roles remain valid.
+COMPOSED_SURFACE_SOFT_ISSUES = frozenset({"governed_case_mismatch"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +54,8 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
         issues.append("malformed_punctuation")
     if not _balanced_delimiters(stripped):
         issues.append("unbalanced_delimiters")
+    if _DOCUMENT_MARKER_RE.match(stripped):
+        issues.append("document_fragment")
 
     tokens = tokenize(stripped)
     lexical = tuple(token for token in tokens if token[:1].isalnum())
@@ -120,6 +126,12 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
             last_action = clause.action_complement_indices[-1]
             if all(index > last_action for index in direct_object_indices):
                 present_roles = present_roles - {"direct_object"}
+        if predicate in {"мочь", "уметь", "хотеть"} and clause.action_complement_indices:
+            last_action = clause.action_complement_indices[-1]
+            if clause.indirect_object_indices and all(
+                index > last_action for index in clause.indirect_object_indices
+            ):
+                present_roles = present_roles - {"indirect_object"}
         complement_roles = frozenset(item.role for item in clause.complements)
         valency = assess_predicate_valency(
             predicate,
@@ -151,6 +163,10 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
                     {
                         "subject",
                         *("direct_object" for _ in action_objects),
+                        *("indirect_object" for index in clause.indirect_object_indices
+                          if index > action_index),
+                        *("predicate_complement" for index in clause.predicate_complement_indices
+                          if index > action_index),
                     }
                 ),
                 implicit_subject=True,
@@ -192,6 +208,8 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
                 and actual_case
                 and expected_case
                 and actual_case != expected_case
+                and not (clause.negated and expected_case == "accusative"
+                         and actual_case == "genitive")
                 and not syncretic_accusative
                 and not surface_supports_expected_case
             ):
@@ -228,6 +246,15 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
             )
             for reading in readings
         )
+        sentence_structure = analyze_structured_utterance(sentence)
+        impersonal_infinitive = any(
+            clause.predicate_index is not None
+            and "INFN"
+            in sentence_structure.tokens[clause.predicate_index].grammemes
+            and bool(clause.indirect_object_indices)
+            for clause in sentence_structure.clauses
+        )
+        finite_predicate = finite_predicate or impersonal_infinitive
         has_infinitive = any(
             reading is not None and "INFN" in reading.grammemes for reading in readings
         )

@@ -38,19 +38,20 @@ def test_expressive_fragment_produces_competing_non_lexical_moves() -> None:
     }
     assert "Что ты подразумеваешь под ебануться?" not in surfaces
     assert all(surface.endswith("?") for surface in surfaces)
+    assert {plan.semantic_origin for plan in plans} == {"scaffold"}
 
 
-def test_self_label_stance_changes_with_dialogue_markers() -> None:
+def test_self_label_stance_requires_evidence_beyond_dialogue_markers() -> None:
     confirmation = _plans("ты же круто, да?")
     challenge = _plans("ты чё герой что-ли?")
 
     assert len(confirmation) >= 2
     assert len(challenge) >= 2
-    assert {plan.stance for plan in confirmation} == {"support"}
-    assert {plan.stance for plan in challenge} == {"oppose"}
+    assert {plan.stance for plan in confirmation} == {"inspect"}
+    assert {plan.stance for plan in challenge} == {"inspect"}
     assert {plan.strategy for plan in confirmation} >= {
-        "contextual_self_assessment",
-        "evaluation_stance",
+        "withhold_unsupported_label",
+        "ask_for_evidence",
     }
 
 
@@ -68,6 +69,7 @@ def test_known_nominal_relation_is_digested_instead_of_defined() -> None:
     }
     assert "Я представляю островок на башке." in surfaces
     assert all("подразумева" not in surface.casefold() for surface in surfaces)
+    assert {plan.semantic_origin for plan in plans} == {"derived"}
 
 
 def test_complete_statement_continues_its_content_instead_of_dialogue_meta_talk() -> None:
@@ -85,6 +87,7 @@ def test_complete_statement_continues_its_content_instead_of_dialogue_meta_talk(
     assert "Что ты планируешь на четверг?" in surfaces
     assert all("продолжаю мысль" not in surface.casefold() for surface in surfaces)
     assert all("держу тему" not in surface.casefold() for surface in surfaces)
+    assert {plan.semantic_origin for plan in plans} == {"scaffold"}
 
 
 def test_non_temporal_statement_uses_its_salient_concept() -> None:
@@ -126,3 +129,19 @@ def test_underspecified_self_reflection_question_describes_active_process() -> N
         "ground_self_reflection_in_active_process"
     }
     assert surfaces == {"Я анализирую контекст."}
+    assert {plan.semantic_origin for plan in plans} == {"derived"}
+
+
+def test_topical_opinion_is_not_replaced_with_generic_process_description():
+    for prompt in ("что думаешь о ножницах", "что думаешь о космосе"):
+        assert not any(
+            plan.strategy == "ground_self_reflection_in_active_process"
+            for plan in _plans(prompt)
+        )
+
+
+def test_stretched_attention_call_uses_contact_semantics_in_legacy_route() -> None:
+    plans = _plans("ауу")
+
+    assert {plan.strategy for plan in plans} == {"answer_contact"}
+    assert {plan.semantic_origin for plan in plans} == {"derived"}

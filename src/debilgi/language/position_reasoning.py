@@ -11,6 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from debilgi.events.models import Event
 from debilgi.experience.feedback import DEFAULT_FEEDBACK_ATTRIBUTOR
@@ -29,6 +30,9 @@ from debilgi.language.productive_nlg import (
 from debilgi.language.tokenizer import tokenize
 from debilgi.personality.perspective import PersonalityPerspective
 from debilgi.storage.database import Database
+
+if TYPE_CHECKING:
+    from debilgi.language.communication import PlannedSurface, ResponseComposer
 
 _POSITION_PREDICATES = frozenset({"быть", "считать", "думать", "полагать"})
 
@@ -348,7 +352,8 @@ class PositionReasoningService:
 def realize_position(
     decision: PositionDecision,
     patterns: tuple[DependencyPattern, ...] = (),
-) -> tuple[ProductiveSurface, ...]:
+    *, composer: ResponseComposer | None = None,
+) -> tuple[ProductiveSurface | PlannedSurface, ...]:
     """Express a decision through dependencies rather than an answer string."""
 
     negated = decision.stance != "support"
@@ -410,7 +415,10 @@ def realize_position(
         confidence=decision.confidence,
         evidence=decision.evidence,
     )
-    surfaces = realize_thought(thought, learned_patterns, limit=4)
+    surfaces = (composer.express(thought, learned_patterns, limit=4) if composer
+                else realize_thought(thought, learned_patterns, limit=4))
+    if composer and composer.deferred:
+        return surfaces
     if decision.expression_mode != "qualified":
         return surfaces
     return tuple(

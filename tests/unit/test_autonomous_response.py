@@ -72,6 +72,18 @@ def test_plan_with_invented_evidence_is_rejected_before_realization() -> None:
     assert candidates == ()
 
 
+def test_provider_evidence_wrapper_is_normalized_only_to_an_allowed_id() -> None:
+    candidates = realize_autonomous_responses(
+        _result(evidence_id="grounding_facts.id=runtime.layout.observable"),
+        perspective=None,
+        allowed_evidence_ids=("runtime.layout.observable",),
+    )
+
+    assert [candidate.text for candidate in candidates] == [
+        "Я не наблюдаю системную раскладку."
+    ]
+
+
 def test_structured_fact_overrides_distorted_roles_and_polarity() -> None:
     consultation = ConsultationResult.from_payload(
         {

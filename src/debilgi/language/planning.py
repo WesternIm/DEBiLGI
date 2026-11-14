@@ -5,12 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from debilgi.cognition.dialogue_tasks import DialogueSituation
 from debilgi.cognition.models import ActionIntent, ActionType
+from debilgi.language.assertion_memory import AssertionMemory, ContinuationPlan
 from debilgi.language.construction_nlg import ConstructionSpec
+from debilgi.language.dialogue_obligations import BoundDialogueReport
 from debilgi.language.dialogue_state import DialogueStateAnalysis
 from debilgi.language.productive_nlg import DependencyPattern
+from debilgi.language.semantic_graph import MeaningGoal, MeaningRecord
 from debilgi.language.social_reasoning import SocialPolicy
 from debilgi.language.usage_learning import UsageGuidance
+from debilgi.language.word_relations import WordRelation
 from debilgi.personality.expression import PersonalityExpression
 from debilgi.personality.perspective import PersonalityPerspective
 from debilgi.reflection.models import ReflectionGuidance
@@ -24,6 +29,8 @@ class StructuredThought:
     objective: str
     confidence: float
     evidence: tuple[str, ...]
+    intention_id: str = ""
+    state_features: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,17 +38,31 @@ class ReplyContext:
     """Relevant memory supplied to wording without changing the chosen action."""
 
     prompt: str = ""
+    turn_prompt: str = ""
+    response_options: tuple[str, ...] = ()
+    focus_reason: str | None = None
     memory_messages: tuple[str, ...] = ()
     dialogue_messages: tuple[str, ...] = ()
-    # Role-labelled turns are kept separately for the optional semantic
-    # teacher.  Local dialogue algorithms intentionally continue to consume
-    # plain text, while the teacher must know which ``я``/``ты`` belongs to
-    # the user and which belongs to the agent.
+    # The optional teacher receives labelled text. Local assertion reasoning
+    # retains event provenance and participant bindings separately below.
     consultation_messages: tuple[str, ...] = ()
     memory_ngrams: tuple[tuple[tuple[str, ...], int], ...] = ()
     experience_transitions: tuple[tuple[tuple[str, ...], float], ...] = ()
     reply_heads: tuple[tuple[str, ...], ...] = ()
     knowledge_facts: tuple[str, ...] = ()
+    # Scoped human statements retained in SQLite, with their source event IDs.
+    proposition_reports: tuple[tuple[str, str], ...] = ()
+    dialogue_reports: tuple[BoundDialogueReport, ...] = ()
+    meaning_records: tuple[MeaningRecord, ...] = ()
+    meaning_goals: tuple[MeaningGoal, ...] = ()
+    source_event_id: str = ""
+    affect_features: tuple[tuple[str, float], ...] = ()
+    dialogue_situation: DialogueSituation | None = None
+    # Raw human language remains useful when a proposition cannot be parsed.
+    corpus_utterances: tuple[tuple[str, str], ...] = ()
+    generation_ngrams: tuple[tuple[tuple[str, ...], int], ...] = ()
+    word_relations: tuple[WordRelation, ...] = ()
+    reference_definitions: tuple[tuple[str, str], ...] = ()
     required_facts: tuple[str, ...] = ()
     seed: str = ""
     personality: PersonalityExpression | None = None
@@ -58,6 +79,9 @@ class ReplyContext:
     learned_registers: tuple[str, ...] = ()
     social_policies: tuple[SocialPolicy, ...] = ()
     dialogue_state: DialogueStateAnalysis | None = None
+    assertion_memory: AssertionMemory = field(default_factory=AssertionMemory)
+    assertion_continuation: ContinuationPlan | None = None
+    assertion_feedback_counts: tuple[int, int] = (0, 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +104,11 @@ def thought_from_intent(intent: ActionIntent) -> StructuredThought:
         objective=str(intent.expected_effect.get("hypothesis", "observe")),
         confidence=intent.confidence,
         evidence=intent.evidence,
+        intention_id=intent.intent_id,
+        state_features=tuple(
+            (key, float(value)) for key, value in intent.decision_context.items()
+            if key.startswith("state_") and isinstance(value, (int, float))
+        ),
     )
 
 

@@ -1,9 +1,11 @@
 from debilgi.language.entities import (
     analyze_entities,
     identity_reply,
+    identity_thought,
     render_message_content,
 )
 from debilgi.language.lexicon import ConfidenceProfile, UnknownKind, WordAnalysis
+from debilgi.language.productive_nlg import realize_thought
 from debilgi.language.sentence_understanding import understand_utterance
 
 PAYLOAD = {
@@ -81,6 +83,14 @@ def test_identity_questions_use_discord_facts() -> None:
     assert identity_reply("как меня зовут?", PAYLOAD) == "Ты — Эвелина (@ferzevina)."
     assert identity_reply("какой у тебя ник?", PAYLOAD) == "В этом Discord я — @DEBiLGI."
     assert identity_reply("кто такой FuryBaM?", PAYLOAD) == "Это FuryBaM (@furybam)."
+
+
+def test_identity_thought_accepts_discourse_markers_and_reversed_word_order() -> None:
+    thought = identity_thought("ну так ты кто", PAYLOAD)
+
+    assert thought is not None
+    assert thought.evidence == ("gateway_identity:123:DEBiLGI",)
+    assert realize_thought(thought)[0].text == "Я называюсь DEBiLGI."
 
 
 def test_grammatical_animacy_does_not_turn_an_object_into_a_person() -> None:

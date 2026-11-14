@@ -103,6 +103,12 @@ class OpenLanguageQuestionService:
         question_id = f"open-question:{hashlib.sha256(identity.encode()).hexdigest()[:24]}"
         replaced: list[tuple[str, str]] = []
         async with self._lock, self._database.transaction() as connection:
+            existing = await (await connection.execute(
+                "SELECT question_id FROM language_open_questions WHERE question_id = ?",
+                (question_id,),
+            )).fetchone()
+            if existing is not None:
+                return question_id
             rows = await (
                 await connection.execute(
                     """SELECT question_id, concept_key FROM language_open_questions

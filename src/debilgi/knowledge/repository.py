@@ -18,6 +18,7 @@ from debilgi.knowledge.models import (
 from debilgi.knowledge.text import alias_keys, clean_extract, normalize_key
 from debilgi.language.abbreviations import generated_abbreviation_aliases
 from debilgi.language.content import content_lemmas
+from debilgi.language.definition_relations import definition_relations
 from debilgi.storage.database import Database
 
 
@@ -127,7 +128,46 @@ class KnowledgeRepository:
                     -float(row["confidence"]),
                 )
             )
-        return self._concept_from_row(rows[0])
+        concept = self._concept_from_row(rows[0])
+        await self.ensure_definition_relations(concept)
+        return concept
+
+    async def ensure_definition_relations(self, concept: KnowledgeConcept) -> None:
+        """Lazily upgrade cached definitions without repeating their network lookup."""
+        async with self._database.transaction() as connection:
+            # A concurrent refresh may have superseded the caller's snapshot.
+            async with connection.execute(
+                "SELECT * FROM knowledge_concepts WHERE concept_id = ?", (concept.concept_id,)
+            ) as cursor:
+                current = await cursor.fetchone()
+            if current is None:
+                return
+            await self._store_definition_relations(
+                connection, concept.concept_id, current["title"], current["definition"],
+                current["source"],
+            )
+
+    @staticmethod
+    async def _store_definition_relations(connection, concept_id, title, definition, source):
+        if source not in {"wikipedia", "ru_wiktionary", "ru_wiktionary_derived"}:
+            return
+        relations = definition_relations(title, definition, require_subject=source == "wikipedia")
+        async with connection.execute(
+            "SELECT sense_key,predicate,target,evidence_text FROM knowledge_definition_relations "
+            "WHERE concept_id = ?", (concept_id,)
+        ) as cursor:
+            existing = {tuple(row) for row in await cursor.fetchall()}
+        if existing == {(e.sense_key, e.predicate, e.target, e.evidence) for e in relations}:
+            return
+        await connection.execute(
+            "DELETE FROM knowledge_definition_relations WHERE concept_id = ?", (concept_id,)
+        )
+        await connection.executemany(
+            """INSERT INTO knowledge_definition_relations
+               (concept_id, sense_key, predicate, target, evidence_text) VALUES (?, ?, ?, ?, ?)""",
+            ((concept_id, edge.sense_key, edge.predicate, edge.target, edge.evidence)
+             for edge in relations),
+        )
 
     async def resolved_concept_for_event(self, event_id: str) -> KnowledgeConcept | None:
         """Return the concept deliberately looked up for this exact event."""
@@ -468,6 +508,7 @@ class KnowledgeRepository:
             )
         concept = await self.concept(concept_id)
         assert concept is not None
+        await self.ensure_definition_relations(concept)
         return concept
 
     async def store_internalized_concept(
@@ -592,6 +633,7 @@ class KnowledgeRepository:
             )
         concept = await self.concept(concept_id)
         assert concept is not None
+        await self.ensure_definition_relations(concept)
         return concept
 
     async def finish_without_result(

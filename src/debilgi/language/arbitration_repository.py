@@ -197,6 +197,8 @@ class ArbitrationRepository:
                                 "tone": proposal.plan.tone,
                                 "certainty": proposal.plan.confidence,
                                 "follow_up": proposal.plan.follow_up,
+                                "message_plan": proposal.metadata.get("message_plan"),
+                                "message_plan_key": proposal.metadata.get("message_plan_key"),
                                 "components": dict(scored.components),
                             }
                         ),

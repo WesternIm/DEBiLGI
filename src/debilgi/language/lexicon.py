@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Callable
@@ -24,8 +25,10 @@ from debilgi.language.character_markov import (
     words_from_text,
 )
 from debilgi.language.content import content_lemmas
+from debilgi.language.definition_relations import definition_relations
 from debilgi.language.lexical_matching import fuzzy_match_allowed
-from debilgi.language.morphology import DEFAULT_MORPHOLOGY
+from debilgi.language.morphology import DEFAULT_MORPHOLOGY, POS_NAMES
+from debilgi.language.ruwordnet import LexicalLink, RuWordNet
 from debilgi.storage.database import Database
 
 try:  # Optional at runtime; the service retains a deterministic local fallback.
@@ -145,6 +148,12 @@ class WordAnalysis:
     associations: tuple[str, ...] = ()
     unknown_kind: UnknownKind | None = None
     is_neologism: bool = False
+    semantic_relations: tuple[tuple[str, str], ...] = ()
+    sense_id: str | None = None
+    sense_candidates: tuple[str, ...] = ()
+    sense_options: tuple[tuple[str, str], ...] = ()
+    relation_evidence: tuple[str, ...] = ()
+    typed_relations: tuple[LexicalLink, ...] = ()
 
     @property
     def is_dictionary_word(self) -> bool:
@@ -158,6 +167,7 @@ class WordAnalysis:
                 "dictionary_cache",
                 "ru_wiktionary",
                 "ru_wiktionary_derived",
+                "ruwordnet",
                 "builtin_abbreviation",
             }
         )
@@ -277,6 +287,10 @@ def extract_explicit_definition(content: str) -> tuple[str, str] | None:
         definition = match.group(2).strip(" ,;:.—–-")
         if concept in _INVALID_DEFINITION_SUBJECTS:
             continue
+        reading = DEFAULT_MORPHOLOGY.best(concept)
+        if (reading is not None and reading.is_known
+                and reading.part_of_speech not in {"noun", "adjective", "verb"}):
+            continue  # a connective or pronoun in a sentence is not a headword lesson
         if is_substantive_definition(concept, definition):
             return concept, definition[:1000]
     return None
@@ -293,8 +307,10 @@ class LexiconService:
         curiosity_threshold: float = 0.68,
         curiosity_question_cooldown: timedelta = timedelta(minutes=30),
         curiosity_max_consecutive_questions: int = 1,
+        ruwordnet: RuWordNet | None = None,
     ) -> None:
         self._database = database
+        self._ruwordnet = ruwordnet
         self.unknown_word_threshold = unknown_word_threshold
         self.curiosity_threshold = curiosity_threshold
         self.curiosity_question_cooldown = curiosity_question_cooldown
@@ -378,6 +394,37 @@ class LexiconService:
         reference = await self._cached_reference(normalized, context=context)
         if reference is None:
             reference = self._reference_analysis(original_normalized, context=context)
+        if guild_id and (personal is None or not personal["explicitly_taught"]):
+            lemma = reference[0] if reference is not None else normalized
+            lesson = await self._database.fetchone(
+                """SELECT * FROM language_personal_interpretations
+                   WHERE guild_id = ? AND explicitly_taught = 1
+                     AND (normalized_form = ? OR lemma = ?)
+                   ORDER BY updated_at DESC LIMIT 1""", (guild_id, lemma, lemma),
+            )
+            if lesson is not None:
+                personal = lesson
+        if reference is None or not reference[3]:
+            # A known morphological form is not yet a known meaning. Use only an
+            # exact headword with a definition-backed graph, never partial aliases.
+            concept = await self._database.fetchone(
+                """SELECT c.definition, c.source, c.confidence FROM knowledge_concepts c
+                   WHERE c.normalized_title = ?
+                     AND c.source IN ('wikipedia', 'ru_wiktionary', 'ru_wiktionary_derived')
+                     AND EXISTS (SELECT 1 FROM knowledge_definition_relations r
+                                 WHERE r.concept_id = c.concept_id)
+                   ORDER BY CASE WHEN c.source = 'wikipedia' THEN 1 ELSE 0 END,
+                            c.confidence DESC LIMIT 1""",
+                ((reference[0] if reference is not None else normalized).replace("ё", "е"),),
+            )
+            if concept is not None:
+                if reference is None:
+                    reference = (normalized, None, {}, (), (), str(concept["source"]),
+                                 float(concept["confidence"]))
+                reference = (
+                    *reference[:3], (str(concept["definition"]),), reference[4],
+                    str(concept["source"]), min(reference[6], float(concept["confidence"])),
+                )
 
         if slang is not None:
             meaning = str(slang["meaning"])
@@ -407,6 +454,23 @@ class LexiconService:
                 ),
                 associations=self._associations(personal),
                 is_neologism=neologism is not None,
+            )
+
+        if (personal is not None and personal["explicitly_taught"] and personal["interpretation"]
+                and not is_abbreviation_candidate(surface)):
+            meaning = str(personal["interpretation"])
+            lemma = reference[0] if reference else str(personal["lemma"] or normalized)
+            part = reference[1] if reference else None
+            features = reference[2] if reference else {}
+            memory = float(personal["confidence"])
+            return WordAnalysis(
+                surface, normalized, lemma, part, features,
+                reference[3] if reference else (), ("learned_in_conversation",),
+                "personal_lexicon", ConfidenceProfile(0.9, memory, 0.85, memory, memory),
+                selected_meaning=meaning, personal_interpretation=meaning,
+                associations=self._associations(personal),
+                semantic_relations=tuple((edge.predicate, edge.target)
+                                         for edge in definition_relations(lemma, meaning)),
             )
 
         if personal is not None and is_abbreviation_candidate(surface):
@@ -454,6 +518,56 @@ class LexiconService:
         if reference is not None:
             lemma, part, features, meanings, labels, source, form_confidence = reference
             senses = await self._senses_for_lemma(lemma)
+            if (self._ruwordnet is not None and not senses and part
+                    and (not meanings or source in {
+                        "builtin", "opencorpora", "opencorpora_spelling",
+                    })):
+                selection = await asyncio.to_thread(
+                    self._ruwordnet.lookup, lemma, part, context or "",
+                )
+                if selection.senses:
+                    chosen = selection.selected
+                    links = ()
+                    if chosen is not None:
+                        links = (*chosen.links, *(
+                            LexicalLink("synonym", chosen.synset_id, word, (word,))
+                            for word in chosen.synonyms if word != lemma
+                        ))
+                    semantic_links = tuple(dict.fromkeys((
+                        *((link.relation, link.target) for link in links),
+                        *((("synonym", word) for word in chosen.synonyms if word != lemma)
+                          if chosen is not None else ()),
+                    )))
+                    return WordAnalysis(
+                        surface, normalized, lemma, part, features,
+                        (chosen.meaning,) if chosen else (), labels, "ruwordnet",
+                        ConfidenceProfile(form_confidence, 0.86, 0.86 if chosen else 0.4,
+                                          0.8, min(form_confidence, 0.86 if chosen else 0.4)),
+                        selected_meaning=chosen.meaning if chosen else None,
+                        personal_interpretation=(
+                            str(personal["interpretation"])
+                            if personal and personal["interpretation"] else None
+                        ),
+                        associations=self._associations(personal),
+                        is_neologism=neologism is not None,
+                        unknown_kind=None if chosen else UnknownKind.AMBIGUOUS_CONTEXT,
+                        semantic_relations=semantic_links,
+                        sense_id=chosen.synset_id if chosen else None,
+                        sense_candidates=tuple(s.synset_id for s in selection.senses),
+                        sense_options=tuple((s.synset_id, s.title) for s in selection.senses),
+                        typed_relations=links,
+                        relation_evidence=(*selection.evidence, *(
+                            f"ruwordnet:{chosen.synset_id}:{link.relation}:{link.target_id}"
+                            for link in links
+                        )),
+                    )
+            if part:
+                senses = tuple(
+                    sense for sense in senses
+                    if not sense.part_of_speech
+                    or POS_NAMES.get(sense.part_of_speech, sense.part_of_speech)
+                    == POS_NAMES.get(part, part)
+                )
             if senses:
                 meanings = tuple(item.definition for item in senses)
                 resolved = self._resolve_sense_from_context(senses, context or "")
@@ -483,6 +597,10 @@ class LexiconService:
                 associations=self._associations(personal),
                 unknown_kind=(UnknownKind.AMBIGUOUS_CONTEXT if ambiguous else None),
                 is_neologism=neologism is not None,
+                semantic_relations=tuple(
+                    (edge.predicate, edge.target)
+                    for edge in definition_relations(lemma, selected)
+                ) if selected is not None else (),
             )
 
         if personal is not None:
@@ -904,11 +1022,12 @@ class LexiconService:
         await self._database.execute(
             """INSERT INTO language_personal_interpretations (
                 guild_id, normalized_form, lemma, interpretation, associations_json,
-                supporting_event_ids_json, confidence, first_seen_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                supporting_event_ids_json, confidence, first_seen_at, updated_at, explicitly_taught
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT (guild_id, normalized_form) DO UPDATE SET
                 lemma = COALESCE(excluded.lemma, lemma),
                 interpretation = excluded.interpretation,
+                explicitly_taught = 1,
                 associations_json = excluded.associations_json,
                 supporting_event_ids_json = excluded.supporting_event_ids_json,
                 occurrence_count = occurrence_count + 1,
@@ -1353,29 +1472,39 @@ class LexiconService:
                ORDER BY e.confidence DESC LIMIT 32""",
             (normalized,),
         )
-        row = rows[0] if rows else None
-        if len(rows) > 1:
-            reading = DEFAULT_MORPHOLOGY.reading_in_context(normalized, context)
-            if reading is not None:
-                row = next(
-                    (item for item in rows if str(item["lemma"]) == reading.lemma),
-                    row,
-                )
+        reading = DEFAULT_MORPHOLOGY.reading_in_context(normalized, context) if context else None
+        contextual = reading is not None and reading.is_known
+
+        def compatible(item: Any) -> bool:
+            if not contextual:
+                return True
+            part = str(item["part_of_speech"] or "")
+            return str(item["lemma"]) == reading.lemma and (
+                not part or POS_NAMES.get(part, part) == reading.part_of_speech
+            )
+
+        row = next((item for item in rows if compatible(item)), None)
         if row is None:
             row = await self._database.fetchone(
                 """SELECT *, '{}' AS grammatical_features_json
                    FROM language_dictionary_entries WHERE lemma = ?""",
-                (normalized,),
+                (reading.lemma if contextual else normalized,),
             )
-        if row is None:
+        if row is None or not compatible(row):
             return None
+        features = {
+            str(name): str(value)
+            for name, value in json.loads(str(row["grammatical_features_json"])).items()
+        }
+        if contextual:
+            # Case/tense belong to this occurrence, not to a cached headword.
+            features = reading.features()
         return (
             str(row["lemma"]),
-            str(row["part_of_speech"]) if row["part_of_speech"] else None,
-            {
-                str(name): str(value)
-                for name, value in json.loads(str(row["grammatical_features_json"])).items()
-            },
+            str(row["part_of_speech"]) if row["part_of_speech"] else (
+                reading.part_of_speech if contextual else None
+            ),
+            features,
             tuple(str(item) for item in json.loads(str(row["meanings_json"]))),
             tuple(str(item) for item in json.loads(str(row["style_labels_json"]))),
             "dictionary_cache",
@@ -1775,6 +1904,13 @@ def _select_meaning(
             return meanings[0], min(0.96, 0.65 + weapon * 0.1)
         if food > weapon:
             return meanings[1], min(0.96, 0.65 + food * 0.1)
+    # Resolve arbitrary dictionary senses through their own semantic evidence.
+    # Ties retain ambiguity; never mix the relations of competing meanings.
+    context_terms = set(content_lemmas(context)) - {lemma}
+    scores = tuple(len(context_terms & set(content_lemmas(meaning))) for meaning in meanings)
+    best = max(scores, default=0)
+    if best > 0 and scores.count(best) == 1:
+        return meanings[scores.index(best)], min(0.9, 0.55 + best * 0.12)
     return None, 0.34
 
 

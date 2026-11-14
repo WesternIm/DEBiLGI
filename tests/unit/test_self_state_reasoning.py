@@ -19,6 +19,15 @@ def _understanding(*known: str) -> UtteranceUnderstanding:
     )
 
 
+def test_understanding_an_evaluation_is_not_evidence_that_it_is_true() -> None:
+    frame = analyze_self_state(analyze_structured_utterance('Ты считаешь себя тупым?'))
+    assert frame is not None
+    result = reason_about_self_state(frame, _understanding('считать', 'тупой'))
+    assert result.actual is None
+    assert result.thought is None
+    assert result.evidence == ('requires_contextual_owned_position',)
+
+
 def test_self_understanding_question_is_resolved_from_context_then_realized() -> None:
     frame = analyze_self_state(analyze_structured_utterance("А ты понял идею?"))
 
@@ -52,6 +61,11 @@ def test_same_reasoner_handles_knowledge_and_memory_predicates() -> None:
 
     assert realize_thought(known.thought)[0].text == "Да, я знаю термин."
     assert realize_thought(remembered.thought)[0].text == "Да, я помню разговор."
+
+
+def test_content_request_with_what_is_not_binary_knowledge_state() -> None:
+    frame = analyze_self_state(analyze_structured_utterance("Что знаешь про кварц?"))
+    assert frame is None
 
 
 def test_ungrounded_idea_does_not_create_a_fake_confident_answer() -> None:

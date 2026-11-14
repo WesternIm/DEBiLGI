@@ -1,3 +1,5 @@
+import pytest
+
 from debilgi.language.arbitration import (
     ArbitrationProfile,
     ResponseArbitrator,
@@ -5,6 +7,14 @@ from debilgi.language.arbitration import (
     extract_features,
     merge_recovery_decision,
 )
+from debilgi.language.communication import ResponseComposer
+from debilgi.language.productive_nlg import (
+    ClauseThought,
+    ConceptArgument,
+    ConceptLexeme,
+    SemanticDependency,
+)
+from debilgi.language.structured_utterance import analyze_structured_utterance
 
 
 def candidate(
@@ -37,6 +47,135 @@ def decide(*candidates: ResponseCandidate):
     )
 
 
+def grounded_answer(text="Лиса взяла ключ."):
+    return ResponseCandidate.create(
+        event_id="event:one", source="semantic_reasoning", renderer="productive_roles",
+        text=text, speech_act="statement", source_confidence=0.86,
+        required_facts=("Лиса взяла ключ.",), metadata={
+            "authored_reply_template": False,
+            "role_order": ("subject", "predicate", "direct_object"),
+            "reasoning_evidence": ("event:reported_action",),
+        },
+    )
+
+
+def composed_question(prompt, predicate):
+    composer = ResponseComposer(analyze_structured_utterance(prompt))
+    thought = ClauseThought(
+        ConceptLexeme(predicate, predicate, "verb", (("tense", "past"),)),
+        (SemanticDependency("subject", ConceptArgument(ConceptLexeme("что", "что", "pronoun"))),),
+        clause_kind="question", focus_role="subject", confidence=0.8,
+        evidence=("current_turn:unresolved_event",),
+    )
+    surface = composer.express(thought, limit=1)[0]
+    return surface.text, composer.metadata_for(surface.text)
+
+
+@pytest.mark.parametrize("predicate", ["произойти", "измениться", "случиться"])
+@pytest.mark.parametrize("source", ["dialogue_move", "new_independent_producer"])
+def test_checked_dialogue_move_survives_zero_word_overlap_and_learned_penalties(predicate, source):
+    text, plan_metadata = composed_question("пиздээ", predicate)
+    answer = candidate(text, source=source, confidence=0.43,
+        metadata={
+            **plan_metadata,
+            "reader_checked": True, "locally_composed": True,
+            "reasoning_evidence": ("incomplete_dialogue_act",), "obligation_fit": 1.0,
+            "context_relevance": 0.0, "semantic_frame_fit": 0.73,
+        })
+    decision = ResponseArbitrator(minimum_score=0.45).decide(
+        event_id="event:one", prompt="пиздээ", focus_concepts=("пиздээ",),
+        candidates=(answer,), recent_replies=(), profile=ArbitrationProfile.baseline(1),
+        structural_weights={f"source:{source}": -100.0},
+    )
+    assert decision.winner == answer
+    assert decision.scores[0].answer_status == "dialogue_response"
+    assert decision.scores[0].features.context_relevance == 1.0
+
+
+def test_dialogue_move_cannot_replace_a_factual_answer_by_claiming_high_fit():
+    text, plan_metadata = composed_question("Сколько стоит гречка?", "произойти")
+    answer = candidate(text, source="dialogue_move", confidence=0.43,
+        metadata={
+            **plan_metadata,
+            "response_obligation": "answer_question", "response_move": "probe_event",
+            "reader_checked": True, "locally_composed": True,
+            "reasoning_evidence": ("incomplete_dialogue_act",), "obligation_fit": 1.0,
+            "context_relevance": 0.0,
+        })
+    features = extract_features(answer, prompt="Сколько стоит гречка?",
+                                focus_concepts=(), recent_replies=())
+    assert features.context_relevance == 0.0
+
+
+def test_negative_wording_feedback_cannot_suppress_a_grounded_answer():
+    answer = grounded_answer()
+    kwargs = dict(
+        event_id="event:one", prompt="Что взяла лиса?", focus_concepts=("лиса",),
+        candidates=(answer,), recent_replies=(), profile=ArbitrationProfile.baseline(1),
+    )
+    initial = ResponseArbitrator(minimum_score=0.0).decide(**kwargs)
+    threshold = initial.scores[0].total - 0.03
+    learned = ResponseArbitrator(minimum_score=threshold).decide(
+        **kwargs, structural_weights={"source:semantic_reasoning": -100.0},
+    )
+    assert learned.scores[0].total < threshold
+    assert learned.scores[0].admission_score >= threshold
+    assert learned.winner == answer
+    assert learned.selection_reason == "grounded_answer_then_surface"
+
+
+def test_recovery_self_confidence_cannot_outbid_a_grounded_answer():
+    answer = grounded_answer()
+    recovery = candidate("Я не знаю ответа.", source="semantic_recovery", confidence=1.0,
+                         metadata={"context_relevance": 1.0, "truth_grounding": 1.0,
+                                   "semantic_frame_fit": 1.0})
+    decision = ResponseArbitrator(minimum_score=0.0).decide(
+        event_id="event:one", prompt="Что взяла лиса?", focus_concepts=("лиса",),
+        candidates=(answer, recovery), recent_replies=(), profile=ArbitrationProfile.baseline(1),
+        structural_weights={"source:semantic_reasoning": -100.0,
+                            "source:semantic_recovery": 100.0},
+    )
+    assert decision.winner == answer
+    statuses = {score.candidate.source: score.answer_status for score in decision.scores}
+    assert statuses == {"semantic_reasoning": "grounded_answer", "semantic_recovery": "recovery"}
+
+
+def test_inapplicable_high_confidence_duplicate_does_not_hide_valid_answer():
+    invalid = candidate("Лиса взяла ключ.", source="knowledge_retrieval", confidence=1.0,
+                        metadata={"applicability": 0.0})
+    answer = grounded_answer()
+    assert decide(invalid, answer).winner == answer
+
+
+def test_hard_semantic_failure_cannot_be_rescued_by_high_scores():
+    decision = ResponseArbitrator(minimum_score=0.0).decide(
+        event_id="event:one", prompt="Что взяла лиса?", focus_concepts=("лиса",),
+        candidates=(grounded_answer("Лиса не взяла ключ."),), recent_replies=(),
+        profile=ArbitrationProfile.baseline(1),
+        structural_weights={"source:semantic_reasoning": 100.0},
+    )
+    assert decision.winner is None
+    assert decision.scores[0].admission_score < 0.0
+
+
+def test_content_preselection_cannot_hide_the_only_valid_answer():
+    rejected = tuple(candidate(
+        "Я отвечаю.", source=f"source_{i}", confidence=1.0,
+        metadata={"hard_rejection": "test_invalid", "response_obligation": "answer_question"},
+    ) for i in range(13))
+    # Distinct surfaces prevent deduplication from masking the pruning problem.
+    from dataclasses import replace
+    rejected = tuple(replace(c, text=f"Ответ номер {i}.") for i, c in enumerate(rejected))
+    answer = grounded_answer()
+    decision = ResponseArbitrator(minimum_score=0.0).decide(
+        event_id="event:one", prompt="Что взяла лиса?", focus_concepts=("лиса",),
+        candidates=(*rejected, answer), recent_replies=(),
+        profile=ArbitrationProfile.baseline(1),
+    )
+    assert len(decision.scores) == 14
+    assert decision.winner == answer
+
+
 def test_winner_does_not_depend_on_generator_order() -> None:
     relevant = candidate(
         "Да, футбол мне интересен. А тебе какой клуб нравится?",
@@ -53,6 +192,34 @@ def test_winner_does_not_depend_on_generator_order() -> None:
 
     assert first.winner == relevant
     assert reversed_order.winner == relevant
+
+
+def test_composed_case_error_is_a_penalty_without_becoming_a_learning_example():
+    from debilgi.language.surface_coherence import evaluate_surface
+
+    rough = "Я управляю машину."
+    assert "governed_case_mismatch" in evaluate_surface(rough).hard_issues
+    composed = candidate(rough, source="semantic_reasoning", metadata={
+        "locally_composed": True, "allow_rough_surface": True,
+        "role_order": ("subject", "predicate", "direct_object"),
+    })
+    copied = candidate(rough, source="semantic_synthesis", metadata={
+        "authored_reply_template": False, "allow_rough_surface": True,
+    })
+    assert ResponseArbitrator._hard_rejections(composed) == ()
+    assert "surface:governed_case_mismatch" in ResponseArbitrator._hard_rejections(copied)
+    decision = decide(composed)
+    assert decision.winner == composed
+    assert decision.scores[0].features.broken_surface_penalty == 0.15
+    assert not evaluate_surface(rough).learnable
+
+
+def test_rough_composition_does_not_excuse_invalid_semantic_roles():
+    invalid = candidate("Я поперхнулся мозг.", source="semantic_reasoning", metadata={
+        "locally_composed": True, "allow_rough_surface": True,
+        "role_order": ("subject", "predicate", "direct_object"),
+    })
+    assert "surface:unexpected_valency_role" in ResponseArbitrator._hard_rejections(invalid)
 
 
 def test_inapplicable_retrieval_is_logged_but_cannot_win() -> None:

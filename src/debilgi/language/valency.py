@@ -143,6 +143,11 @@ _PROFILES = {
         _profile("избегать", _SUBJECT, _GENITIVE_OBJECT),
         _profile("управлять", _SUBJECT, _INSTRUMENTAL_OBJECT),
         _profile("пользоваться", _SUBJECT, _INSTRUMENTAL_OBJECT),
+        _profile(
+            "являться", _SUBJECT,
+            ValencySlot("direct_object", grammatical_case="instrumental"),
+            ValencySlot("predicate_complement", grammatical_case="instrumental"),
+        ),
         _profile("интересоваться", _SUBJECT, _INSTRUMENTAL_OBJECT),
         _profile("удивляться", _SUBJECT, _REQUIRED_INDIRECT),
         _profile("радоваться", _SUBJECT, _REQUIRED_INDIRECT),
@@ -169,6 +174,8 @@ _PROFILES = {
         _profile(
             "говорить",
             _SUBJECT,
+            ValencySlot("direct_object", grammatical_case="accusative"),
+            _INDIRECT,
             _TOPIC,
             _COMPANION,
             complement_roles={"с": "companion", "со": "companion"},

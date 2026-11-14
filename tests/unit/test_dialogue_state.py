@@ -110,6 +110,21 @@ def test_answer_failure_returns_to_the_last_real_question() -> None:
     assert "осознанный" in analysis.added_context_terms
 
 
+def test_claim_contradiction_reopens_question_behind_the_bad_answer() -> None:
+    question = "Так зачем ты это делал?"
+    analysis = analyze_dialogue_state(
+        "Ты сказал делал",
+        (
+            "Пересматриваю я предыдущий ответ.",
+            question,
+            "Нет, я не делал это.",
+        ),
+    )
+
+    assert analysis.repair_target == question
+    assert analysis.retrieval_query == question
+
+
 @pytest.mark.parametrize(
     "repair_message",
     (

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,11 @@ from discord.ext import commands
 from debilgi.cognition.core import CognitiveCore
 from debilgi.cognition.features import BehaviorFeatureExtractor
 from debilgi.cognition.world_model import WorldModelRepository
+from debilgi.diagnostics.progress import (
+    LearningProgressAnalyzer,
+    LearningProgressReport,
+    ProgressVerdict,
+)
 from debilgi.events.pipeline import EventPipeline
 from debilgi.events.repository import EventRepository
 from debilgi.language.archive_importer import ArchiveImportManager
@@ -57,6 +63,30 @@ class Diagnostics(
         self._feature_extractor = feature_extractor
         self._world_model = world_model
         self._cognitive_core = cognitive_core
+        self._learning_progress = LearningProgressAnalyzer(database)
+        self._live_progress_sessions: set[tuple[int, int]] = set()
+
+    @language.command(name="delivery", description="Show durable reply delivery status")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def delivery(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        rows = await self._database.fetchall(
+            """SELECT j.status, COUNT(*) AS count FROM reply_delivery_jobs j
+               JOIN events e ON e.event_id = j.event_id WHERE e.guild_id = ?
+               GROUP BY j.status""", (interaction.guild_id,),
+        )
+        issues = await self._database.fetchall(
+            """SELECT j.event_id, j.status FROM reply_delivery_jobs j
+               JOIN events e ON e.event_id = j.event_id
+               WHERE e.guild_id = ? AND j.status IN ('uncertain', 'failed')
+               ORDER BY j.updated_at DESC LIMIT 10""", (interaction.guild_id,),
+        )
+        lines = [f"worker running: {self.bot.reply_delivery.running}"]
+        lines.extend(f"{row['status']}: {row['count']}" for row in rows)
+        lines.extend(f"{row['status']}: {row['event_id']}" for row in issues)
+        await interaction.response.send_message('\n'.join(lines), ephemeral=True)
 
     @app_commands.command(name="dna", description="Show immutable personality genome")
     @app_commands.guild_only()
@@ -91,6 +121,128 @@ class Diagnostics(
             f"{self_model.initiative_attempts}",
             ephemeral=True,
         )
+
+    @language.command(
+        name="progress",
+        description="Compare recent learning quality with the preceding window",
+    )
+    @app_commands.describe(window="Resolved observations per comparison window, from 10 to 100")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def learning_progress(
+        self,
+        interaction: discord.Interaction,
+        window: app_commands.Range[int, 10, 100] = 25,
+    ) -> None:
+        assert interaction.guild_id is not None
+        report = await self._learning_progress.report(
+            interaction.guild_id,
+            window_size=window,
+        )
+        await interaction.response.send_message(_format_learning_progress(report), ephemeral=True)
+
+    @language.command(
+        name="progress-live",
+        description="Continuously refresh learning metrics in one private message",
+    )
+    @app_commands.describe(
+        window="Observations per comparison window, from 10 to 100",
+        duration_minutes="How long to refresh the panel, from 1 to 30 minutes",
+        refresh_seconds="Refresh interval, from 10 to 60 seconds",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def learning_progress_live(
+        self,
+        interaction: discord.Interaction,
+        window: app_commands.Range[int, 10, 100] = 25,
+        duration_minutes: app_commands.Range[int, 1, 30] = 5,
+        refresh_seconds: app_commands.Range[int, 10, 60] = 15,
+    ) -> None:
+        assert interaction.guild_id is not None
+        session_key = (interaction.guild_id, interaction.user.id)
+        if session_key in self._live_progress_sessions:
+            await interaction.response.send_message(
+                "You already have a live learning-progress panel running on this server.",
+                ephemeral=True,
+            )
+            return
+
+        self._live_progress_sessions.add(session_key)
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + duration_minutes * 60
+            tick = 0
+            while True:
+                tick += 1
+                remaining = max(0, round(deadline - loop.time()))
+                report = await self._learning_progress.report(
+                    interaction.guild_id,
+                    window_size=window,
+                )
+                state = "FINISHED" if remaining == 0 else "LIVE"
+                updated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+                header = (
+                    f"{state} | update #{tick} | {updated_at} | "
+                    f"remaining {_format_duration(remaining)}\n"
+                )
+                try:
+                    await interaction.edit_original_response(
+                        content=header + _format_learning_progress(report)
+                    )
+                except (discord.NotFound, discord.Forbidden):
+                    return
+                if remaining == 0:
+                    return
+                await asyncio.sleep(min(refresh_seconds, remaining))
+        finally:
+            self._live_progress_sessions.discard(session_key)
+
+    @language.command(
+        name="quality-cases",
+        description="Show recent failures routed through the closed learning loop",
+    )
+    @app_commands.describe(limit="Number of recent cases, from 1 to 10")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def quality_cases(
+        self,
+        interaction: discord.Interaction,
+        limit: app_commands.Range[int, 1, 10] = 5,
+    ) -> None:
+        assert interaction.guild_id is not None
+        rows = await self._database.fetchall(
+            """SELECT quality_case.case_id, quality_case.category,
+                      quality_case.source_kind, quality_case.reason,
+                      quality_case.severity, quality_case.status,
+                      quality_case.created_at,
+                      COUNT(action.action_id) AS action_count
+               FROM learning_quality_cases AS quality_case
+               LEFT JOIN learning_quality_actions AS action
+                 ON action.case_id = quality_case.case_id
+               WHERE quality_case.guild_id = ?
+               GROUP BY quality_case.case_id
+               ORDER BY quality_case.created_at DESC LIMIT ?""",
+            (interaction.guild_id, limit),
+        )
+        if not rows:
+            await interaction.response.send_message(
+                "No learning-quality failures recorded yet.",
+                ephemeral=True,
+            )
+            return
+        lines = ["recent learning-quality cases"]
+        lines.extend(
+            f"{row['status']} | {row['category']} | {row['source_kind']} | "
+            f"severity={float(row['severity']):.2f} actions={int(row['action_count'])} | "
+            f"{str(row['reason'])[:100]}"
+            for row in rows
+        )
+        await interaction.response.send_message("\n".join(lines)[:1_950], ephemeral=True)
 
     @app_commands.command(name="reflection", description="Show private outcome reflection")
     @app_commands.guild_only()
@@ -838,3 +990,81 @@ def _optional_seconds(value: float | None) -> str:
 
 def _optional_number(value: float | None) -> str:
     return "-" if value is None else f"{value:.3f}"
+
+
+def _format_learning_progress(report: LearningProgressReport) -> str:
+    feedback = report.feedback
+    comprehension = report.comprehension
+    predictions = report.predictions
+    pipeline = report.pipeline
+    quality_loop = report.quality_loop
+    labels = {
+        ProgressVerdict.IMPROVING: "IMPROVING",
+        ProgressVerdict.PLATEAU: "PLATEAU",
+        ProgressVerdict.REGRESSING: "REGRESSING",
+        ProgressVerdict.INSUFFICIENT_DATA: "INSUFFICIENT DATA",
+    }
+    return (
+        f"operational trend: {labels[report.verdict]} "
+        f"(evidence {report.evidence_score:+d}, "
+        f"comparable sections {report.comparable_sections}/4)\n"
+        f"window: latest {report.window_size} vs preceding {report.window_size}\n\n"
+        "feedback quality (current <- previous)\n"
+        f"samples: {feedback.current.samples} <- {feedback.previous.samples}\n"
+        f"average reward: {_metric_pair(feedback, 'average_reward')}\n"
+        f"positive rate: {_metric_pair(feedback, 'positive_rate', percent=True)}\n"
+        f"negative rate: {_metric_pair(feedback, 'negative_rate', percent=True)}\n"
+        f"reward calibration MAE: {_metric_pair(feedback, 'calibration_error')}\n\n"
+        "text comprehension coverage (current <- previous)\n"
+        f"samples: {comprehension.current.samples} <- {comprehension.previous.samples}\n"
+        f"average score: {_metric_pair(comprehension, 'average_score')}\n"
+        f"sufficient rate: {_metric_pair(comprehension, 'sufficient_rate', percent=True)}\n"
+        f"unknown terms/message: {_metric_pair(comprehension, 'average_unknown_terms')}\n\n"
+        "world prediction (current <- previous)\n"
+        f"samples: {predictions.current.samples} <- {predictions.previous.samples}\n"
+        f"exact accuracy: {_metric_pair(predictions, 'accuracy', percent=True)}\n"
+        f"average difference d: {_metric_pair(predictions, 'average_difference')}\n\n"
+        "reply pipeline (current <- previous)\n"
+        f"reply attempts: {pipeline.current.samples} <- {pipeline.previous.samples}\n"
+        f"intentional silences: {pipeline.current.intentional_silences} <- "
+        f"{pipeline.previous.intentional_silences}\n"
+        f"reply rate: {_metric_pair(pipeline, 'reply_rate', percent=True)}\n"
+        f"technical failure rate: "
+        f"{_metric_pair(pipeline, 'technical_failure_rate', percent=True)}\n\n"
+        "closed learning loop\n"
+        f"cases: {quality_loop.queued_cases} queued, "
+        f"{quality_loop.monitoring_cases} monitoring, "
+        f"{quality_loop.resolved_cases} resolved, "
+        f"{quality_loop.exhausted_cases} exhausted\n"
+        f"verified repair coverage: {_quality_repair_coverage(quality_loop)}\n"
+        f"actions: {quality_loop.applied_actions} applied, "
+        f"{quality_loop.queued_actions} queued\n\n"
+        f"A trend needs at least {report.minimum_samples} observations in both windows "
+        "for at least two sections. Comprehension score measures internal coverage; "
+        "negative human feedback decides whether a failure enters the learning loop."
+    )
+
+
+def _metric_pair(comparison: object, field: str, *, percent: bool = False) -> str:
+    current = getattr(comparison.current, field)
+    previous = getattr(comparison.previous, field)
+    if current is None or previous is None:
+        return "- <- -"
+    if percent:
+        return f"{current:.1%} <- {previous:.1%} ({current - previous:+.1%})"
+    return f"{current:.3f} <- {previous:.3f} ({current - previous:+.3f})"
+
+
+def _format_duration(seconds: int) -> str:
+    minutes, seconds = divmod(max(0, seconds), 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _quality_repair_coverage(stats: object) -> str:
+    total = (
+        stats.queued_cases
+        + stats.monitoring_cases
+        + stats.resolved_cases
+        + stats.exhausted_cases
+    )
+    return "-" if total == 0 else f"{stats.resolved_cases / total:.1%}"

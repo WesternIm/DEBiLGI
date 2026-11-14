@@ -29,7 +29,8 @@ _PLANNING_INSTRUCTION = """
 Ты — семантический планировщик русскоязычного агента DEBiLGI. Ты не пишешь ответ
 пользователю. Верни только JSON по переданной схеме.
 
-Сформируй 2–4 различных response_plans. В них разрешены только:
+Сформируй 1–3 различных response_plans. Не дублируй одинаковые пропозиции. В них
+разрешены только:
 - абстрактный move и stance;
 - лемма русского глагола в инфинитиве;
 - аргументы как отдельные словарные леммы с семантическими ролями;
@@ -475,7 +476,7 @@ class CloudflareWorkersAIConsultant:
                 "json_schema": _consultation_response_schema(planning=request.mode == "planning"),
             },
             "temperature": 0.1,
-            "max_tokens": 1_024 if request.mode == "planning" else 2_048,
+            "max_tokens": 2_048,
         }
         try:
             async with session.post(
@@ -1199,8 +1200,8 @@ def _consultation_response_schema(
             "social_frame": {"type": "object"},
             "response_plans": {
                 "type": "array",
-                "minItems": 2 if planning else 0,
-                "maxItems": 4 if planning else 0,
+                "minItems": 1 if planning else 0,
+                "maxItems": 3 if planning else 0,
                 "items": {
                     "type": "object",
                     "properties": {

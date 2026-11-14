@@ -66,6 +66,9 @@ def assess_reaction(
     exclamation_signal = min(1.0, tokens.count("!") * 0.5)
     uncertainty_signal = pragmatics.uncertainty
     emotional_signal = pragmatics.emotional_intensity
+    if question_signal or {"или", "либо"}.intersection(tokens):
+        # Alternatives named in a question are not the speaker's current stance.
+        counts = {**counts, "affirmation": 0, "refusal": 0}
 
     vector = PrimitiveVector(
         agreement=_clamp(

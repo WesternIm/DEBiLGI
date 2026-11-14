@@ -538,6 +538,13 @@ class BackgroundLearningService:
                        WHERE guild_id = ? AND channel_id = ? AND concept_key = ?""",
                     (attempts, now.isoformat(), status, guild_id, channel_id, word),
                 )
+                if status == "exhausted":
+                    await self._finish_quality_study_action(
+                        guild_id,
+                        word,
+                        status="failed",
+                        study_status=status,
+                    )
                 logger.info(
                     "cycle=%s semantic_word=%r reason=%s result=%s attempt=%d status=%s",
                     cycle_id,
@@ -564,6 +571,12 @@ class BackgroundLearningService:
                    SET study_attempts = ?, last_study_attempt_at = ?, study_status = 'learned'
                    WHERE guild_id = ? AND channel_id = ? AND concept_key = ?""",
                 (attempts, now.isoformat(), guild_id, channel_id, word),
+            )
+            await self._finish_quality_study_action(
+                guild_id,
+                word,
+                status="applied",
+                study_status="learned",
             )
             pattern_summary = _pattern_summary(lesson.pattern)
             learned = LearnedConcept(
@@ -594,6 +607,33 @@ class BackgroundLearningService:
             [learned for learned, _ in results if learned is not None],
             len(rows),
             sum(missing for _, missing in results),
+        )
+
+    async def _finish_quality_study_action(
+        self,
+        guild_id: int,
+        concept_key: str,
+        *,
+        status: str,
+        study_status: str,
+    ) -> None:
+        await self._database.execute(
+            """UPDATE learning_quality_actions
+               SET status = ?, details_json = ?
+               WHERE action_type = 'semantic_study' AND target_key = ?
+                 AND status = 'queued' AND case_id IN (
+                     SELECT case_id FROM learning_quality_cases WHERE guild_id = ?
+                 )""",
+            (
+                status,
+                json.dumps(
+                    {"term": concept_key, "study_status": study_status},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                concept_key,
+                guild_id,
+            ),
         )
 
     async def _consult_unknown_concept(

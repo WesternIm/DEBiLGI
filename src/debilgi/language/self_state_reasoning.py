@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from debilgi.language.content import content_lemmas
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
@@ -27,14 +27,9 @@ _STATE_PREDICATES = {
     "affective_state": frozenset({"чувствовать", "ощущать"}),
     "threat_response": frozenset({"бояться", "пугаться", "страшиться"}),
 }
-_NON_ATTESTED_SELF_TRAITS = frozenset({"осознанный", "сознательный"})
-_COGNITIVE_LEVEL_TARGETS = frozenset(
-    {"мышление", "рассуждение", "интеллект", "анализ"}
-)
+_COGNITIVE_LEVEL_TARGETS = frozenset({"мышление", "рассуждение", "интеллект", "анализ"})
 _LEVEL_NOUNS = frozenset({"уровень", "качество", "способность"})
-_PREDICATIVE_CONFIRMATION_MARKERS = frozenset(
-    {"да", "верно", "ведь", "же", "правда"}
-)
+_PREDICATIVE_CONFIRMATION_MARKERS = frozenset({"да", "верно", "ведь", "же", "правда"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +106,16 @@ def analyze_self_state(
         for item in structure.clauses
         if item.question_target_index is not None
     }
+    # ``что знаешь про X?`` asks for the content of the knowledge, not whether
+    # the agent possesses a binary knowledge state. Leave it to semantic
+    # inquiry/definition reasoning, where the topic can become the answer
+    # target. The yes/no state path is reserved for ``ты знаешь X?``.
+    if (
+        state == "knowledge"
+        and "что" in question_targets
+        and any(item.role == "topic" for item in frame.complements)
+    ):
+        return None
     if state == "self_location" and not question_targets & {"где", "куда"}:
         return None
     subject = structure.tokens[frame.subject_indices[0]] if frame.subject_indices else None
@@ -130,8 +135,7 @@ def analyze_self_state(
     if target is None:
         target = _bound_target(resolved_bindings)
     reflexive_self = any(
-        token.lemma == "себя"
-        for token in structure.tokens[frame.token_start : frame.token_end]
+        token.lemma == "себя" for token in structure.tokens[frame.token_start : frame.token_end]
     )
     return SelfStateFrame(
         state=state,
@@ -252,33 +256,19 @@ def reason_about_self_state(
         )
 
     if frame.state == "self_assessment":
-        trait = frame.target.head.lemma if frame.target is not None else ""
-        actual = bool(
-            understanding.sufficient
-            and frame.target is not None
-            and trait not in _NON_ATTESTED_SELF_TRAITS
-        )
-        thought = _self_assessment_thought(frame, actual)
         return SelfStateResolution(
-            thought,
+            None,
             frame.state,
-            actual,
-            min(0.94, frame.confidence * 0.84 + 0.12),
-            (
-                "local_self_assessment",
-                "trait_not_supported_by_self_model"
-                if trait in _NON_ATTESTED_SELF_TRAITS
-                else "structural_parse_sufficient",
-            ),
+            None,
+            frame.confidence * 0.6,
+            ("requires_contextual_owned_position",),
         )
 
     target_terms = set(frame.target_lemmas)
     contextual_terms = {
         term for message in context_messages[-12:] for term in content_lemmas(message)
     }
-    knowledge_terms = {
-        term for fact in knowledge_facts[:24] for term in content_lemmas(fact)
-    }
+    knowledge_terms = {term for fact in knowledge_facts[:24] for term in content_lemmas(fact)}
     known_terms = set(understanding.known_terms) | knowledge_terms
     evidence: list[str] = []
     actual: bool | None
@@ -310,7 +300,9 @@ def reason_about_self_state(
             frame.confidence * 0.72,
             tuple(evidence),
         )
-    thought = _answer_thought(frame, actual)
+    # Preserve the real derivation. A resolved-state label hid that these
+    # answers were inferred from parser/vocabulary availability, not content.
+    thought = replace(_answer_thought(frame, actual), evidence=tuple(evidence))
     return SelfStateResolution(
         thought,
         frame.state,
@@ -694,6 +686,21 @@ def _nominal_self_role_frame(
     target = _nominal_self_role_target(structure, frame)
     if target is None:
         return None
+    if target.head.part_of_speech == "adjective":
+        # In "ты тупой" the adjective is a nominative predicate, not a
+        # feminine genitive modifier. Resolve syncretism from this clause role.
+        genders = [
+            gender
+            for gender in ("masculine", "feminine", "neuter")
+            if DEFAULT_MORPHOLOGY.inflect(
+                target.head.lemma, case="nominative", number="singular", gender=gender
+            )
+            == target.head.surface.casefold()
+        ]
+        if len(genders) == 1:
+            features = dict(target.head.features)
+            features.update(case="nominative", gender=genders[0], number="singular")
+            target = replace(target, head=replace(target.head, features=tuple(features.items())))
     return SelfStateFrame(
         state="self_role_assessment",
         predicate_lemma="считать",
@@ -745,7 +752,8 @@ def _contextual_self_role_frame(
         token
         for token in structure.tokens[frame.token_start : frame.token_end]
         if token.surface[:1].isalnum()
-        and token.semantic_role not in {
+        and token.semantic_role
+        not in {
             "function_word",
             "pragmatic_marker",
             "vocative",
@@ -755,12 +763,8 @@ def _contextual_self_role_frame(
         return None
     target = candidates[0]
     features = dict(target.grammatical_features)
-    nominal_label = (
-        target.part_of_speech in {"adjective", "participle"}
-        or (
-            target.part_of_speech == "noun"
-            and features.get("animacy") == "animate"
-        )
+    nominal_label = target.part_of_speech in {"adjective", "participle"} or (
+        target.part_of_speech == "noun" and features.get("animacy") == "animate"
     )
     if not nominal_label:
         return None
@@ -876,8 +880,7 @@ def _self_assessment_target(
     frame: ClauseFrame,
 ) -> ConceptArgument | None:
     reflexive = any(
-        structure.tokens[index].lemma == "себя"
-        for index in frame.direct_object_indices
+        structure.tokens[index].lemma == "себя" for index in frame.direct_object_indices
     )
     if not reflexive:
         return None

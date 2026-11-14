@@ -28,7 +28,7 @@ _WELLBEING_RE = re.compile(
 )
 _THANKS = frozenset({"спасибо", "благодарю", "пасиб", "спс"})
 _CLARIFICATION_RE = re.compile(
-    r"^(?:а\s+)?(?:чего|чё|че|что)(?:\s+(?:бля|блин|нахуй))?[?!.…]*[)\]]*$",
+    r"^(?:а\s+)?(?:чего|чё|че|что|в\s*смысле)(?:\s+(?:бля|блин|нахуй))?[?!.…]*[)\]]*$",
     re.IGNORECASE,
 )
 _ATTENTION_CALL_RE = re.compile(

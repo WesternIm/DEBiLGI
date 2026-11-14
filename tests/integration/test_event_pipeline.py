@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +13,117 @@ from debilgi.storage.database import Database
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS = PROJECT_ROOT / "migrations"
+
+
+async def test_retry_resumes_failed_stage_without_restart(database: Database) -> None:
+    repository = EventRepository(database)
+    calls = [0, 0]
+
+    async def first(_event: Event) -> None:
+        calls[0] += 1
+
+    async def flaky(_event: Event) -> None:
+        calls[1] += 1
+        if calls[1] == 1:
+            raise RuntimeError("temporary failure")
+
+    pipeline = EventPipeline(repository, [first, flaky], retry_delay=0)
+    await pipeline.start()
+    try:
+        await pipeline.publish(make_event())
+        assert await pipeline.wait_until_processed("pipeline:1")
+        await pipeline.join()
+        assert calls == [1, 2]
+        row = await database.fetchone("SELECT attempts FROM event_processing")
+        assert row["attempts"] == 2
+    finally:
+        await pipeline.stop()
+
+
+async def test_retry_budget_is_bounded(database: Database) -> None:
+    repository = EventRepository(database)
+    calls = 0
+
+    async def broken(_event: Event) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("permanent failure")
+
+    pipeline = EventPipeline(repository, [broken], max_attempts=3, retry_delay=0)
+    await pipeline.start()
+    try:
+        await pipeline.publish(make_event())
+        assert not await pipeline.wait_until_processed("pipeline:1")
+        await pipeline.join()
+        assert calls == 3
+        assert pipeline.running
+    finally:
+        await pipeline.stop()
+
+
+async def test_failure_recording_error_does_not_kill_worker(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = EventRepository(database)
+
+    async def broken_mark_failed(*_args) -> None:
+        raise RuntimeError("database temporarily unavailable")
+
+    async def handler(event: Event) -> None:
+        if event.event_id == "broken":
+            raise RuntimeError("handler failed")
+
+    monkeypatch.setattr(repository, "mark_failed", broken_mark_failed)
+    pipeline = EventPipeline(repository, [handler], max_attempts=1)
+    await pipeline.start()
+    try:
+        await pipeline.publish(make_event("broken"))
+        await pipeline.publish(make_event("healthy"))
+        await asyncio.wait_for(pipeline.join(), timeout=2)
+        assert pipeline.running
+        assert await repository.processing_status("healthy") is ProcessingStatus.PROCESSED
+        assert await repository.processing_status("broken") is ProcessingStatus.PROCESSING
+    finally:
+        await pipeline.stop()
+
+
+async def test_stop_timeout_preserves_events_for_recovery(database: Database) -> None:
+    repository = EventRepository(database)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = []
+
+    async def handler(event: Event) -> None:
+        entered.set()
+        await release.wait()
+        completed.append(event.event_id)
+
+    pipeline = EventPipeline(repository, [handler], queue_size=1)
+    await pipeline.start()
+    await pipeline.publish(make_event("first"))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    await pipeline.publish(make_event("second"))
+    await asyncio.wait_for(pipeline.stop(timeout=0.01), timeout=2)
+    assert not pipeline.running
+    assert await repository.processing_status("first") is ProcessingStatus.PROCESSING
+    assert await repository.processing_status("second") is ProcessingStatus.PENDING
+    release.set()
+    await pipeline.start()
+    try:
+        await asyncio.wait_for(pipeline.join(), timeout=2)
+        assert completed == ["first", "second"]
+    finally:
+        await pipeline.stop()
+
+
+async def test_running_reports_dead_workers(database: Database) -> None:
+    pipeline = EventPipeline(EventRepository(database))
+    await pipeline.start()
+    for worker in pipeline._workers:
+        worker.cancel()
+    await asyncio.gather(*pipeline._workers, return_exceptions=True)
+    assert not pipeline.running
+    await pipeline.stop()
 
 
 def make_event(event_id: str = "pipeline:1", guild_id: int = 1) -> Event:

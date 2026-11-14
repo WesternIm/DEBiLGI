@@ -98,7 +98,7 @@ async def test_exchange_builds_instruction_example_and_graph(database: Database)
     assert row is not None
     assert str(row["instruction_text"]) == "где лежит красный ключ?"
     assert str(row["answer_text"]) == "Красный ключ лежит в верхнем ящике."
-    assert int(row["occurrence_count"]) == 2
+    assert int(row["occurrence_count"]) == 1
 
 
 async def test_graph_lookup_keeps_protected_paronyms_in_separate_concepts(

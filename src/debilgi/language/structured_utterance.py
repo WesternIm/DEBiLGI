@@ -22,6 +22,7 @@ from debilgi.language.grammar import role
 from debilgi.language.lexicon import WordAnalysis
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY, MorphologicalReading
 from debilgi.language.pragmatics import analyze_pragmatics
+from debilgi.language.syntax_backend import enrich_structure
 from debilgi.language.tokenizer import normalize_chat_token
 from debilgi.language.valency import predicate_valency
 
@@ -268,7 +269,13 @@ def analyze_structured_utterance(
             else "unassigned_content"
         )
         selected_meaning = _selected_meaning(lexical)
-        candidates = lexical.dictionary_meanings if lexical is not None else ()
+        candidates = (
+            tuple(label for _, label in lexical.sense_options)
+            if lexical is not None and lexical.sense_options
+            else lexical.dictionary_meanings
+            if lexical is not None
+            else ()
+        )
         unknown_kind = lexical.unknown_kind.value if lexical and lexical.unknown_kind else None
         confidence = _token_confidence(reading, lexical, entity)
         token_cards.append(
@@ -318,6 +325,8 @@ def analyze_structured_utterance(
             niche_signals.append(f"contextual_lexicon:{lexical.source}")
         if lexical is not None and lexical.is_neologism:
             niche_signals.append("neologism")
+        if lexical is not None and lexical.sense_id is not None:
+            niche_signals.append(f"selected_sense:{lexical.source}:{lemma}:{lexical.sense_id}")
         if normalized in abbreviations:
             niche_signals.append(f"abbreviation:{normalized}")
         if normalized in _EMOTIONAL_INTENSIFIERS:
@@ -387,15 +396,17 @@ def analyze_structured_utterance(
         clause_links,
     )
     dependencies = _dependency_arcs(tuple(mutable_cards), tuple(clauses))
-    return StructuredUtterance(
-        text=text,
-        tokens=tuple(mutable_cards),
-        clauses=tuple(clauses),
-        dependencies=dependencies,
-        clause_links=clause_links,
-        niche_signals=tuple(dict.fromkeys(niche_signals)),
-        ambiguities=tuple(dict.fromkeys(ambiguities)),
-        confidence=min(1.0, token_confidence * 0.45 + clause_confidence * 0.55),
+    return enrich_structure(
+        StructuredUtterance(
+            text=text,
+            tokens=tuple(mutable_cards),
+            clauses=tuple(clauses),
+            dependencies=dependencies,
+            clause_links=clause_links,
+            niche_signals=tuple(dict.fromkeys(niche_signals)),
+            ambiguities=tuple(dict.fromkeys(ambiguities)),
+            confidence=min(1.0, token_confidence * 0.45 + clause_confidence * 0.55),
+        )
     )
 
 
@@ -447,12 +458,38 @@ def _analyze_clause(
             (index for index in content_indices if cards[index].part_of_speech == "predicate"),
             None,
         )
+    if predicate_index is None:
+        # Russian impersonal attitudes and necessities use a dative
+        # experiencer with an infinitive as the main predicate: ``мне
+        # плевать``, ``тебе решать``. Treating the infinitive only as a
+        # possible complement erased the whole proposition and left dialogue
+        # planning with a bag of topic words.
+        predicate_index = next(
+            (
+                index
+                for index in content_indices
+                if cards[index].part_of_speech == "verb"
+                and "INFN" in cards[index].grammemes
+                and any(
+                    earlier < index
+                    and cards[earlier].part_of_speech in {"noun", "pronoun"}
+                    and _feature(cards[earlier], "case") == "dative"
+                    for earlier in content_indices
+                )
+            ),
+            None,
+        )
     imperative = bool(predicate_index is not None and "impr" in cards[predicate_index].grammemes)
     question_target = next(
         (
             index
             for index in syntactic_indices
-            if role(cards[index].surface) == "question" or role(cards[index].lemma) == "question"
+            if (role(cards[index].surface) == "question" or role(cards[index].lemma) == "question")
+            and not (
+                cards[index].lemma == "что"
+                and index > start
+                and cards[index - 1].lemma in {"пока", "потому", "так", "только"}
+            )
         ),
         None,
     )
@@ -612,6 +649,27 @@ def _analyze_clause(
         indirect_object = (indirect,) if indirect is not None else ()
         direct_object = _expand_coordinated_role(direct_object, coordinations)
         indirect_object = _expand_coordinated_role(indirect_object, coordinations)
+        profile = predicate_valency(cards[predicate_index].lemma)
+        if direct_object and (
+            profile is None or any(slot.role == "predicate_complement" for slot in profile.slots)
+        ):
+            # An instrumental adjective after an object can describe that
+            # object through the predicate, rather than modify a following noun.
+            # Keep the relation explicit so "считать себя умным" loses no property.
+            predicate_complement = tuple(
+                index
+                for index in content_indices
+                if index > direct_object[-1]
+                and index not in complement_objects
+                and cards[index].part_of_speech in {"adjective", "participle"}
+                and _feature(cards[index], "case") == "instrumental"
+                and not any(
+                    following > index
+                    and cards[following].part_of_speech == "noun"
+                    and _feature(cards[following], "case") == "instrumental"
+                    for following in content_indices
+                )
+            )
 
     negated = bool(
         predicate_index is not None
@@ -774,7 +832,23 @@ def _subject_index(
             and _feature(cards[index], "case") in {None, "nominative"}
         )
     if not candidates:
-        return None
+        if predicate_index is None or "intr" not in cards[predicate_index].grammemes:
+            return None
+        # Syncretic neuter nouns are often tagged accusative ("время настало").
+        # An intransitive predicate cannot govern that direct object.
+        nominal = tuple(i for i in before if cards[i].part_of_speech == "noun")
+        if len(nominal) != 1 or any(cards[i].part_of_speech == "adjective" for i in before):
+            return None
+        candidate = cards[nominal[0]]
+        predicate = cards[predicate_index]
+        if (
+            _feature(candidate, "case") != "accusative"
+            or _feature(candidate, "gender") != _feature(predicate, "gender")
+            or DEFAULT_MORPHOLOGY.inflect(candidate.lemma, case="nominative")
+            != candidate.surface.casefold()
+        ):
+            return None
+        candidates = nominal
     if predicate_index is None or len(candidates) == 1:
         return candidates[0]
     predicate = cards[predicate_index]

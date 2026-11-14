@@ -53,6 +53,15 @@ def test_wholly_unknown_fragment_remains_a_phrase_level_gap() -> None:
     assert understanding.unknown_terms == ("фырба", "трошка")
 
 
+def test_bare_purpose_question_is_missing_its_referent() -> None:
+    understanding = understand_utterance("зачем", ())
+
+    assert understanding.comprehension_score < 1.0
+    assert understanding.sufficient is False
+    assert understanding.task is not None
+    assert {gap.kind for gap in understanding.task.frontier.pending} == {"referent"}
+
+
 def test_dictionary_backed_ambiguity_is_known_instead_of_an_unknown_word() -> None:
     ambiguous = WordAnalysis(
         surface_form="лук",

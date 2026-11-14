@@ -8,7 +8,7 @@ realizes them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from debilgi.language.content import content_lemmas
 from debilgi.language.lexical_matching import same_lexical_family
@@ -58,13 +58,26 @@ def realize_autonomous_responses(
     grounding = dict(grounding_facts)
     candidates: list[AutonomousResponseCandidate] = []
     for plan in consultation.response_plans:
+        normalized_plan = replace(
+            plan,
+            propositions=tuple(
+                replace(
+                    proposition,
+                    evidence_ids=tuple(
+                        _canonical_evidence_id(evidence_id, allowed)
+                        for evidence_id in proposition.evidence_ids
+                    ),
+                )
+                for proposition in plan.propositions
+            ),
+        )
         propositions = tuple(
             dict.fromkeys(
                 _compile_grounded_proposition(
                     proposition,
                     grounding=grounding,
                 )
-                for proposition in plan.propositions
+                for proposition in normalized_plan.propositions
             )
         )
         evidence_ids = tuple(
@@ -76,7 +89,7 @@ def realize_autonomous_responses(
         )
         if any(evidence_id not in allowed for evidence_id in evidence_ids):
             continue
-        if _requires_grounding(plan) and (
+        if _requires_grounding(normalized_plan) and (
             not evidence_ids
             or any(
                 not proposition.evidence_ids
@@ -87,7 +100,7 @@ def realize_autonomous_responses(
         if grounding and any(
             not _proposition_is_grounded(
                 proposition,
-                move=plan.move,
+                move=normalized_plan.move,
                 grounding=grounding,
             )
             for proposition in propositions
@@ -97,7 +110,7 @@ def realize_autonomous_responses(
         seen_surfaces: set[str] = set()
         surface_confidences: list[float] = []
         for proposition in propositions:
-            thought = _thought(proposition, plan.confidence)
+            thought = _thought(proposition, normalized_plan.confidence)
             if thought is None:
                 texts = []
                 break
@@ -121,19 +134,19 @@ def realize_autonomous_responses(
             continue
         personality_fit = _personality_fit(
             perspective,
-            move=plan.move,
-            stance=plan.stance,
+            move=normalized_plan.move,
+            stance=normalized_plan.stance,
         )
         confidence = min(
-            plan.confidence,
+            normalized_plan.confidence,
             *surface_confidences,
             0.62 + personality_fit * 0.34,
         )
         candidates.append(
             AutonomousResponseCandidate(
                 text=" ".join(texts),
-                move=plan.move,
-                stance=plan.stance,
+                move=normalized_plan.move,
+                stance=normalized_plan.stance,
                 confidence=confidence,
                 personality_fit=personality_fit,
                 evidence_ids=evidence_ids,
@@ -159,6 +172,23 @@ def realize_autonomous_responses(
         seen_texts.add(normalized)
         unique.append(candidate)
     return tuple(unique)
+
+
+def _canonical_evidence_id(value: str, allowed: set[str]) -> str:
+    """Accept harmless provider wrappers while preserving the strict allow-list."""
+
+    normalized = value.strip().strip("`\"'")
+    candidates = [normalized]
+    for prefix in (
+        "grounding_facts.id=",
+        "grounding_fact.id=",
+        "grounding_facts.",
+        "evidence_id=",
+        "id=",
+    ):
+        if normalized.startswith(prefix):
+            candidates.append(normalized.removeprefix(prefix).strip().strip("`\"'"))
+    return next((candidate for candidate in candidates if candidate in allowed), normalized)
 
 
 def _thought(

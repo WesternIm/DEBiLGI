@@ -1,4 +1,5 @@
 from debilgi.language.capabilities import (
+    action_requires_external_agency,
     assess_capability_question,
     capability_study_terms,
     realize_capability_assessment,
@@ -69,6 +70,36 @@ def test_bot_internal_action_is_supported_by_the_same_capability_model() -> None
     assert realize_capability_assessment(assessment) == ("Да, я умею анализировать текст.")
 
 
+def test_modal_action_before_predicate_uses_the_same_capability_model() -> None:
+    assessment = assess_capability_question(
+        structure("Ты машиной управлять можешь?"),
+        study_completed=True,
+    )
+
+    assert assessment is not None
+    assert assessment.action_lemma == "управлять"
+    assert assessment.action_object is not None
+    assert assessment.action_object.head.lemma == "машина"
+    assert not assessment.supported
+    surface = realize_capability_assessment(assessment)
+    assert surface is not None
+    assert "управлять" in surface.casefold()
+    assert "машин" in surface.casefold()
+    assert assessment.thought.negated
+
+
+def test_elliptical_modal_question_recovers_action_from_dialogue() -> None:
+    assessment = assess_capability_question(
+        structure("А ты можешь?"),
+        context_messages=("user: Ты машиной управлять можешь?",),
+        study_completed=True,
+    )
+
+    assert assessment is not None
+    assert assessment.action_lemma == "управлять"
+    assert not assessment.supported
+
+
 def test_unknown_capability_exposes_action_and_object_for_foreground_study() -> None:
     parsed = structure("Ты умеешь устраивать рейды?")
 
@@ -124,6 +155,31 @@ def test_external_directive_is_grounded_in_agent_boundary() -> None:
     assert assessment is not None
     assert assessment.mode == "directive"
     assert realize_capability_assessment(assessment) == ("Я не могу выкинуть штурвал.")
+
+
+def test_motion_directive_uses_the_same_agent_boundary() -> None:
+    assessment = assess_capability_question(structure("Лети отсюда"))
+
+    assert assessment is not None
+    assert assessment.mode == "directive"
+    assert assessment.action_lemma == "лететь"
+    assert realize_capability_assessment(assessment) == ("Я не могу лететь.")
+
+
+def test_prefixed_motion_verbs_share_an_external_action_family() -> None:
+    assert all(
+        action_requires_external_agency(action)
+        for action in ("бегать", "сбегать", "прибежать", "понабегать")
+    )
+    assert not action_requires_external_agency("проанализировать")
+
+    assessment = assess_capability_question(structure("Сбегай за сушняком"))
+
+    assert assessment is not None
+    assert assessment.mode == "directive"
+    assert realize_capability_assessment(assessment) == (
+        "Я не могу сбегать за сушняком."
+    )
 
 
 def test_future_tense_action_request_is_not_retrieved_as_an_old_fact() -> None:

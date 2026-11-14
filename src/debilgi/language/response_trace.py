@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
@@ -20,6 +20,18 @@ _MAX_ITEMS = 100
 _MAX_DEPTH = 7
 
 
+@dataclass(frozen=True, slots=True)
+class ResponseTraceTerminal:
+    """The terminal facts needed by diagnostics without coupling to Discord."""
+
+    event_id: str
+    status: str
+    selected_route: str | None
+    failure_stage: str | None
+    failure_reason: str | None
+    completed_at: datetime
+
+
 class ResponseTraceRepository:
     """Record what the reply system observed, produced, rejected and sent.
 
@@ -30,9 +42,18 @@ class ResponseTraceRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
         self._completion_notifier: Callable[[], None] | None = None
+        self._quality_observer: (
+            Callable[[ResponseTraceTerminal], Awaitable[None]] | None
+        ) = None
 
     def set_completion_notifier(self, notifier: Callable[[], None] | None) -> None:
         self._completion_notifier = notifier
+
+    def set_quality_observer(
+        self,
+        observer: Callable[[ResponseTraceTerminal], Awaitable[None]] | None,
+    ) -> None:
+        self._quality_observer = observer
 
     async def begin(self, event: Event, *, prompt: str) -> str:
         trace_id = _trace_id(event.event_id)
@@ -207,6 +228,23 @@ class ResponseTraceRepository:
         finally:
             if self._completion_notifier is not None:
                 self._completion_notifier()
+            if self._quality_observer is not None:
+                terminal = ResponseTraceTerminal(
+                    event_id=event_id,
+                    status=status,
+                    selected_route=selected_route,
+                    failure_stage=failure_stage,
+                    failure_reason=failure_reason,
+                    completed_at=timestamp,
+                )
+                try:
+                    await self._quality_observer(terminal)
+                except Exception:
+                    _logger.exception(
+                        "trace_quality_observer_failed event=%s status=%s",
+                        event_id,
+                        status,
+                    )
 
     async def steps_for_event(self, event_id: str) -> tuple[dict[str, Any], ...]:
         rows = await self._database.fetchall(
