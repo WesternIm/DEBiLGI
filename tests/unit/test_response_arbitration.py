@@ -1,3 +1,5 @@
+import pytest
+
 from debilgi.language.arbitration import (
     ArbitrationProfile,
     ResponseArbitrator,
@@ -5,6 +7,14 @@ from debilgi.language.arbitration import (
     extract_features,
     merge_recovery_decision,
 )
+from debilgi.language.communication import ResponseComposer
+from debilgi.language.productive_nlg import (
+    ClauseThought,
+    ConceptArgument,
+    ConceptLexeme,
+    SemanticDependency,
+)
+from debilgi.language.structured_utterance import analyze_structured_utterance
 
 
 def candidate(
@@ -47,6 +57,54 @@ def grounded_answer(text="Лиса взяла ключ."):
             "reasoning_evidence": ("event:reported_action",),
         },
     )
+
+
+def composed_question(prompt, predicate):
+    composer = ResponseComposer(analyze_structured_utterance(prompt))
+    thought = ClauseThought(
+        ConceptLexeme(predicate, predicate, "verb", (("tense", "past"),)),
+        (SemanticDependency("subject", ConceptArgument(ConceptLexeme("что", "что", "pronoun"))),),
+        clause_kind="question", focus_role="subject", confidence=0.8,
+        evidence=("current_turn:unresolved_event",),
+    )
+    surface = composer.express(thought, limit=1)[0]
+    return surface.text, composer.metadata_for(surface.text)
+
+
+@pytest.mark.parametrize("predicate", ["произойти", "измениться", "случиться"])
+@pytest.mark.parametrize("source", ["dialogue_move", "new_independent_producer"])
+def test_checked_dialogue_move_survives_zero_word_overlap_and_learned_penalties(predicate, source):
+    text, plan_metadata = composed_question("пиздээ", predicate)
+    answer = candidate(text, source=source, confidence=0.43,
+        metadata={
+            **plan_metadata,
+            "reader_checked": True, "locally_composed": True,
+            "reasoning_evidence": ("incomplete_dialogue_act",), "obligation_fit": 1.0,
+            "context_relevance": 0.0, "semantic_frame_fit": 0.73,
+        })
+    decision = ResponseArbitrator(minimum_score=0.45).decide(
+        event_id="event:one", prompt="пиздээ", focus_concepts=("пиздээ",),
+        candidates=(answer,), recent_replies=(), profile=ArbitrationProfile.baseline(1),
+        structural_weights={f"source:{source}": -100.0},
+    )
+    assert decision.winner == answer
+    assert decision.scores[0].answer_status == "dialogue_response"
+    assert decision.scores[0].features.context_relevance == 1.0
+
+
+def test_dialogue_move_cannot_replace_a_factual_answer_by_claiming_high_fit():
+    text, plan_metadata = composed_question("Сколько стоит гречка?", "произойти")
+    answer = candidate(text, source="dialogue_move", confidence=0.43,
+        metadata={
+            **plan_metadata,
+            "response_obligation": "answer_question", "response_move": "probe_event",
+            "reader_checked": True, "locally_composed": True,
+            "reasoning_evidence": ("incomplete_dialogue_act",), "obligation_fit": 1.0,
+            "context_relevance": 0.0,
+        })
+    features = extract_features(answer, prompt="Сколько стоит гречка?",
+                                focus_concepts=(), recent_replies=())
+    assert features.context_relevance == 0.0
 
 
 def test_negative_wording_feedback_cannot_suppress_a_grounded_answer():

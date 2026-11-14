@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import logging
 from contextlib import suppress
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import discord
@@ -17,6 +17,7 @@ from debilgi.events.repository import EventRepository
 from debilgi.language.research_wait import LexicalResearchPending
 
 logger = logging.getLogger(__name__)
+_RECEIPT_RECONCILIATION_WINDOW = timedelta(hours=24)
 
 
 def delivery_nonce(event_id: str) -> str:
@@ -146,6 +147,19 @@ class ReplyDeliveryService:
         if status == 'uncertain':
             sent = await self.transport.find_sent(event, reply)
             if sent is None:
+                if datetime.now(UTC) - event.utc_timestamp >= _RECEIPT_RECONCILIATION_WINDOW:
+                    await self.repository.state(
+                        event_id,
+                        'failed',
+                        'receipt_not_found_after_reconciliation_window',
+                    )
+                    logger.warning(
+                        'Delivery receipt reconciliation expired: event=%s guild=%s channel=%s',
+                        event_id,
+                        event.guild_id,
+                        event.channel_id,
+                    )
+                    return
                 await self.repository.state(event_id, 'uncertain', 'receipt_not_found', 300)
                 logger.warning('Delivery requires confirmation: event=%s guild=%s channel=%s',
                                event_id, event.guild_id, event.channel_id)

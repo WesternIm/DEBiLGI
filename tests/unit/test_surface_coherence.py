@@ -2,6 +2,12 @@ from debilgi.language.surface_coherence import evaluate_surface
 from debilgi.language.surface_policy import internal_surface_reason
 
 
+def test_document_bullet_is_not_a_conversational_surface():
+    result = evaluate_surface("* создание: первый том написан в тюрьме.")
+
+    assert "document_fragment" in result.hard_issues
+
+
 def test_rejects_logged_markov_splices() -> None:
     broken = (
         ". суть: ауу, но не буду но она ещё разобрал?.",

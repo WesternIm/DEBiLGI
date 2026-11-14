@@ -52,7 +52,11 @@ class DeliveryRepository:
             """SELECT * FROM reply_delivery_jobs
                WHERE status IN ('pending', 'prepared', 'sent', 'uncertain')
                  AND next_attempt_at <= CURRENT_TIMESTAMP
-               ORDER BY CASE WHEN status = 'sent' THEN 0 ELSE 1 END, created_at, event_id
+               ORDER BY CASE
+                   WHEN status = 'sent' THEN 0
+                   WHEN status IN ('pending', 'prepared') THEN 1
+                   ELSE 2
+               END, created_at, event_id
                LIMIT 1"""
         )
 

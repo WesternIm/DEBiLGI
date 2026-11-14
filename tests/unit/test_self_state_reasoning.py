@@ -63,6 +63,11 @@ def test_same_reasoner_handles_knowledge_and_memory_predicates() -> None:
     assert realize_thought(remembered.thought)[0].text == "Да, я помню разговор."
 
 
+def test_content_request_with_what_is_not_binary_knowledge_state() -> None:
+    frame = analyze_self_state(analyze_structured_utterance("Что знаешь про кварц?"))
+    assert frame is None
+
+
 def test_ungrounded_idea_does_not_create_a_fake_confident_answer() -> None:
     frame = analyze_self_state(analyze_structured_utterance("Ты понял идею?"))
 

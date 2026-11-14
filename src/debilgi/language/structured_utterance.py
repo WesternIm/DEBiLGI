@@ -272,7 +272,9 @@ def analyze_structured_utterance(
         candidates = (
             tuple(label for _, label in lexical.sense_options)
             if lexical is not None and lexical.sense_options
-            else lexical.dictionary_meanings if lexical is not None else ()
+            else lexical.dictionary_meanings
+            if lexical is not None
+            else ()
         )
         unknown_kind = lexical.unknown_kind.value if lexical and lexical.unknown_kind else None
         confidence = _token_confidence(reading, lexical, entity)
@@ -394,16 +396,18 @@ def analyze_structured_utterance(
         clause_links,
     )
     dependencies = _dependency_arcs(tuple(mutable_cards), tuple(clauses))
-    return enrich_structure(StructuredUtterance(
-        text=text,
-        tokens=tuple(mutable_cards),
-        clauses=tuple(clauses),
-        dependencies=dependencies,
-        clause_links=clause_links,
-        niche_signals=tuple(dict.fromkeys(niche_signals)),
-        ambiguities=tuple(dict.fromkeys(ambiguities)),
-        confidence=min(1.0, token_confidence * 0.45 + clause_confidence * 0.55),
-    ))
+    return enrich_structure(
+        StructuredUtterance(
+            text=text,
+            tokens=tuple(mutable_cards),
+            clauses=tuple(clauses),
+            dependencies=dependencies,
+            clause_links=clause_links,
+            niche_signals=tuple(dict.fromkeys(niche_signals)),
+            ambiguities=tuple(dict.fromkeys(ambiguities)),
+            confidence=min(1.0, token_confidence * 0.45 + clause_confidence * 0.55),
+        )
+    )
 
 
 def _analyze_clause(
@@ -454,6 +458,27 @@ def _analyze_clause(
             (index for index in content_indices if cards[index].part_of_speech == "predicate"),
             None,
         )
+    if predicate_index is None:
+        # Russian impersonal attitudes and necessities use a dative
+        # experiencer with an infinitive as the main predicate: ``мне
+        # плевать``, ``тебе решать``. Treating the infinitive only as a
+        # possible complement erased the whole proposition and left dialogue
+        # planning with a bag of topic words.
+        predicate_index = next(
+            (
+                index
+                for index in content_indices
+                if cards[index].part_of_speech == "verb"
+                and "INFN" in cards[index].grammemes
+                and any(
+                    earlier < index
+                    and cards[earlier].part_of_speech in {"noun", "pronoun"}
+                    and _feature(cards[earlier], "case") == "dative"
+                    for earlier in content_indices
+                )
+            ),
+            None,
+        )
     imperative = bool(predicate_index is not None and "impr" in cards[predicate_index].grammemes)
     question_target = next(
         (
@@ -461,7 +486,8 @@ def _analyze_clause(
             for index in syntactic_indices
             if (role(cards[index].surface) == "question" or role(cards[index].lemma) == "question")
             and not (
-                cards[index].lemma == "что" and index > start
+                cards[index].lemma == "что"
+                and index > start
                 and cards[index - 1].lemma in {"пока", "потому", "так", "только"}
             )
         ),
@@ -623,6 +649,27 @@ def _analyze_clause(
         indirect_object = (indirect,) if indirect is not None else ()
         direct_object = _expand_coordinated_role(direct_object, coordinations)
         indirect_object = _expand_coordinated_role(indirect_object, coordinations)
+        profile = predicate_valency(cards[predicate_index].lemma)
+        if direct_object and (
+            profile is None or any(slot.role == "predicate_complement" for slot in profile.slots)
+        ):
+            # An instrumental adjective after an object can describe that
+            # object through the predicate, rather than modify a following noun.
+            # Keep the relation explicit so "считать себя умным" loses no property.
+            predicate_complement = tuple(
+                index
+                for index in content_indices
+                if index > direct_object[-1]
+                and index not in complement_objects
+                and cards[index].part_of_speech in {"adjective", "participle"}
+                and _feature(cards[index], "case") == "instrumental"
+                and not any(
+                    following > index
+                    and cards[following].part_of_speech == "noun"
+                    and _feature(cards[following], "case") == "instrumental"
+                    for following in content_indices
+                )
+            )
 
     negated = bool(
         predicate_index is not None
@@ -785,19 +832,19 @@ def _subject_index(
             and _feature(cards[index], "case") in {None, "nominative"}
         )
     if not candidates:
-        if predicate_index is None or 'intr' not in cards[predicate_index].grammemes:
+        if predicate_index is None or "intr" not in cards[predicate_index].grammemes:
             return None
         # Syncretic neuter nouns are often tagged accusative ("время настало").
         # An intransitive predicate cannot govern that direct object.
-        nominal = tuple(i for i in before if cards[i].part_of_speech == 'noun')
-        if len(nominal) != 1 or any(cards[i].part_of_speech == 'adjective' for i in before):
+        nominal = tuple(i for i in before if cards[i].part_of_speech == "noun")
+        if len(nominal) != 1 or any(cards[i].part_of_speech == "adjective" for i in before):
             return None
         candidate = cards[nominal[0]]
         predicate = cards[predicate_index]
         if (
-            _feature(candidate, 'case') != 'accusative'
-            or _feature(candidate, 'gender') != _feature(predicate, 'gender')
-            or DEFAULT_MORPHOLOGY.inflect(candidate.lemma, case='nominative')
+            _feature(candidate, "case") != "accusative"
+            or _feature(candidate, "gender") != _feature(predicate, "gender")
+            or DEFAULT_MORPHOLOGY.inflect(candidate.lemma, case="nominative")
             != candidate.surface.casefold()
         ):
             return None

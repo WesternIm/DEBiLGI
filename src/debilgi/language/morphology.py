@@ -25,9 +25,7 @@ _MESSAGE_TYPES = {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}
 morphology_logger = logging.getLogger("debilgi.morphology_disambiguation")
 spelling_logger = logging.getLogger("debilgi.spelling_correction")
 _RUSSIAN_ALPHABET = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-_NUMERIC_LITERAL_RE = re.compile(
-    r"^[+-]?\d+(?:(?:\.\d+)+|,\d+)?(?:[%‰])?$"
-)
+_NUMERIC_LITERAL_RE = re.compile(r"^[+-]?\d+(?:(?:\.\d+)+|,\d+)?(?:[%‰])?$")
 _INFINITIVE_GOVERNOR_LEMMAS = frozenset(
     {
         "быть",
@@ -67,6 +65,8 @@ CASE_GRAMMEMES = {
     "prepositional": "loct",
 }
 FEATURE_GRAMMEMES = {
+    "short_participle": "PRTS",
+    "short_adjective": "ADJS",
     "singular": "sing",
     "plural": "plur",
     "masculine": "masc",
@@ -218,8 +218,7 @@ def _existential_holder_index(
             continue
         for following in range(index + 1, min(len(tokens), index + 3)):
             if any(
-                item.part_of_speech in {"noun", "pronoun"}
-                and item.case == "genitive"
+                item.part_of_speech in {"noun", "pronoun"} and item.case == "genitive"
                 for item in alternatives[following]
             ):
                 return following
@@ -261,9 +260,7 @@ class RussianMorphology:
         )
         analysis_form = chat_form.canonical
         parsed = self._analyzer.parse(analysis_form)
-        corrected_form: str | None = (
-            analysis_form if analysis_form != normalized else None
-        )
+        corrected_form: str | None = analysis_form if analysis_form != normalized else None
         if corrected_form is not None:
             spelling_logger.info(
                 "word=%r corrected=%r reason=expressive_%s intensity=%.3f",
@@ -449,8 +446,7 @@ class RussianMorphology:
             next_has_noun = bool(
                 next_lexical_index is not None
                 and any(
-                    reading.part_of_speech == "noun"
-                    for reading in alternatives[next_lexical_index]
+                    reading.part_of_speech == "noun" for reading in alternatives[next_lexical_index]
                 )
             )
             if next_has_noun:
@@ -516,8 +512,7 @@ class RussianMorphology:
             definitional_subject = (
                 index >= 2
                 and normalize_word(tokens[index - 2]) == "что"
-                and normalize_word(tokens[index - 1])
-                in {"такой", "такая", "такое", "такие"}
+                and normalize_word(tokens[index - 1]) in {"такой", "такая", "такое", "такие"}
             )
             if definitional_subject:
                 score += 1.10 if candidate.case == "nominative" else -0.32
@@ -543,10 +538,7 @@ class RussianMorphology:
                     start=index + 1,
                     end=verb_index,
                 )
-                implicit_person = (
-                    verb.person in {"first", "second"}
-                    or "impr" in verb.grammemes
-                )
+                implicit_person = verb.person in {"first", "second"} or "impr" in verb.grammemes
                 if has_other_subject or implicit_person:
                     if candidate.case == "accusative":
                         score += 0.82
@@ -634,11 +626,7 @@ class RussianMorphology:
     ) -> bool:
         """Preserve colloquial ``base + ка`` nouns such as ``мусорку``."""
 
-        if (
-            self._analyzer is None
-            or not word.endswith("ку")
-            or len(word) < 5
-        ):
+        if self._analyzer is None or not word.endswith("ку") or len(word) < 5:
             return False
         base = word[:-2]
         expected_lemma = f"{word[:-1]}а"
@@ -678,11 +666,7 @@ class RussianMorphology:
             if productive_feminine:
                 readings = (
                     *productive_feminine,
-                    *(
-                        reading
-                        for reading in readings
-                        if reading not in productive_feminine
-                    ),
+                    *(reading for reading in readings if reading not in productive_feminine),
                 )
         grammemes: set[str] = set()
         for name, value in features.items():
@@ -857,19 +841,13 @@ def _infinitive_governor(
             if reading.lemma in _INFINITIVE_GOVERNOR_LEMMAS
             and (
                 reading.part_of_speech == "predicate"
-                or (
-                    reading.part_of_speech == "verb"
-                    and "INFN" not in reading.grammemes
-                )
+                or (reading.part_of_speech == "verb" and "INFN" not in reading.grammemes)
                 or reading.lemma == "должный"
             )
         )
         if candidates:
             return previous, max(candidates, key=lambda reading: reading.score)
-        if any(
-            reading.part_of_speech in {"noun", "pronoun"}
-            for reading in alternatives[previous]
-        ):
+        if any(reading.part_of_speech in {"noun", "pronoun"} for reading in alternatives[previous]):
             break
     return None
 
@@ -909,10 +887,7 @@ def _subject_agreement_features(
         )
         previous_is_cardinal = bool(
             index > start
-            and any(
-                reading.part_of_speech == "number"
-                for reading in alternatives[index - 1]
-            )
+            and any(reading.part_of_speech == "number" for reading in alternatives[index - 1])
         )
         if genitives and previous_is_cardinal:
             return {"number": "plural"}
@@ -980,8 +955,7 @@ def _has_nominative_argument(
     return any(
         index != excluded_index
         and any(
-            reading.part_of_speech in {"noun", "pronoun"}
-            and reading.case == "nominative"
+            reading.part_of_speech in {"noun", "pronoun"} and reading.case == "nominative"
             for reading in alternatives[index]
         )
         for index in range(start, end)
@@ -1118,8 +1092,10 @@ def _reading(
 
 
 def _numeric_reading(surface: str) -> MorphologicalReading:
-    numeric_kind = "percentage" if surface.endswith(("%", "‰")) else (
-        "real" if "." in surface or "," in surface else "integer"
+    numeric_kind = (
+        "percentage"
+        if surface.endswith(("%", "‰"))
+        else ("real" if "." in surface or "," in surface else "integer")
     )
     return MorphologicalReading(
         surface_form=surface,

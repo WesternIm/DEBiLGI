@@ -24,11 +24,15 @@ _SPEAKER_IDENTITY_RE = re.compile(
     re.IGNORECASE,
 )
 _BOT_IDENTITY_RE = re.compile(
-    r"^(?:а\s+)?(?:кто\s+ты|как\s+тебя\s+зовут|какое\s+у\s+тебя\s+имя|"
+    r"^(?:а\s+)?(?:кто\s+ты|ты\s+кто|как\s+тебя\s+зовут|какое\s+у\s+тебя\s+имя|"
     r"какой\s+у\s+тебя\s+ник|твой\s+ник\s+какой)\??$",
     re.IGNORECASE,
 )
 _WHO_IS_RE = re.compile(r"^(?:а\s+)?кто\s+(?:такой|такая|такие)?\s*(.+?)\??$", re.IGNORECASE)
+_IDENTITY_DISCOURSE_PREFIX_RE = re.compile(
+    r"^(?:(?:а|ну|так|слушай|скажи(?:-ка)?)[,\s]+)+",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,7 +198,7 @@ def identity_thought(prompt: str, payload: Mapping[str, Any]) -> ClauseThought |
         ConceptLexeme,
         SemanticDependency,
     )
-    normalized = " ".join(prompt.casefold().replace("ё", "е").strip(" .!…").split())
+    normalized = _normalized_identity_prompt(prompt)
     if _BOT_IDENTITY_RE.fullmatch(normalized):
         subject, record = "я", payload.get("bot_identity")
     elif _SPEAKER_IDENTITY_RE.fullmatch(normalized):
@@ -219,7 +223,7 @@ def identity_thought(prompt: str, payload: Mapping[str, Any]) -> ClauseThought |
 def identity_reply(prompt: str, payload: Mapping[str, Any]) -> str | None:
     """Answer explicit Discord identity questions from gateway facts, not guesses."""
 
-    normalized = " ".join(prompt.casefold().replace("ё", "е").strip(" .!…").split())
+    normalized = _normalized_identity_prompt(prompt)
     if _SPEAKER_IDENTITY_RE.fullmatch(normalized):
         record = payload.get("author_identity")
         return f"Ты — {_describe_identity(record)}." if isinstance(record, Mapping) else None
@@ -255,6 +259,13 @@ def _describe_identity(raw: Mapping[str, Any]) -> str:
     if isinstance(username, str) and username and username != display:
         return f"{display} (@{username})"
     return f"@{username}" if isinstance(username, str) and username else display
+
+
+def _normalized_identity_prompt(prompt: str) -> str:
+    normalized = " ".join(
+        prompt.casefold().replace("ё", "е").strip(" .!…,:;").split()
+    )
+    return _IDENTITY_DISCOURSE_PREFIX_RE.sub("", normalized)
 
 
 def _identity_aliases(record: Mapping[str, Any]) -> tuple[str, ...]:

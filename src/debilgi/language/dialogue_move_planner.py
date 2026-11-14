@@ -99,7 +99,7 @@ def plan_dialogue_moves(
     if is_contact_request(prompt):
         return (DialogueMovePlan(
             move="engage", strategy="answer_contact",
-            thought=_listen_thought(0.95, ("current_message:contact_request",)),
+            thought=_reply_thought(0.95, ("current_message:contact_request",)),
             confidence=0.95, stance="engage", evidence=("current_message:contact_request",),
             semantic_origin="derived",
         ),)
@@ -636,6 +636,8 @@ def _social_moves(
         "acknowledge_attention",
         "acknowledge_understanding",
         "acknowledge_evaluation",
+        "repair_previous_answer",
+        "repair_understanding",
     }
     for index, (move, strategy, thought) in enumerate(specifications.get(obligation, ())):
         reaction_fit = 0.0
@@ -1144,6 +1146,26 @@ def _listen_thought(confidence: float, evidence: tuple[str, ...]) -> ClauseThoug
                 ConceptArgument(
                     ConceptLexeme("ты", "тебя", "pronoun"),
                     grammatical_case="accusative",
+                ),
+            ),
+        ),
+        confidence=confidence,
+        evidence=evidence,
+    )
+
+
+def _reply_thought(confidence: float, evidence: tuple[str, ...]) -> ClauseThought:
+    """Represent taking the conversational turn as an action, before wording."""
+
+    return ClauseThought(
+        predicate=_verb("отвечать", "отвечаю"),
+        dependencies=(
+            _subject(),
+            SemanticDependency(
+                "indirect_object",
+                ConceptArgument(
+                    ConceptLexeme("ты", "тебе", "pronoun"),
+                    grammatical_case="dative",
                 ),
             ),
         ),

@@ -592,35 +592,10 @@ class CognitiveRepository:
         )
 
     async def evaluate_prior_intents(self, event: Event, limit: int = 20) -> int:
-        rows = await self._database.fetchall(
-            """
-            SELECT intent_id FROM cognition_action_intents
-            WHERE guild_id = ? AND evaluated_at IS NULL AND created_at < ?
-              AND expires_at >= ? AND (channel_id = ? OR channel_id IS NULL)
-            ORDER BY created_at DESC LIMIT ?
-            """,
-            (
-                event.guild_id,
-                event.utc_timestamp.isoformat(),
-                event.utc_timestamp.isoformat(),
-                event.channel_id,
-                max(1, min(limit, 100)),
-            ),
-        )
-        for row in rows:
-            await self._database.execute(
-                """
-                UPDATE cognition_action_intents
-                SET actual_outcome = ?, evaluated_at = ?
-                WHERE intent_id = ? AND evaluated_at IS NULL
-                """,
-                (
-                    event.event_type.value,
-                    event.utc_timestamp.isoformat(),
-                    str(row["intent_id"]),
-                ),
-            )
-        return len(rows)
+        # These proposals are strictly shadow-only (see ActionIntent). A next
+        # channel event is not evidence that an unexecuted action had an effect.
+        # Actual speech actions learn in MeaningIntentRepository after sending.
+        return 0
 
     async def recent_intents(self, guild_id: int, limit: int = 10) -> list[ActionIntent]:
         rows = await self._database.fetchall(

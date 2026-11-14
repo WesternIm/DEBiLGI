@@ -57,6 +57,14 @@ def test_curiosity_and_aversion_form_unlisted_composite() -> None:
     assert set(result.blend_id.split("+")) == {"curiosity", "aversion"}
 
 
+def test_yes_and_no_inside_a_question_are_not_agreement_or_refusal() -> None:
+    result = assess_reaction(event("Так да или нет?"), None, DEBILGI_GENOME)
+
+    assert result.vector.agreement < 0.20
+    assert result.vector.resistance < 0.20
+    assert result.vector.curiosity > result.vector.agreement
+
+
 def test_resistance_changes_statement_into_boundary_act() -> None:
     vector = PrimitiveVector(
         agreement=0.1,

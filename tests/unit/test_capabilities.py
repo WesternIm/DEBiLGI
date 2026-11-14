@@ -70,6 +70,36 @@ def test_bot_internal_action_is_supported_by_the_same_capability_model() -> None
     assert realize_capability_assessment(assessment) == ("Да, я умею анализировать текст.")
 
 
+def test_modal_action_before_predicate_uses_the_same_capability_model() -> None:
+    assessment = assess_capability_question(
+        structure("Ты машиной управлять можешь?"),
+        study_completed=True,
+    )
+
+    assert assessment is not None
+    assert assessment.action_lemma == "управлять"
+    assert assessment.action_object is not None
+    assert assessment.action_object.head.lemma == "машина"
+    assert not assessment.supported
+    surface = realize_capability_assessment(assessment)
+    assert surface is not None
+    assert "управлять" in surface.casefold()
+    assert "машин" in surface.casefold()
+    assert assessment.thought.negated
+
+
+def test_elliptical_modal_question_recovers_action_from_dialogue() -> None:
+    assessment = assess_capability_question(
+        structure("А ты можешь?"),
+        context_messages=("user: Ты машиной управлять можешь?",),
+        study_completed=True,
+    )
+
+    assert assessment is not None
+    assert assessment.action_lemma == "управлять"
+    assert not assessment.supported
+
+
 def test_unknown_capability_exposes_action_and_object_for_foreground_study() -> None:
     parsed = structure("Ты умеешь устраивать рейды?")
 

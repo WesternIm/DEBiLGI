@@ -15,6 +15,7 @@ from debilgi.language.productive_nlg import (
     ConceptLexeme,
     SemanticDependency,
 )
+from debilgi.language.request_focus import polarity_of
 from debilgi.language.structured_utterance import (
     TokenInterpretation,
     analyze_structured_utterance,
@@ -37,6 +38,52 @@ class DialogueExchange:
     reason: str
     question_event_id: str | None = None
     answer_event_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BoundDialogueReport:
+    question_event_id: str
+    answer_event_id: str
+    answer_text: str
+    thought: ClauseThought
+
+
+def thought_from_data(data: dict) -> ClauseThought:
+    """Decode our own structured report; never reparse a generated sentence."""
+
+    def lexeme(value: dict) -> ConceptLexeme:
+        return ConceptLexeme(
+            value["lemma"],
+            value["surface"],
+            value["part_of_speech"],
+            tuple(tuple(pair) for pair in value["features"]),
+            value["entity_kind"],
+        )
+
+    dependencies = tuple(
+        SemanticDependency(
+            item["role"],
+            ConceptArgument(
+                lexeme(item["argument"]["head"]),
+                tuple(lexeme(modifier) for modifier in item["argument"]["modifiers"]),
+                item["argument"]["preposition"],
+                item["argument"]["grammatical_case"],
+                tuple(lexeme(modifier) for modifier in item["argument"]["postmodifiers"]),
+            ),
+        )
+        for item in data["dependencies"]
+    )
+    return ClauseThought(
+        lexeme(data["predicate"]),
+        dependencies,
+        clause_kind=data["clause_kind"],
+        negated=data["negated"],
+        response_polarity=data["response_polarity"],
+        focus_role=data["focus_role"],
+        confidence=data["confidence"],
+        evidence=tuple(data["evidence"]),
+        predicate_class=data["predicate_class"],
+    )
 
 
 def exchange_from_events(events: tuple[Event, ...], current: Event) -> DialogueExchange | None:
@@ -94,14 +141,48 @@ def question_obligation(text: str) -> QuestionObligation | None:
     if len(structure.clauses) != 1:
         return None
     clause = structure.clauses[0]
-    if clause.clause_kind != "question" or clause.question_target_index is None:
+    if clause.clause_kind != "question" or clause.modal_lemmas:
         return None
     if clause.negated or clause.coordinations:
         return None
     tokens = structure.tokens
-    wh = tokens[clause.question_target_index].lemma
+    wh = (
+        tokens[clause.question_target_index].lemma
+        if clause.question_target_index is not None
+        else None
+    )
     predicate = tokens[clause.predicate_index] if clause.predicate_index is not None else None
     lemma = predicate.lemma if predicate else clause.implicit_predicate
+    naming = (
+        wh == "как"
+        and lemma == "звать"
+        and len(clause.direct_object_indices) == 1
+        and not clause.subject_indices
+    )
+    if naming:
+        person = tokens[clause.direct_object_indices[0]]
+        if person.lemma not in {"я", "ты", "мы", "вы"}:
+            return None
+        subject = ConceptLexeme(
+            person.lemma,
+            person.lemma,
+            "pronoun",
+            (("case", "nominative"), *tuple(
+                feature
+                for feature in person.grammatical_features
+                if feature[0] in {"number", "person"}
+            )),
+        )
+        thought = ClauseThought(
+            ConceptLexeme(
+                "называться",
+                "называться",
+                "verb",
+                (("tense", "present"),),
+            ),
+            (SemanticDependency("subject", ConceptArgument(subject)),),
+        )
+        return QuestionObligation("name", thought, text)
     definition = wh == "что" and lemma in {"быть", "значить", "означать", "подразумевать"}
     if definition:
         target_indices = (
@@ -129,6 +210,10 @@ def question_obligation(text: str) -> QuestionObligation | None:
         if wh == "что" and clause.subject_indices and not clause.direct_object_indices
         else "location"
         if wh == "где" and clause.subject_indices
+        else "cause"
+        if wh in {"почему", "зачем"} and clause.subject_indices
+        else "polarity"
+        if wh is None and clause.subject_indices
         else None
     )
     if role is None or clause.action_complement_indices or clause.predicate_complement_indices:
@@ -158,6 +243,20 @@ def question_obligation(text: str) -> QuestionObligation | None:
     # Do not silently discard already supplied locations or modifiers.
     if clause.complements:
         return None
+    used = {
+        clause.predicate_index,
+        clause.question_target_index,
+        *clause.subject_indices,
+        *clause.direct_object_indices,
+        *clause.indirect_object_indices,
+    }
+    for token in tokens:
+        if token.index in used or not token.surface[:1].isalnum():
+            continue
+        if token.part_of_speech == "adverb" and token.semantic_role == "unassigned_content":
+            dependencies.append(SemanticDependency("manner", ConceptArgument(_lexeme(token))))
+        elif token.semantic_role not in {"function_word", "pragmatic_marker"}:
+            return None
     return QuestionObligation(role, ClauseThought(_lexeme(predicate), tuple(dependencies)), text)
 
 
@@ -175,7 +274,28 @@ def resolve_dialogue_exchange(prompt: str, context: tuple[str, ...]) -> Dialogue
     if len(structure.clauses) != 1 or "?" in prompt:
         return unmatched("not_a_single_answer_clause")
     clause = structure.clauses[0]
-    if clause.predicate_index is not None or clause.coordinations:
+    if obligation.expected_role == "polarity":
+        words = tuple(token.surface for token in structure.tokens if token.surface[:1].isalnum())
+        polarity = polarity_of(words[0]) if len(words) == 1 else None
+        if polarity is None:
+            return unmatched("expected_unqualified_polarity")
+        proposition = replace(
+            obligation.proposition,
+            negated=not polarity,
+            clause_kind="question",
+            confidence=0.9,
+            evidence=(
+                "dialogue_obligation:polarity_bound",
+                f"question:{obligation.source_message}",
+                f"user_answer:{prompt}",
+            ),
+        )
+        return DialogueExchange(obligation, "matched", prompt, proposition, "compatible_polarity")
+    if (
+        clause.predicate_index is not None
+        and obligation.expected_role != "name"
+        or clause.coordinations
+    ):
         return unmatched("independent_proposition_or_alternatives")
     tokens = structure.tokens
     if any(t.lemma in {"не", "ни", "нет", "или", "либо"} for t in tokens):
@@ -191,7 +311,7 @@ def resolve_dialogue_exchange(prompt: str, context: tuple[str, ...]) -> Dialogue
     }
     main_indices = [i for i in lexical if i not in complement_indices]
     heads = [i for i in main_indices if tokens[i].part_of_speech == "noun"]
-    if obligation.expected_role == "location":
+    if obligation.expected_role in {"location", "cause"}:
         if main_indices or len(clause.complements) != 1:
             return unmatched("expected_location")
         complement = clause.complements[0]
@@ -199,12 +319,39 @@ def resolve_dialogue_exchange(prompt: str, context: tuple[str, ...]) -> Dialogue
             return unmatched("ambiguous_location")
         head = tokens[complement.object_indices[0]]
         prep = tokens[complement.preposition_index].lemma
-        if prep not in {"в", "на", "под", "над", "около", "возле", "за"}:
+        allowed = (
+            {"для", "из-за"}
+            if obligation.expected_role == "cause"
+            else {"в", "на", "под", "над", "около", "возле", "за"}
+        )
+        if prep not in allowed:
             return unmatched("not_a_location_preposition")
+        if head.part_of_speech != "noun":
+            return unmatched("expected_nominal_complement")
+        if (
+            obligation.expected_role == "cause"
+            and dict(head.grammatical_features).get("case") != "genitive"
+        ):
+            return unmatched("cause_case_mismatch")
         argument = ConceptArgument(
             _lexeme(head),
             preposition=prep,
             grammatical_case=dict(head.grammatical_features).get("case"),
+        )
+    elif obligation.expected_role == "name":
+        if len(main_indices) != 1 or clause.complements:
+            return unmatched("expected_one_name")
+        token = tokens[main_indices[0]]
+        name_surface = prompt.strip().strip(".,!?;:«»\"' ") or token.surface
+        argument = ConceptArgument(
+            ConceptLexeme(
+                token.normalized,
+                name_surface,
+                "proper_noun",
+                (("case", "nominative"), ("number", "singular")),
+                "name",
+            ),
+            grammatical_case="nominative",
         )
     else:
         if len(heads) != 1 or any(
@@ -221,8 +368,13 @@ def resolve_dialogue_exchange(prompt: str, context: tuple[str, ...]) -> Dialogue
                 "predicate_complement": "instrumental",
             }[obligation.expected_role],
         )
-    additions = [SemanticDependency(obligation.expected_role, argument)]
-    if obligation.expected_role != "location":
+    bound_role = (
+        "predicate_complement"
+        if obligation.expected_role == "name"
+        else obligation.expected_role
+    )
+    additions = [SemanticDependency(bound_role, argument)]
+    if obligation.expected_role not in {"location", "cause"}:
         for complement in clause.complements:
             if len(complement.object_indices) != 1:
                 return unmatched("ambiguous_nominal_modifier")
@@ -244,7 +396,7 @@ def resolve_dialogue_exchange(prompt: str, context: tuple[str, ...]) -> Dialogue
     proposition = ClauseThought(
         obligation.proposition.predicate,
         (*obligation.proposition.dependencies, *additions),
-        clause_kind="question",
+        clause_kind="statement" if obligation.expected_role == "name" else "question",
         confidence=0.9,
         evidence=(
             "dialogue_obligation:slot_filled",

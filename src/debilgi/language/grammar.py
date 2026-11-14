@@ -308,6 +308,9 @@ def role(token: str) -> str:
         return "conjunction"
     if normalized in _PARTICLES:
         return "particle"
+    reading = DEFAULT_MORPHOLOGY.best(normalized)
+    if reading is not None and reading.is_known and reading.part_of_speech:
+        return "content" if reading.part_of_speech == "noun" else reading.part_of_speech
     if len(normalized) >= 4 and normalized.endswith(_VERB_SUFFIXES):
         return "verb"
     if len(normalized) >= 4 and normalized.endswith(_ADJECTIVE_SUFFIXES):

@@ -9,6 +9,7 @@ from debilgi.language.communication import (
     PendingText,
     ResponseComposer,
     plan_issues,
+    reader_goal,
     surface_issues,
 )
 from debilgi.language.productive_nlg import (
@@ -114,6 +115,14 @@ def test_incomplete_meaning_is_rejected_before_surface_generation(monkeypatch):
     monkeypatch.setattr(communication, "realize_thought", nlg)
     assert composer.compose(plan) == ()
     nlg.assert_not_called()
+
+
+def test_reader_goal_recovers_quantity_word_when_parser_did_not_mark_target():
+    goal = reader_goal(analyze_structured_utterance("У тебя сколько бабушек?"))
+
+    assert goal.kind == "answer_slot"
+    assert goal.question_word == "сколько"
+    assert "бабушка" in goal.topics
 
 
 def test_failed_verbalization_does_not_silently_drop_the_reason(monkeypatch):

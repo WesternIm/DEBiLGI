@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -122,6 +122,38 @@ async def test_ambiguous_send_never_retries_without_receipt(environment):
     assert (await env.repository.get(incoming.event_id))['status'] == 'completed'
     env.transport.send.assert_awaited_once()
     env.workflow.record_sent.assert_awaited_once()
+
+
+async def test_uncertain_receipt_does_not_block_new_delivery(environment):
+    env = environment
+    uncertain, newer = event(10), event(12)
+    await env.events.append(uncertain)
+    await env.repository.save_reply(uncertain.event_id, reply())
+    await env.repository.state(uncertain.event_id, 'uncertain')
+    await env.events.append(newer)
+
+    await env.service.run_once()
+
+    assert (await env.repository.get(newer.event_id))['status'] == 'completed'
+    assert (await env.repository.get(uncertain.event_id))['status'] == 'uncertain'
+    env.transport.send.assert_awaited_once()
+    env.transport.find_sent.assert_not_awaited()
+
+
+async def test_stale_uncertain_receipt_becomes_terminal_without_resending(environment):
+    env = environment
+    incoming = replace(event(), timestamp=NOW - timedelta(days=2))
+    await env.events.append(incoming)
+    await env.repository.save_reply(incoming.event_id, reply())
+    await env.repository.state(incoming.event_id, 'uncertain')
+
+    await env.service.run_once()
+
+    job = await env.repository.get(incoming.event_id)
+    assert job['status'] == 'failed'
+    assert job['last_error'] == 'receipt_not_found_after_reconciliation_window'
+    env.transport.find_sent.assert_awaited_once()
+    env.transport.send.assert_not_awaited()
 
 
 async def test_restart_during_send_requires_reconciliation(environment):

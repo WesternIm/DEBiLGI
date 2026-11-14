@@ -206,6 +206,19 @@ def analyze_dialogue_act(
             confidence=max(0.86, structure.confidence * 0.94),
             evidence=("construction:do_not_pretend_not_to_understand",),
         )
+    if "prior_answer_challenge" in pragmatic_functions:
+        return DialogueActFrame(
+            kind="prior_answer_challenge",
+            response_obligation="repair_previous_answer",
+            subject="addressee",
+            predicate=predicate or "сказать",
+            objects=topical,
+            polarity=-0.72,
+            register=register,
+            complete=True,
+            confidence=max(0.88, structure.confidence * 0.94),
+            evidence=("construction:prior_answer_challenge",),
+        )
     if signals_prior_answer_correction(structure.text):
         return DialogueActFrame(
             kind="prior_answer_correction",

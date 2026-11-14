@@ -35,6 +35,11 @@ def test_stretched_chat_interjections_keep_their_pragmatic_function() -> None:
     assert "attention_call" in attention.functions
 
 
+def test_detached_infinitive_exclamation_retains_ordinary_lexical_use():
+    assert "coarse_emphasis" in analyze_pragmatics("ебать, а я ногти грызу").functions
+    assert "coarse_emphasis" not in analyze_pragmatics("Ты будешь ебать меня").functions
+
+
 def test_laughter_with_leading_vowel_and_chat_emotions_are_pragmatic() -> None:
     for text in ("ахахахах", "АХАХА", "hahaha", "лол", "кек"):
         assert "amusement" in analyze_pragmatics(text).functions

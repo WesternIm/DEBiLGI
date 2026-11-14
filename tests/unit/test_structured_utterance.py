@@ -1,3 +1,5 @@
+import pytest
+
 from debilgi.language.entities import analyze_entities
 from debilgi.language.lexicon import ConfidenceProfile, WordAnalysis
 from debilgi.language.structured_utterance import analyze_structured_utterance
@@ -451,3 +453,15 @@ def test_real_parenthetical_marker_detaches_when_a_proposition_already_exists() 
     assert structure.tokens[frame.predicate_index].lemma == "уйти"
     marker = next(token for token in structure.tokens if token.lemma == "знать")
     assert marker.semantic_role == "pragmatic_marker"
+
+
+@pytest.mark.parametrize("text", ["Я считаю себя умным.", "Маша назвала Петю добрым."])
+def test_secondary_adjective_predicate_is_bound_to_the_action(text):
+    structure = analyze_structured_utterance(text)
+    clause = structure.clauses[0]
+    assert clause.direct_object_indices
+    assert len(clause.predicate_complement_indices) == 1
+    adjective = structure.tokens[clause.predicate_complement_indices[0]]
+    assert adjective.part_of_speech == "adjective"
+    assert dict(adjective.grammatical_features)["case"] == "instrumental"
+    assert adjective.semantic_role == "predicate_complement"

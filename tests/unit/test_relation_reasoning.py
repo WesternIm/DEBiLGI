@@ -54,6 +54,28 @@ def test_keeps_ambiguous_object_lemmas_until_meaning_can_resolve_them() -> None:
     assert result.text == "Нет, у меня нет носков."
 
 
+def test_extracts_implicit_quantity_possession_and_answers_from_object_type() -> None:
+    frame = analyze_relation_question(
+        analyze_structured_utterance("У тебя сколько бабушек?")
+    )
+
+    assert frame is not None
+    assert frame.holder_kind == "self"
+    assert frame.query_quantity is True
+    assert "бабушка" in frame.object_lemmas
+
+    result = reason_about_relation(
+        frame,
+        (),
+        (("бабушка", "мать отца или матери, родственница и предок человека"),),
+        study_completed=True,
+    )
+
+    assert result.object_class == "biological"
+    assert result.productive_thought is not None
+    assert "у меня нет бабушек" in result.text.casefold()
+
+
 @pytest.mark.parametrize(
     "text,concepts,expected_prefix,expected_class",
     (

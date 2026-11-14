@@ -23,6 +23,7 @@ from debilgi.language.structural_learning import (
     learned_structural_bonus,
     structural_response_features,
 )
+from debilgi.language.structured_utterance import analyze_structured_utterance
 from debilgi.language.surface_coherence import COMPOSED_SURFACE_SOFT_ISSUES, evaluate_surface
 from debilgi.language.surface_policy import internal_surface_reason
 from debilgi.language.tokenizer import tokenize
@@ -251,6 +252,7 @@ DEFAULT_SOURCE_BIASES: Mapping[str, float] = MappingProxyType(
     {
         "discord_identity": 0.45,
         "autonomous_semantic_plan": 0.48,
+        "dialogue_task": 0.50,
         "contextual_learning": 0.35,
         "short_act": 0.30,
         "exact_archive": 0.25,
@@ -378,6 +380,84 @@ class ResponseArbitrator:
     def __init__(self, *, minimum_score: float = 0.45) -> None:
         self.minimum_score = minimum_score
 
+    def decide_exploration(self, **kwargs) -> ArbitrationDecision:
+        """Let learned composition compete only while it remains context-bound.
+
+        Retain the ordinary quality scores and rejection reasons for diagnostics.
+        Corpus preference may break a tie between applicable compositions, but
+        it cannot overrule semantic relevance or the active dialogue task.
+        """
+        decision = self.decide(**kwargs)
+        if decision.winner is not None:
+            return decision
+        from debilgi.language.copying import is_input_copy
+
+        usable = tuple(
+            score
+            for score in decision.scores
+            if score.eligible
+            and score.candidate.source == "learned_distribution"
+            and score.candidate.text.strip()
+            and not _TECHNICAL_RE.search(score.candidate.text)
+            and internal_surface_reason(score.candidate.text) is None
+            and not is_input_copy(score.candidate.text, kwargs["prompt"])
+            and isinstance(
+                score.candidate.metadata.get("dialogue_task_progress"), int | float
+            )
+            and not isinstance(
+                score.candidate.metadata.get("dialogue_task_progress"), bool
+            )
+            and float(score.candidate.metadata["dialogue_task_progress"]) >= 0.45
+            and score.features.context_relevance >= 0.45
+        )
+        selected = max(
+            usable,
+            key=lambda score: (
+                float(score.candidate.metadata["dialogue_task_progress"]),
+                score.features.context_relevance,
+                score.total,
+                float(score.candidate.metadata.get("generation_score", 0.0)),
+                score.features.non_repetition,
+                score.candidate.candidate_id,
+            ),
+            default=None,
+        )
+        return replace(
+            decision,
+            winner=selected.candidate if selected else None,
+            selection_reason=(
+                "context_bound_learned_composition"
+                if selected is not None
+                else decision.selection_reason
+            ),
+            selected_proposal_ids=(selected.candidate.proposal.proposal_id,) if selected else (),
+        )
+
+    def decide_answer_domain(self, *, options: tuple[str, ...], **kwargs) -> ArbitrationDecision:
+        """A proved slot value needn't satisfy grammar for a complete sentence."""
+        from debilgi.language.dialogue_obligations import thought_from_data
+        from debilgi.language.request_focus import supported_alternative
+
+        decision = self.decide(**kwargs)
+        usable = []
+        for score in decision.scores:
+            candidate = score.candidate
+            metadata = candidate.metadata
+            plan = metadata.get("message_plan")
+            if candidate.source != "semantic_reasoning" or not plan or not metadata.get("premises"):
+                continue
+            thought = thought_from_data(plan["claim"])
+            supported = supported_alternative(kwargs["prompt"], options, thought)
+            if supported is not None and candidate.text.casefold() == supported.casefold():
+                usable.append(score)
+        selected = max(usable, key=lambda score: score.total, default=None)
+        return replace(
+            decision,
+            winner=selected.candidate if selected else None,
+            selection_reason="grounded_observed_answer_domain",
+            selected_proposal_ids=(selected.candidate.proposal.proposal_id,) if selected else (),
+        )
+
     def decide(
         self,
         *,
@@ -433,11 +513,7 @@ class ResponseArbitrator:
             ),
             default=None,
         )
-        winner = (
-            winner_score.candidate
-            if winner_score is not None
-            else None
-        )
+        winner = winner_score.candidate if winner_score is not None else None
         reason = (
             "grounded_answer_then_surface"
             if winner_score is not None and winner_score.answer_status == "grounded_answer"
@@ -524,6 +600,8 @@ class ResponseArbitrator:
             reasons = (*reasons, "definition_not_required_for_event")
         if unmet := requirement_rejection(prompt, candidate.metadata):
             reasons = (*reasons, unmet)
+        if issue := _question_response_rejection(candidate):
+            reasons = (*reasons, issue)
         features = extract_features(
             candidate,
             prompt=prompt,
@@ -570,16 +648,17 @@ class ResponseArbitrator:
         # Feedback about wording ranks admitted answers, but cannot suppress an
         # otherwise grounded answer or turn lack of an answer into evidence.
         admission_score = total
-        if answer_status == "grounded_answer":
-            stable_weights = {
-                name: DEFAULT_WEIGHTS.get(name, 0.0) for name in measured_features
-            }
+        if answer_status in {"grounded_answer", "dialogue_response"}:
+            stable_weights = {name: DEFAULT_WEIGHTS.get(name, 0.0) for name in measured_features}
             admission_score = sum(
                 (-1 if name in _PENALTY_NAMES else 1) * stable_weights[name] * value
                 for name, value in measured_features.items()
-            ) / max(1.0, sum(
-                weight for name, weight in stable_weights.items() if name not in _PENALTY_NAMES
-            ))
+            ) / max(
+                1.0,
+                sum(
+                    weight for name, weight in stable_weights.items() if name not in _PENALTY_NAMES
+                ),
+            )
         if reasons:
             total = min(total, -10.0)
             admission_score = min(admission_score, -10.0)
@@ -619,14 +698,24 @@ class ResponseArbitrator:
             for issue in surface.hard_issues
             if not (
                 (researched_fact_surface and issue == "unexpected_valency_role")
-                or (candidate.metadata.get("allow_rough_surface") is True
+                or (
+                    candidate.metadata.get("allow_rough_surface") is True
                     and candidate.metadata.get("locally_composed") is True
-                    and issue in COMPOSED_SURFACE_SOFT_ISSUES)
+                    and issue in COMPOSED_SURFACE_SOFT_ISSUES
+                )
             )
         )
         explicit_rejection = candidate.metadata.get("hard_rejection")
         if isinstance(explicit_rejection, str) and explicit_rejection:
             reasons.append(explicit_rejection)
+        task_progress = candidate.metadata.get("dialogue_task_progress")
+        if (
+            candidate.metadata.get("dialogue_task_required") is True
+            and isinstance(task_progress, int | float)
+            and not isinstance(task_progress, bool)
+            and float(task_progress) < 0.45
+        ):
+            reasons.append("dialogue_task_not_advanced")
         for fact in candidate.required_facts:
             if not _covers_fact(text, fact):
                 reasons.append(f"missing_required_fact:{_fact_key(fact)}")
@@ -636,6 +725,18 @@ class ResponseArbitrator:
     def _deduplicate(
         candidates: tuple[ResponseCandidate, ...],
     ) -> tuple[ResponseCandidate, ...]:
+        # Equal wording does not imply equal provenance. Keep a checked
+        # meaning plan over an unverified surface with a higher self-score.
+        def provenance(item: ResponseCandidate) -> tuple[bool, float]:
+            return (
+                bool(
+                    item.metadata.get("reader_checked")
+                    and item.metadata.get("thought_before_surface")
+                    and item.metadata.get("message_plan")
+                ),
+                item.source_confidence,
+            )
+
         by_text: dict[str, ResponseCandidate] = {}
         for candidate in candidates:
             key = " ".join(candidate.text.casefold().split())
@@ -649,7 +750,7 @@ class ResponseArbitrator:
                 or (current_rejected and not candidate_rejected)
                 or (
                     current_rejected == candidate_rejected
-                    and candidate.source_confidence > current.source_confidence
+                    and provenance(candidate) > provenance(current)
                 )
             ):
                 by_text[key] = candidate
@@ -687,6 +788,8 @@ def extract_features(
         if isinstance(measured_relevance, int | float) and not isinstance(measured_relevance, bool)
         else _overlap(candidate_terms, active_terms)
     )
+    dialogue_binding = _dialogue_binding(candidate, prompt)
+    context_relevance = max(context_relevance, dialogue_binding)
     topic_continuity = _overlap(candidate_terms, prompt_terms or focus_terms)
     covered = sum(_covers_fact(text, fact) for fact in candidate.required_facts)
     covered += sum(_covers_key_point(text, point) for point in candidate.key_points)
@@ -712,6 +815,7 @@ def extract_features(
     )
     non_repetition = 1.0 - recent_similarity
     speech_act_fit = _speech_act_fit(candidate.speech_act, text)
+    speech_act_fit = max(speech_act_fit, dialogue_binding)
     uncertainty_words = set(word.casefold() for word in words) & _UNCERTAINTY_MARKERS
     uncertainty_calibration = (
         1.0
@@ -767,32 +871,88 @@ def extract_features(
 
 
 def _answer_status(
-    candidate: ResponseCandidate, features: CandidateFeatures,
-    prompt: str, focus_concepts: tuple[str, ...],
+    candidate: ResponseCandidate,
+    features: CandidateFeatures,
+    prompt: str,
+    focus_concepts: tuple[str, ...],
 ) -> str:
     metadata = candidate.metadata
-    if (candidate.source in {"fallback", "semantic_recovery"}
-            or metadata.get("semantic_recovery") is True):
+    if (
+        candidate.source in {"fallback", "semantic_recovery"}
+        or metadata.get("semantic_recovery") is True
+    ):
         return "recovery"
-    composed = bool(metadata.get("locally_composed") or (
-        metadata.get("authored_reply_template") is False
-        and (metadata.get("role_order") or metadata.get("proposition_count"))
-    ))
-    evidence = bool(candidate.required_facts or any(metadata.get(key) for key in (
-        "reasoning_evidence", "position_evidence", "used_evidence", "causal_path",
-    )))
+    if _dialogue_binding(candidate, prompt) > 0.0:
+        return "dialogue_response"
+    composed = bool(
+        metadata.get("locally_composed")
+        or (
+            metadata.get("authored_reply_template") is False
+            and (metadata.get("role_order") or metadata.get("proposition_count"))
+        )
+    )
+    evidence = bool(
+        candidate.required_facts
+        or any(
+            metadata.get(key)
+            for key in (
+                "reasoning_evidence",
+                "position_evidence",
+                "used_evidence",
+                "causal_path",
+            )
+        )
+    )
     # Binding is checked against actual words too; a producer's numerical
     # confidence alone cannot make "I analyze context" answer any topic.
     topics = set(content_lemmas(prompt)) | set(focus_concepts)
     bound = bool(topics & set(content_lemmas(candidate.text)))
     if not bound:
-        bound = bool(metadata.get("answer_slot") and features.semantic_frame_fit >= 0.8
-                     and metadata.get("obligation_fit", 0.0) >= 0.8)
-    if (composed and evidence and bound
-            and not metadata.get("response_signal_mismatch")
-            and metadata.get("semantic_scaffold") is not True):
+        bound = bool(
+            metadata.get("answer_slot")
+            and features.semantic_frame_fit >= 0.8
+            and metadata.get("obligation_fit", 0.0) >= 0.8
+        )
+    if (
+        composed
+        and evidence
+        and bound
+        and not metadata.get("response_signal_mismatch")
+        and metadata.get("semantic_scaffold") is not True
+    ):
         return "grounded_answer"
     return "candidate"
+
+
+def _dialogue_binding(candidate: ResponseCandidate, prompt: str) -> float:
+    """Measure an independently composed plan, without prescribing its move.
+
+    A producer's name or a known move label cannot earn admission. The same
+    checks apply to new plans and new predicates. Questions requesting facts
+    still require answer evidence rather than conversational appropriateness.
+    """
+    metadata = candidate.metadata
+    plan = metadata.get("message_plan")
+    if (
+        not isinstance(plan, Mapping)
+        or metadata.get("reader_checked") is not True
+        or metadata.get("locally_composed") is not True
+        or not metadata.get("reasoning_evidence")
+        or metadata.get("response_signal_mismatch")
+        or metadata.get("semantic_recovery")
+        or metadata.get("hard_rejection")
+        or metadata.get("communicative_status") == "express_limit"
+    ):
+        return 0.0
+    goal, claim = plan.get("goal"), plan.get("claim")
+    if not isinstance(goal, Mapping) or not isinstance(claim, Mapping):
+        return 0.0
+    if goal.get("kind") != "respond" or not claim.get("evidence"):
+        return 0.0
+    if any(c.clause_kind == "question" for c in analyze_structured_utterance(prompt).clauses):
+        return 0.0
+    fit = metadata.get("obligation_fit")
+    return _clamp(float(fit)) if isinstance(fit, int | float) and not isinstance(fit, bool) else 0.0
 
 
 def _speech_act_fit(speech_act: str, text: str) -> float:
@@ -800,6 +960,29 @@ def _speech_act_fit(speech_act: str, text: str) -> float:
     if speech_act in {"clarifying_question", "question", "invite_continuation"}:
         return 1.0 if is_question else 0.25
     return 0.85 if not is_question else 0.55
+
+
+def _question_response_rejection(
+    candidate: ResponseCandidate,
+) -> str | None:
+    if not candidate.text.rstrip().endswith("?"):
+        return None
+    response_move = candidate.metadata.get("response_move")
+    genuine_clarification = bool(
+        candidate.metadata.get("genuine_clarification")
+        or candidate.metadata.get("unresolved_reference")
+        or response_move in {
+            "clarify_reference",
+            "clarify_intended_meaning",
+            "request_required_argument",
+        }
+    )
+    if genuine_clarification:
+        return None
+    required = candidate.metadata.get("required_response_act")
+    if required in {"answer", "repair"}:
+        return "question_does_not_fulfill_answer_or_repair"
+    return None
 
 
 def _metadata_score(

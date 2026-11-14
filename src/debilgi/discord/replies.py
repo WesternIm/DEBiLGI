@@ -9,16 +9,24 @@ import re
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from time import perf_counter
 
 from debilgi.autonomy.policy import InitiativePolicy
+from debilgi.cognition.affect import AffectRepository
 from debilgi.cognition.continuous import ContinuousCognitionService
 from debilgi.cognition.core_repository import CognitiveRepository
+from debilgi.cognition.dialogue_tasks import (
+    DialogueTaskRepository,
+    contact_response_binding,
+    task_candidate_metadata,
+    unresolved_input_binding,
+)
 from debilgi.cognition.models import ActionIntent, ActionType
 from debilgi.dataset.self_dataset import SelfDatasetRepository
-from debilgi.events.models import Event
+from debilgi.events.models import Event, EventType
 from debilgi.experience.consolidation import ExperienceConsolidator
+from debilgi.experience.meaning_intents import MeaningIntentRepository
 from debilgi.experience.models import PreparedReply
 from debilgi.knowledge.models import KnowledgeGrounding
 from debilgi.knowledge.policy import KnowledgeQueryPolicy
@@ -29,6 +37,7 @@ from debilgi.language.abstract_reasoning import (
     resolve_abstract_question,
 )
 from debilgi.language.addressing import DEFAULT_ADDRESSING
+from debilgi.language.affective_stance import affective_stances
 from debilgi.language.arbitration import (
     ArbitrationDecision,
     ArbitrationProfile,
@@ -63,7 +72,13 @@ from debilgi.language.clarification_policy import (
     lexical_question_target,
     requests_word_definition,
 )
-from debilgi.language.communication import MessagePlan, PendingText, ResponseComposer, reader_goal
+from debilgi.language.communication import (
+    MessagePlan,
+    PendingText,
+    ResponseComposer,
+    plan_issues,
+    reader_goal,
+)
 from debilgi.language.content import content_lemmas, content_tokens
 from debilgi.language.context_gate import WorkingMemoryContextGate
 from debilgi.language.contextual_question_reasoning import (
@@ -104,11 +119,11 @@ from debilgi.language.entities import (
     identity_thought,
     render_message_content,
 )
+from debilgi.language.generative_planner import plan_from_evidence, resolve_evidence_context
 from debilgi.language.grounded_repair import (
     grounded_repair_thought,
     prior_claim_review_thought,
     unmet_requirement_thought,
-    unresolved_answer_thought,
 )
 from debilgi.language.lexical_matching import same_lexical_family
 from debilgi.language.lexicon import (
@@ -121,6 +136,7 @@ from debilgi.language.meaning_plan import (
     build_response_meaning_plan,
     realize_response_meaning,
 )
+from debilgi.language.memory_based import MemoryPhraseGenerator
 from debilgi.language.open_questions import OpenLanguageQuestionService
 from debilgi.language.personal_action_reasoning import (
     analyze_personal_action,
@@ -153,6 +169,7 @@ from debilgi.language.productive_nlg import (
     SemanticDependency,
     realize_thought,
 )
+from debilgi.language.proposition_memory import PropositionMemory
 from debilgi.language.quantitative_reasoning import resolve_travel_time_question
 from debilgi.language.question_reasoning import (
     analyze_semantic_question,
@@ -177,6 +194,7 @@ from debilgi.language.relation_reasoning import (
     analyze_relation_question,
     reason_about_relation,
 )
+from debilgi.language.request_focus import supported_alternative
 from debilgi.language.research_wait import LexicalResearchPending
 from debilgi.language.response_alignment import assess_response_alignment
 from debilgi.language.response_requirements import response_requirement
@@ -453,8 +471,11 @@ def _previous_answer_grounding(
         return ()
     structure = analyze_structured_utterance(previous)
     clause = max(structure.clauses, key=lambda item: item.confidence, default=None)
-    if (clause is None or clause.predicate_index is None
-            or clause.clause_kind not in {"statement", "nominal_statement"}):
+    if (
+        clause is None
+        or clause.predicate_index is None
+        or clause.clause_kind not in {"statement", "nominal_statement"}
+    ):
         return ()
     predicate = structure.tokens[clause.predicate_index]
     action = (
@@ -463,13 +484,10 @@ def _previous_answer_grounding(
         else None
     )
     direct_object = (
-        structure.tokens[clause.direct_object_indices[0]]
-        if clause.direct_object_indices
-        else None
+        structure.tokens[clause.direct_object_indices[0]] if clause.direct_object_indices else None
     )
     negated = clause.negated or any(
-        token.lemma == "не"
-        for token in structure.tokens[clause.token_start : clause.token_end]
+        token.lemma == "не" for token in structure.tokens[clause.token_start : clause.token_end]
     )
     features = dict(predicate.grammatical_features)
     statement = (
@@ -691,6 +709,11 @@ class SafeMentionReplyService:
         response_plan_retry_limit: int = 2,
         context_character_limit: int = 600,
         productive_only_replies: bool = False,
+        meaning_first_replies: bool = False,
+        proposition_memory: PropositionMemory | None = None,
+        meaning_intents: MeaningIntentRepository | None = None,
+        affect: AffectRepository | None = None,
+        dialogue_tasks: DialogueTaskRepository | None = None,
         enabled: bool = False,
     ) -> None:
         if context_character_limit <= 0:
@@ -701,8 +724,12 @@ class SafeMentionReplyService:
         self._archive_repository = archive_repository
         self._expression_engine = expression_engine
         self._experience_consolidator = experience_consolidator
+        self._meaning_intents = meaning_intents
+        self._affect = affect
+        self._dialogue_tasks = dialogue_tasks
         self._initiative_policy = initiative_policy
         self._generator = generator
+        self._data_generator = MemoryPhraseGenerator()
         self._social_reactions = social_reactions
         self._reflection = reflection
         self._literacy = literacy
@@ -724,7 +751,7 @@ class SafeMentionReplyService:
         self._context_gate = context_gate
         self._semantic_consultant = semantic_consultant
         self._autonomous_planning_required = bool(
-            getattr(semantic_consultant, "autonomous_planning", False)
+            not meaning_first_replies and getattr(semantic_consultant, "autonomous_planning", False)
         )
         self._semantic_assimilation = semantic_assimilation
         self._position_reasoning = position_reasoning or PositionReasoningService()
@@ -739,6 +766,8 @@ class SafeMentionReplyService:
         self._response_plan_retry_limit = response_plan_retry_limit
         self._context_character_limit = context_character_limit
         self._productive_only_replies = productive_only_replies
+        self._meaning_first_replies = meaning_first_replies
+        self._proposition_memory = proposition_memory
         self._stable_reply_cache: OrderedDict[str, str] = OrderedDict()
         self._pending_concepts: OrderedDict[str, str] = OrderedDict()
         self._candidate_sources: OrderedDict[str, str] = OrderedDict()
@@ -808,6 +837,8 @@ class SafeMentionReplyService:
                 details={"failure": upstream_failure},
             )
             self._log_reply_failure(event, upstream_failure)
+            if self._meaning_first_replies:
+                return await self._prepare_data_exploration(event)
             if self._productive_only_replies or self._autonomous_planning_required:
                 return await self._withhold_non_productive_failure(event, upstream_failure)
             return await self._failure_reply(event)
@@ -816,6 +847,8 @@ class SafeMentionReplyService:
         except asyncio.CancelledError:
             raise
         except LexicalResearchPending:
+            if self._meaning_first_replies:
+                return await self._prepare_data_exploration(event)
             raise
         except Exception as exc:
             await self._trace_step(
@@ -827,6 +860,8 @@ class SafeMentionReplyService:
                 details={"exception_type": type(exc).__name__, "exception": str(exc)},
             )
             self._log_reply_failure(event, "generation_exception", exc)
+            if self._meaning_first_replies:
+                return await self._prepare_data_exploration(event)
             if self._productive_only_replies or self._autonomous_planning_required:
                 return await self._withhold_non_productive_failure(
                     event,
@@ -835,6 +870,8 @@ class SafeMentionReplyService:
             return await self._failure_reply(event)
         if prepared is not None and prepared.text.strip():
             return prepared
+        if self._meaning_first_replies:
+            return await self._prepare_data_exploration(event)
         self._log_reply_failure(event, "empty_generation_result")
         await self._trace_step(
             event.event_id,
@@ -843,11 +880,17 @@ class SafeMentionReplyService:
             status="failed",
             summary="reply generation returned no usable text",
         )
-        if self._productive_only_replies or self._autonomous_planning_required:
+        if (
+            self._meaning_first_replies
+            or self._productive_only_replies
+            or self._autonomous_planning_required
+        ):
             return await self._withhold_non_productive_failure(
                 event,
                 (
-                    "autonomous_planning_no_surface"
+                    "evidence_planner_no_surface"
+                    if self._meaning_first_replies
+                    else "autonomous_planning_no_surface"
                     if self._autonomous_planning_required
                     else "productive_only_no_surface"
                 ),
@@ -863,6 +906,8 @@ class SafeMentionReplyService:
             return None
         await self._trace_begin(event)
         intent = await self._repository.intent_for_event(event.event_id)
+        if self._meaning_first_replies and intent is None:
+            intent = self._direct_reply_intent(event)
         if intent is None:
             await self._trace_step(
                 event.event_id,
@@ -901,9 +946,14 @@ class SafeMentionReplyService:
                 "required_facts": context.required_facts,
                 "knowledge_facts": context.knowledge_facts,
                 "dialogue_state": context.dialogue_state,
+                "dialogue_situation": context.dialogue_situation,
+                "affect_features": context.affect_features,
             },
         )
         plan = utterance_plan(thought_from_intent(intent), context=context)
+        if plan is None and self._meaning_first_replies:
+            intent = self._direct_reply_intent(event)
+            plan = utterance_plan(thought_from_intent(intent), context=context)
         if plan is None:
             await self._trace_step(
                 event.event_id,
@@ -929,23 +979,34 @@ class SafeMentionReplyService:
         if semantic_reply is not None and not requests_word_definition(semantic_reply.text):
             return semantic_reply
         text = await self._generate_checked(event, plan)
-        research_gaps = await self._defer_pending_research(
-            event, plan.context.prompt, plan.context.dialogue_messages,
-            plan.context.dialogue_state.resolved_bindings if plan.context.dialogue_state else (),
-        )
-        decision = self._arbitration_decisions.get(event.event_id)
-        grounded_answer = bool(decision and decision.winner and decision.winner.source in {
-            "semantic_thought", "semantic_reasoning", "discord_identity", "dialogue_context",
-            "personal_action", "runtime_state", "relation_reasoning",
-        })
+        if not self._meaning_first_replies:
+            await self._defer_pending_research(
+                event,
+                plan.context.prompt,
+                plan.context.dialogue_messages,
+                (
+                    plan.context.dialogue_state.resolved_bindings
+                    if plan.context.dialogue_state
+                    else ()
+                ),
+            )
+        # Pending dictionary work does not invalidate a conversational question.
+        # Only a lexical definition/request is subject to this final boundary;
+        # ordinary repairs have already passed the response arbitrator.
         if unrequested_definition(
             text, plan.context.prompt, plan.context.reference_definitions
-        ) or requests_word_definition(text) or (
-            research_gaps and text.rstrip().endswith("?") and not grounded_answer
-        ):
-            text = realize_thought(unresolved_answer_thought(), limit=1)[0].text
-            self._remember_candidate_source(event.event_id, "semantic_recovery")
+        ) or requests_word_definition(text):
+            # Legacy generation may not have used content arbitration. Re-enter
+            # the complete planner instead of authoring a replacement here.
             self._arbitration_decisions.pop(event.event_id, None)
+            text = await self._generate_arbitrated(event, plan, mode="active", replan=True)
+            if requests_word_definition(text) or unrequested_definition(
+                text,
+                plan.context.prompt,
+                plan.context.reference_definitions,
+            ):
+                text = ""
+                self._arbitration_decisions.pop(event.event_id, None)
         if not text or context.personality is None:
             return None
         arbitration = self._arbitration_decisions.pop(event.event_id, None)
@@ -983,8 +1044,33 @@ class SafeMentionReplyService:
             ),
             assertion_experience=(
                 arbitration.winner.metadata.get("assertion_experience")
+                if arbitration is not None
+                and arbitration.winner is not None
+                and arbitration.winner.text == text
+                else None
+            ),
+            meaning_intention_id=(
+                arbitration.winner.metadata.get("meaning_intention_id")
                 if arbitration is not None and arbitration.winner is not None
                 and arbitration.winner.text == text else None
+            ),
+            dialogue_task_id=(
+                str(arbitration.winner.metadata["dialogue_task_id"])
+                if arbitration is not None
+                and arbitration.winner is not None
+                and arbitration.winner.text == text
+                and arbitration.winner.metadata.get("dialogue_task_id")
+                else None
+            ),
+            dialogue_task_progress=(
+                float(arbitration.winner.metadata["dialogue_task_progress"])
+                if arbitration is not None
+                and arbitration.winner is not None
+                and arbitration.winner.text == text
+                and isinstance(
+                    arbitration.winner.metadata.get("dialogue_task_progress"), int | float
+                )
+                else None
             ),
         )
         await self._trace_step(
@@ -1011,7 +1097,8 @@ class SafeMentionReplyService:
         utterance,
     ) -> PreparedReply | None:
         if (
-            intent.action_type is not ActionType.ASK_QUESTION
+            self._meaning_first_replies
+            or intent.action_type is not ActionType.ASK_QUESTION
             or utterance.speech_act != "clarifying_question"
             or utterance.context.exact_answer is not None
             or utterance.context.required_facts
@@ -1062,7 +1149,11 @@ class SafeMentionReplyService:
         )
 
     async def prepare_bound_explanation(self, event: Event) -> PreparedReply | None:
-        if self._productive_only_replies or self._open_questions is None:
+        if (
+            self._meaning_first_replies
+            or self._productive_only_replies
+            or self._open_questions is None
+        ):
             return None
         resolution = await self._open_questions.resolution_for_event(event.event_id)
         if resolution is None:
@@ -1079,7 +1170,11 @@ class SafeMentionReplyService:
         )
 
     async def prepare_bound_short_act(self, event: Event) -> PreparedReply | None:
-        if self._productive_only_replies or self._short_speech_acts is None:
+        if (
+            self._meaning_first_replies
+            or self._productive_only_replies
+            or self._short_speech_acts is None
+        ):
             return None
         resolution = await self._short_speech_acts.resolution_for_event(event.event_id)
         if resolution is None:
@@ -1149,10 +1244,26 @@ class SafeMentionReplyService:
         reply: PreparedReply,
         created_at: datetime,
     ) -> None:
+        if self._dialogue_tasks is not None and reply.dialogue_task_id is not None:
+            await self._dialogue_tasks.record_attempt(
+                prompt,
+                task_id=reply.dialogue_task_id,
+                response_message_id=response_message_id,
+                text=reply.text,
+                created_at=created_at,
+                predicted_progress=reply.dialogue_task_progress,
+            )
+        if self._meaning_intents is not None and reply.meaning_intention_id is not None:
+            await self._meaning_intents.record_sent(
+                prompt, intention_id=reply.meaning_intention_id,
+                response_message_id=response_message_id, created_at=created_at, text=reply.text,
+            )
         if self._assertion_experiences is not None and reply.assertion_experience is not None:
             await self._assertion_experiences.record_sent(
-                prompt, response_message_id=response_message_id,
-                proposal=reply.assertion_experience, created_at=created_at,
+                prompt,
+                response_message_id=response_message_id,
+                proposal=reply.assertion_experience,
+                created_at=created_at,
             )
         prompt_text = self._clean_content(prompt)
         if reply.processing_outcome is not None and self._processing_outcomes is not None:
@@ -1189,8 +1300,11 @@ class SafeMentionReplyService:
                 _one_line(reply.text),
             )
         pending_concept = reply.pending_concept or lexical_question_target(reply.text)
-        if (pending_concept is not None and self._open_questions is not None
-                and requests_word_definition(reply.text)):
+        if (
+            pending_concept is not None
+            and self._open_questions is not None
+            and requests_word_definition(reply.text)
+        ):
             await self._open_questions.open_for(
                 prompt,
                 concept=pending_concept,
@@ -1226,13 +1340,23 @@ class SafeMentionReplyService:
 
     async def _reply_context(self, event: Event, intent: ActionIntent) -> ReplyContext:
         prompt = self._clean_content(event)
-        personality = self._expression_engine.express(intent)
+        affect_features: tuple[tuple[str, float], ...] = ()
+        if self._affect is not None and event.actor_id is not None:
+            affect_features = (
+                await self._affect.state(event.guild_id, event.actor_id, at=event.utc_timestamp)
+            ).features
+        expressive_intent = replace(
+            intent, decision_context={**intent.decision_context, **dict(affect_features)}
+        )
+        personality = self._expression_engine.express(expressive_intent)
         if event.actor_id is None or event.channel_id is None:
             return ReplyContext(
                 prompt=prompt,
+                source_event_id=event.event_id,
                 seed=_stable_response_seed(prompt, scope=str(event.guild_id)),
                 personality=personality,
                 perspective=build_personality_perspective(personality),
+                affect_features=affect_features,
             )
         (
             working_events,
@@ -1274,8 +1398,9 @@ class SafeMentionReplyService:
         )
         # A deferred reply still interprets the original turn. Later messages
         # must not become antecedents merely because dictionary lookup took time.
-        working_events = tuple(item for item in working_events
-                               if item.utc_timestamp <= event.utc_timestamp)
+        working_events = tuple(
+            item for item in working_events if item.utc_timestamp <= event.utc_timestamp
+        )
         recent_working_messages = self._recent_texts(
             (item for item in working_events if item.event_id != event.event_id),
             limit=self._memory.limits.max_context_events,
@@ -1286,7 +1411,19 @@ class SafeMentionReplyService:
             include_bot=True,
         )
         consultation_messages = self._recent_consultation_turns(
-            (item for item in working_events if item.event_id != event.event_id),
+            (
+                item
+                for item in working_events
+                if item.event_id != event.event_id
+                and (
+                    not self._meaning_first_replies
+                    or item.actor_id == event.actor_id
+                    or item.event_type == EventType.BOT_REPLIED
+                    and item.target_id == event.actor_id
+                    or item.payload.get("author_is_bot")
+                    and item.target_id == event.actor_id
+                )
+            ),
             limit=12,
         )
         dialogue_chain = tuple(discourse.messages[: discourse.reply_depth])
@@ -1302,6 +1439,26 @@ class SafeMentionReplyService:
         dialogue_state = replace(
             dialogue_state, exchange=exchange_from_events(tuple(working_events), event)
         )
+        dialogue_situation = (
+            await self._dialogue_tasks.deliberate(
+                event,
+                prompt=prompt,
+                consultation_messages=consultation_messages,
+                dialogue_state=dialogue_state,
+            )
+            if self._dialogue_tasks is not None
+            else None
+        )
+        if dialogue_situation is not None:
+            expressive_intent = replace(
+                intent,
+                decision_context={
+                    **intent.decision_context,
+                    **dict(affect_features),
+                    **dict(dialogue_situation.features),
+                },
+            )
+            personality = self._expression_engine.express(expressive_intent)
         assertion_memory = build_assertion_memory(tuple(working_events), event)
         assertion_continuation = plan_assertion_continuation(
             prompt, assertion_memory, tuple(working_events), event
@@ -1322,9 +1479,9 @@ class SafeMentionReplyService:
             )
             resolved_facts = resolved_grounding.facts
             resolved_answer = resolved_grounding.exact_answer
-            reference_definitions = tuple(dict.fromkeys(
-                (*reference_definitions, *resolved_grounding.definitions)
-            ))
+            reference_definitions = tuple(
+                dict.fromkeys((*reference_definitions, *resolved_grounding.definitions))
+            )
             semantic_facts = tuple(dict.fromkeys((*semantic_facts, *resolved_semantic)))
             knowledge_facts = tuple(dict.fromkeys((*knowledge_facts, *resolved_facts)))
             knowledge_answer = knowledge_answer or resolved_answer
@@ -1355,9 +1512,13 @@ class SafeMentionReplyService:
             fact for fact in semantic_facts if not set(content_lemmas(fact)) <= prompt_content_terms
         )
         required_facts = (
-            *(fact for fact in knowledge_facts if not unrequested_definition(
-                fact, dialogue_state.repair_target or prompt, reference_definitions
-            )),
+            *(
+                fact
+                for fact in knowledge_facts
+                if not unrequested_definition(
+                    fact, dialogue_state.repair_target or prompt, reference_definitions
+                )
+            ),
             *(fact.text for fact in literacy_facts),
         )
         exact_answer = knowledge_answer or next(
@@ -1375,6 +1536,7 @@ class SafeMentionReplyService:
         )
         return ReplyContext(
             prompt=prompt,
+            source_event_id=event.event_id,
             reference_definitions=reference_definitions,
             memory_messages=(
                 *recent_working_messages,
@@ -1416,6 +1578,8 @@ class SafeMentionReplyService:
             assertion_memory=assertion_memory,
             assertion_continuation=assertion_continuation,
             assertion_feedback_counts=assertion_feedback_counts,
+            affect_features=affect_features,
+            dialogue_situation=dialogue_situation,
         )
 
     async def _usage_context(self, event: Event, prompt: str) -> tuple[UsageGuidance, ...]:
@@ -1429,6 +1593,8 @@ class SafeMentionReplyService:
         return await self._semantic_assimilation.guidance_for_prompt(event.guild_id, prompt)
 
     async def _generate_checked(self, event: Event, utterance) -> str:
+        if self._meaning_first_replies:
+            return await self._generate_evidence_reply(event, utterance)
         dialogue_state = utterance.context.dialogue_state
         if (
             dialogue_state is not None
@@ -1473,6 +1639,845 @@ class SafeMentionReplyService:
                 self._candidate_sources[event.event_id] = legacy_source
                 self._arbitration_decisions.pop(event.event_id, None)
         return legacy_text
+
+    @staticmethod
+    def _direct_reply_intent(event: Event) -> ActionIntent:
+        """An observed direct address permits a reply even without a stored intent."""
+        return ActionIntent(
+            intent_id=f"local-response:{event.event_id}",
+            guild_id=event.guild_id,
+            action_type=ActionType.SHORT_REPLY,
+            target_id=event.actor_id,
+            channel_id=event.channel_id,
+            urgency=0.5,
+            confidence=0.25,
+            expected_effect={"hypothesis": "respond_to_observed_message"},
+            reasoning_trace=({"source": "direct_address", "event_id": event.event_id},),
+            evidence=(event.event_id,),
+            decision_context={"state_uncertainty": 1.0},
+            created_at=event.utc_timestamp,
+            expires_at=event.utc_timestamp + timedelta(minutes=5),
+        )
+
+    async def _prepare_data_exploration(self, event: Event) -> PreparedReply | None:
+        """Recover from the current turn, then consult contextual language data."""
+        intent = self._direct_reply_intent(event)
+        affect_features: tuple[tuple[str, float], ...] = ()
+        if self._affect is not None and event.actor_id is not None:
+            affect_features = (
+                await self._affect.state(
+                    event.guild_id,
+                    event.actor_id,
+                    at=event.utc_timestamp,
+                )
+            ).features
+            intent = replace(
+                intent,
+                decision_context={
+                    **intent.decision_context,
+                    **dict(affect_features),
+                },
+            )
+        dialogue_situation = (
+            await self._dialogue_tasks.situation(
+                event.guild_id, event.channel_id, event.actor_id
+            )
+            if self._dialogue_tasks is not None
+            and event.channel_id is not None
+            and event.actor_id is not None
+            else None
+        )
+        context = ReplyContext(
+            prompt=self._clean_content(event),
+            seed=event.event_id,
+            personality=self._expression_engine.express(intent),
+            source_event_id=event.event_id,
+            dialogue_situation=dialogue_situation,
+            affect_features=affect_features,
+        )
+        if self._proposition_memory is not None:
+            try:
+                turns = await self._proposition_memory.recent_conversation(event)
+                addressed = tuple(
+                    turn
+                    for turn in turns
+                    if (
+                        turn.actor_id == event.actor_id
+                        and not turn.payload.get("author_is_bot")
+                        or turn.payload.get("author_is_bot")
+                        and turn.actor_id == event.payload.get("bot_user_id")
+                        and turn.target_id == event.actor_id
+                    )
+                )
+                context = replace(
+                    context,
+                    consultation_messages=self._recent_consultation_turns(addressed, limit=100),
+                )
+                context = resolve_evidence_context(context)
+                corpus, grams, relations, dialogue_reports = await asyncio.gather(
+                    self._proposition_memory.relevant_utterances(event, context.prompt),
+                    self._proposition_memory.learned_ngrams(event),
+                    self._proposition_memory.learned_word_relations(event),
+                    self._proposition_memory.relevant_dialogue_reports(
+                        event, context.prompt
+                    ),
+                )
+                context = replace(
+                    context,
+                    corpus_utterances=corpus,
+                    generation_ngrams=grams,
+                    word_relations=relations,
+                    dialogue_reports=dialogue_reports,
+                )
+            except Exception:
+                _failure_logger.exception("event=%s reason=corpus_unavailable", event.event_id)
+        plan = utterance_plan(thought_from_intent(intent), context=context)
+        try:
+            analyses = tuple(await self._word_analyses(event, context.prompt))
+        except Exception:
+            analyses = ()
+        semantic_candidates = self._semantic_recovery_candidates(
+            event,
+            plan,
+            analyses,
+            dialogue_situation.active_task if dialogue_situation is not None else None,
+        )
+        semantic = self._arbitrator.decide(
+            event_id=event.event_id,
+            prompt=context.prompt,
+            focus_concepts=tuple(content_lemmas(context.prompt)),
+            candidates=semantic_candidates,
+            recent_replies=(),
+            profile=ArbitrationProfile.baseline(event.guild_id),
+            used_fallback=True,
+        )
+        exploration = await self._select_data_exploration(event, plan)
+        if exploration.winner is not None:
+            decision = merge_recovery_decision(
+                semantic,
+                exploration,
+                selection_reason="learned_language_before_semantic_recovery",
+            )
+        else:
+            decision = semantic
+        winner = decision.winner
+        if self._arbitration_repository is not None:
+            try:
+                await self._arbitration_repository.save_decision(
+                    event,
+                    decision,
+                    mode="active",
+                    prompt=context.prompt,
+                    legacy_text=None,
+                    legacy_source=None,
+                )
+            except Exception:
+                _failure_logger.exception(
+                    "event=%s reason=exploration_persistence_failed",
+                    event.event_id,
+                )
+        self._log_arbitration(event, decision, mode="active", legacy_text=None, legacy_source=None)
+        self._arbitration_decisions.pop(event.event_id, None)
+        self._candidate_sources.pop(event.event_id, None)
+        if winner is None:
+            return await self._withhold_non_productive_failure(
+                event,
+                "exploration_did_not_fulfill_dialogue_task",
+            )
+        return PreparedReply(
+            text=winner.text,
+            intent_id=intent.intent_id,
+            tokens=tokenize(winner.text),
+            genome_signature=context.personality.genome_signature,
+            candidate_count=len(decision.scores),
+            fallback=False,
+            response_source=f"arbitrated:{winner.source}",
+            arbitration_decision_id=decision.decision_id,
+            winner_candidate_id=winner.candidate_id,
+            arbitration_weight_version=decision.weight_version,
+            dialogue_task_id=(
+                str(winner.metadata["dialogue_task_id"])
+                if winner.metadata.get("dialogue_task_id")
+                else None
+            ),
+            dialogue_task_progress=(
+                float(winner.metadata["dialogue_task_progress"])
+                if isinstance(winner.metadata.get("dialogue_task_progress"), int | float)
+                else None
+            ),
+        )
+
+    async def _select_data_exploration(
+        self,
+        event: Event,
+        utterance,
+        *,
+        profile: ArbitrationProfile | None = None,
+        structural_weights=None,
+    ) -> ArbitrationDecision:
+        context = utterance.context
+        active_task = (
+            context.dialogue_situation.active_task
+            if context.dialogue_situation is not None
+            else None
+        )
+        try:
+            recent = await self._recent_self_replies(event)
+        except Exception:
+            recent = ()
+        surfaces = self._data_generator.generate_explorations(utterance, recent_replies=recent)
+        repairing_previous_answer = bool(
+            active_task is not None
+            and active_task.goal == "repair_shared_model"
+            and active_task.kind == "response_quality_repair"
+        )
+        restored_response_control = bool(
+            active_task is not None
+            and active_task.kind == "response_control"
+            and context.focus_reason == "answer_control_keeps_request"
+        )
+        open_directive = bool(
+            active_task is not None
+            and active_task.goal == "satisfy_directive"
+            and any(
+                value.endswith(("-нибудь", "-то", "-либо"))
+                for _, value in active_task.objective.required_roles
+            )
+        )
+        candidates = tuple(
+            ResponseCandidate.create(
+                event_id=event.event_id,
+                source="learned_distribution",
+                renderer=(
+                    "observed_answer_domain"
+                    if context.response_options
+                    else "observed_word_transitions"
+                ),
+                text=surface.text,
+                speech_act=utterance.speech_act,
+                source_confidence=0.25,
+                metadata=task_candidate_metadata(
+                    active_task,
+                    surface.text,
+                    {
+                        "authored_reply_template": False,
+                        "locally_composed": True,
+                        "meaning_origin": "learned_distribution",
+                        "exploratory": True,
+                        "generation_score": surface.score,
+                        "corpus_source_event_ids": surface.source_event_ids,
+                        "uses_persistent_word_statistics": bool(context.generation_ngrams),
+                        "learned_word_relation_count": len(context.word_relations),
+                        "semantic_relation_support": surface.relation_support,
+                        "semantic_relation_conflicts": surface.relation_conflicts,
+                        "lexical_topicality": surface.topicality,
+                        "allow_rough_surface": True,
+                        "script_fallback_enabled": False,
+                        "response_options": context.response_options,
+                        "focused_request": context.prompt,
+                        "contact_request": (
+                            is_contact_request(context.prompt)
+                        ),
+                        "contact_response_binding": contact_response_binding(
+                            surface.text
+                        ),
+                        "unresolved_input_reaction": surface.unresolved_reaction,
+                        "unresolved_input_binding": unresolved_input_binding(
+                            surface.text
+                        ),
+                        "unresolved_prompt_terms": (
+                            tuple(content_lemmas(context.prompt))
+                            or tuple(
+                                token.casefold()
+                                for token in tokenize(context.prompt)
+                                if token[:1].isalnum()
+                            )
+                            if surface.unresolved_reaction
+                            else ()
+                        ),
+                        "learned_cognitive_predicate": surface.cognitive_predicate,
+                        "choice_is_provisional": bool(context.response_options),
+                        "response_move": (
+                            "targeted_repair"
+                            if repairing_previous_answer
+                            else "continue_topic"
+                            if restored_response_control
+                            else "perform_directive"
+                            if open_directive
+                            else ""
+                        ),
+                        "obligation_fit": (
+                            0.88
+                            if repairing_previous_answer or restored_response_control
+                            else 0.84
+                            if open_directive
+                            else 0.0
+                        ),
+                        "answer_slot": (
+                            "почему"
+                            if response_requirement(context.prompt) == "explain_reason"
+                            and bool(surface.source_event_ids)
+                            and bool(
+                                {"без", "из-за", "потому", "поэтому"}
+                                & set(tokenize(surface.text))
+                            )
+                            else None
+                        ),
+                        "reasoning_evidence": (
+                            surface.source_event_ids
+                            if response_requirement(context.prompt) == "explain_reason"
+                            and bool(
+                                {"без", "из-за", "потому", "поэтому"}
+                                & set(tokenize(surface.text))
+                            )
+                            else ()
+                        ),
+                    },
+                ),
+            )
+            for surface in surfaces
+            if not requests_word_definition(surface.text)
+            and not unrequested_definition(
+                surface.text,
+                context.prompt,
+                context.reference_definitions,
+            )
+        )
+        decision = self._arbitrator.decide_exploration(
+            event_id=event.event_id,
+            prompt=context.prompt,
+            focus_concepts=(),
+            candidates=candidates,
+            recent_replies=recent,
+            profile=profile or ArbitrationProfile.baseline(event.guild_id),
+            structural_weights=structural_weights or {},
+        )
+        await self._trace_step(
+            event.event_id,
+            stage="candidate_generation",
+            component="corpus_generation",
+            status="completed",
+            summary="learned word transitions were searched without a script",
+            details={
+                "source_event_ids": tuple(source_id for source_id, _ in context.corpus_utterances),
+                "selection": _decision_trace_details(decision),
+                "quality_is_ranking_not_silence": True,
+            },
+        )
+        return decision
+
+    def _semantic_recovery_candidates(
+        self,
+        event: Event,
+        utterance,
+        analyses: tuple[WordAnalysis, ...],
+        active_task,
+    ) -> tuple[ResponseCandidate, ...]:
+        """Transform the current meaning when corpus composition has no answer.
+
+        This path contains no dialogue-act-to-phrase mapping.  It can only
+        revoice grammatical roles that are present in this turn, then select
+        semantic alignment or resistance from persistent affect and the
+        expressed personality.
+        """
+
+        if utterance is None:
+            return ()
+        context = utterance.context
+        candidates: list[ResponseCandidate] = []
+        identity = identity_thought(context.prompt, event.payload)
+        if identity is not None:
+            composer = ResponseComposer(analyze_structured_utterance(context.prompt))
+            for surface in composer.express(identity, limit=1):
+                candidates.append(
+                    ResponseCandidate.create(
+                        event_id=event.event_id,
+                        source="discord_identity",
+                        renderer="runtime_identity_proposition",
+                        text=surface.text,
+                        speech_act="brief_statement",
+                        source_confidence=0.99,
+                        key_points=tuple(content_lemmas(context.prompt)),
+                        metadata=task_candidate_metadata(
+                            active_task,
+                            surface.text,
+                            {
+                                **composer.metadata_for(surface.text),
+                                "authored_reply_template": False,
+                                "locally_composed": True,
+                                "meaning_origin": "runtime_identity_fact",
+                                "semantic_origin": "gateway_identity",
+                                "identity_grounded": True,
+                                "answer_slot": "кто",
+                                "reasoning_evidence": identity.evidence,
+                                "response_move": "answer_identity",
+                                "obligation_fit": 1.0,
+                                "semantic_frame_fit": 1.0,
+                                "focused_request": context.prompt,
+                                "script_fallback_enabled": False,
+                            },
+                        ),
+                    )
+                )
+        stances = affective_stances(
+            context.prompt,
+            affect_features=context.affect_features,
+            personality=context.personality,
+        )
+        candidates.extend(
+            ResponseCandidate.create(
+                event_id=event.event_id,
+                source="affective_stance",
+                renderer=f"semantic_role_transform:{stance.operation}",
+                text=stance.text,
+                speech_act="brief_statement",
+                source_confidence=min(0.88, 0.58 + stance.weight * 0.28),
+                key_points=stance.topics,
+                metadata=task_candidate_metadata(
+                    active_task,
+                    stance.text,
+                    {
+                        "authored_reply_template": False,
+                        "locally_composed": True,
+                        "meaning_origin": "affect_weighted_stance",
+                        "semantic_origin": "current_turn_roles",
+                        "semantic_operation": stance.operation,
+                        "reasoning_evidence": (event.event_id,),
+                        "response_move": "take_position",
+                        "obligation_fit": 0.92,
+                        "semantic_frame_fit": 0.98,
+                        "stance_consistency": stance.weight,
+                        "social_coherence": stance.weight,
+                        "focused_request": context.prompt,
+                        "stance_aligned": stance.aligned,
+                        "stance_predicate": stance.predicate,
+                        "stance_topics": stance.topics,
+                        "script_fallback_enabled": False,
+                    },
+                ),
+            )
+            for stance in stances
+        )
+        return tuple(candidates)
+
+    async def _generate_evidence_reply(
+        self,
+        event: Event,
+        utterance,
+        *,
+        remember: bool = True,
+    ) -> str:
+        """One local evidence path; no fallback to act-specific semantic scripts."""
+        started = perf_counter()
+        context = utterance.context
+        if self._proposition_memory is not None:
+            turns = await self._proposition_memory.recent_conversation(event)
+            exchange = exchange_from_events(turns, event)
+            state = context.dialogue_state
+            if state is not None:
+                state = replace(state, exchange=exchange)
+            addressed = tuple(
+                turn
+                for turn in turns
+                if (
+                    turn.actor_id == event.actor_id
+                    and not turn.payload.get("author_is_bot")
+                    or turn.payload.get("author_is_bot")
+                    and turn.actor_id == event.payload.get("bot_user_id")
+                    and turn.target_id == event.actor_id
+                )
+            )
+            context = replace(
+                context,
+                consultation_messages=self._recent_consultation_turns(addressed, limit=100),
+                dialogue_state=state,
+            )
+        context = resolve_evidence_context(context)
+        context = replace(
+            context,
+            memory_ngrams=(),
+            source_event_id=event.event_id,
+            meaning_goals=(
+                await self._meaning_intents.learned_goals(event)
+                if self._meaning_intents is not None else ()
+            ),
+        )
+        if self._proposition_memory is not None:
+            query = (
+                context.dialogue_state.retrieval_query if context.dialogue_state else context.prompt
+            )
+            reports, corpus, grams, relations, dialogue_reports, meanings = await asyncio.gather(
+                self._proposition_memory.relevant_reports(event, query),
+                self._proposition_memory.relevant_utterances(event, query),
+                self._proposition_memory.learned_ngrams(event),
+                self._proposition_memory.learned_word_relations(event),
+                self._proposition_memory.relevant_dialogue_reports(event, query),
+                self._proposition_memory.learned_meanings(event),
+            )
+            context = replace(
+                context,
+                proposition_reports=reports,
+                corpus_utterances=corpus,
+                generation_ngrams=grams,
+                word_relations=relations,
+                dialogue_reports=dialogue_reports,
+                meaning_records=meanings,
+            )
+        utterance = replace(utterance, context=context)
+        analyses = await self._word_analyses(event, context.prompt)
+        planning = plan_from_evidence(
+            context, analyses, explore_meanings=self._meaning_intents is not None,
+        )
+        active_before_subtask = (
+            context.dialogue_situation.active_task
+            if context.dialogue_situation is not None
+            else None
+        )
+        if (
+            not planning.proposals
+            and active_before_subtask is not None
+            and active_before_subtask.goal == "answer_question"
+            and not active_before_subtask.locally_verifiable
+            and self._dialogue_tasks is not None
+        ):
+            dialogue_situation = await self._dialogue_tasks.spawn_subtask(
+                event,
+                active_before_subtask,
+                missing_slots=tuple(
+                    dict.fromkeys(
+                        (
+                            *active_before_subtask.objective.missing_slots,
+                            *planning.unresolved,
+                        )
+                    )
+                ),
+            )
+            context = replace(context, dialogue_situation=dialogue_situation)
+            utterance = replace(utterance, context=context)
+            planning = plan_from_evidence(
+                context,
+                analyses,
+                explore_meanings=self._meaning_intents is not None,
+            )
+        proposals = planning.proposals
+        selection = None
+        if self._meaning_intents is not None:
+            proposals = tuple(
+                proposal for proposal in proposals if not plan_issues(proposal.plan)
+                and (not context.response_options or supported_alternative(
+                    context.prompt, context.response_options, proposal.plan.claim,
+                ) is not None)
+            )
+            selection = await self._meaning_intents.choose(
+                event, proposals, planning.objective,
+                parent_intent_id=utterance.thought.intention_id or "direct-reply:" + event.event_id,
+                state_features=tuple(
+                    dict(
+                        (
+                            *utterance.thought.state_features,
+                            *context.affect_features,
+                            *(
+                                context.dialogue_situation.features
+                                if context.dialogue_situation is not None
+                                else ()
+                            ),
+                        )
+                    ).items()
+                ),
+            )
+            proposals = (selection.proposal,) if selection is not None else ()
+            if selection is not None:
+                is_question = selection.proposal.plan.claim.clause_kind == "question"
+                utterance = replace(
+                    utterance,
+                    speech_act="clarifying_question" if is_question else "brief_statement",
+                    thought=replace(
+                        utterance.thought,
+                        intention_id=selection.intention_id,
+                        action_type=(
+                            ActionType.ASK_QUESTION if is_question else ActionType.SHORT_REPLY
+                        ),
+                        objective=selection.expected_outcome or selection.proposal.operation,
+                    ),
+                )
+            await self._trace_step(
+                event.event_id, stage="intent", component="learned_meaning_policy",
+                status="selected" if selection is not None else "unresolved",
+                summary="a semantic intention was selected before wording from actual experience",
+                details={"selection": selection, "learned_goals": context.meaning_goals,
+                         "script_fallback_enabled": False},
+            )
+        await self._trace_step(
+            event.event_id,
+            stage="reasoning",
+            component="evidence_planner",
+            status="derived" if planning.proposals else "unresolved",
+            summary="local response meanings retain their actual source propositions",
+            details={
+                "planning": planning,
+                "script_fallback_enabled": False,
+                "turn_prompt": context.turn_prompt,
+                "focused_request": context.prompt,
+                "focus_reason": context.focus_reason,
+                "response_options": context.response_options,
+            },
+        )
+        composer = ResponseComposer(analyze_structured_utterance(context.prompt))
+        candidates = []
+        active_task = (
+            context.dialogue_situation.active_task
+            if context.dialogue_situation is not None
+            else None
+        )
+        for proposal in proposals:
+            answer_option = (
+                supported_alternative(context.prompt, context.response_options, proposal.plan.claim)
+                if context.response_options
+                else None
+            )
+            if context.response_options and answer_option is None:
+                continue
+            # Keep the source proposition explicit at the delivery boundary;
+            # a bare slot value loses its actor/action during common scoring.
+            message = replace(proposal.plan, answer_shape="sentence", focus_role=None)
+            for surface in composer.compose(
+                message,
+                (*proposal.patterns, *context.dependency_patterns),
+            ):
+                text = (
+                    answer_option[:1].upper() + answer_option[1:] if answer_option else surface.text
+                )
+                if unrequested_definition(
+                    text,
+                    context.prompt,
+                    context.reference_definitions,
+                ):
+                    continue
+                candidates.append(
+                    ResponseCandidate.create(
+                        event_id=event.event_id,
+                        source="semantic_reasoning",
+                        renderer=f"evidence_planner:{proposal.operation}",
+                        text=text,
+                        speech_act=utterance.speech_act,
+                        source_confidence=proposal.confidence,
+                        key_points=planning.objective.topics,
+                        metadata=task_candidate_metadata(
+                            active_task,
+                            text,
+                            {
+                                **composer.metadata_for(surface.text),
+                                "authored_reply_template": False,
+                                "locally_composed": True,
+                                "role_order": surface.role_order,
+                                "meaning_origin": "derived",
+                                "semantic_origin": "derived",
+                                "semantic_scaffold": False,
+                                "reasoning_evidence": tuple(
+                                    p.evidence_id for p in proposal.premises
+                                ),
+                                "premises": proposal.premises,
+                                "derivation": proposal.operation,
+                                "answer_slot": proposal.answer_slot,
+                                "obligation_fit": 0.9,
+                                "semantic_frame_fit": 0.96,
+                                "response_options": context.response_options,
+                                "focused_request": context.prompt,
+                                "choice_is_provisional": False,
+                                "task_resolution": proposal.operation.startswith("task_"),
+                                "meaning_intention_id": (
+                                    selection.intention_id if selection is not None else None
+                                ),
+                                "intention_plan_key": proposal.plan.key,
+                                "expected_outcome": (
+                                    selection.expected_outcome if selection is not None else None
+                                ),
+                            },
+                        ),
+                    )
+                )
+        if (
+            active_task is not None
+            and active_task.goal == "perform_utterance"
+            and active_task.objective.required_content
+        ):
+            requested = active_task.objective.required_content.strip()
+            text = requested[:1].upper() + requested[1:]
+            if text and text[-1].isalnum():
+                text += "."
+            candidates.append(
+                ResponseCandidate.create(
+                    event_id=event.event_id,
+                    source="dialogue_task",
+                    renderer="requested_utterance_effect",
+                    text=text,
+                    speech_act="brief_statement",
+                    source_confidence=active_task.confidence,
+                    key_points=active_task.objective.focus_terms,
+                    metadata=task_candidate_metadata(
+                        active_task,
+                        text,
+                        {
+                            "authored_reply_template": False,
+                            "locally_composed": True,
+                            "meaning_origin": "dialogue_task_effect",
+                            "semantic_origin": "current_turn_request",
+                            "semantic_scaffold": False,
+                            "task_resolution": "perform_utterance",
+                            "obligation_fit": 1.0,
+                            "semantic_frame_fit": 1.0,
+                            "focused_request": context.prompt,
+                        },
+                    ),
+                )
+            )
+        await self._trace_step(
+            event.event_id,
+            stage="candidate_generation",
+            component="evidence_planner",
+            status="completed",
+            summary="only evidence-derived meanings were realized",
+            details={
+                "candidate_count": len(candidates),
+                "candidates": tuple(
+                    {
+                        "source": c.source,
+                        "renderer": c.renderer,
+                        "text": c.text,
+                        "metadata": dict(c.metadata),
+                    }
+                    for c in candidates
+                ),
+                "composition": composer.records,
+            },
+        )
+        profile = (
+            await self._arbitration_repository.profile(event.guild_id)
+            if self._arbitration_repository is not None
+            else ArbitrationProfile.baseline(event.guild_id)
+        )
+        structural_weights = (
+            await self._arbitration_repository.structural_weights(event.guild_id)
+            if self._arbitration_repository is not None
+            else {}
+        )
+        select = (
+            self._arbitrator.decide_answer_domain
+            if context.response_options
+            else self._arbitrator.decide
+        )
+        recent_replies = await self._recent_self_replies(event)
+        decision = select(
+            **({"options": context.response_options} if context.response_options else {}),
+            event_id=event.event_id,
+            prompt=context.prompt,
+            focus_concepts=planning.objective.topics,
+            candidates=tuple(candidates),
+            recent_replies=recent_replies,
+            profile=profile,
+            structural_weights=structural_weights,
+        )
+        if decision.winner is None:
+            recovery_candidates = self._semantic_recovery_candidates(
+                event,
+                utterance,
+                tuple(analyses),
+                active_task,
+            )
+            recovery = self._arbitrator.decide(
+                event_id=event.event_id,
+                prompt=context.prompt,
+                focus_concepts=planning.objective.topics,
+                candidates=recovery_candidates,
+                recent_replies=recent_replies,
+                profile=ArbitrationProfile.baseline(event.guild_id),
+                structural_weights={},
+                used_fallback=True,
+                clarifiable_terms=tuple(
+                    dict.fromkeys(
+                        analysis.lemma or analysis.normalized_form
+                        for analysis in analyses
+                        if analysis.requires_lexical_study
+                        and (analysis.lemma or analysis.normalized_form)
+                    )
+                ),
+            )
+            decision = merge_recovery_decision(
+                decision,
+                recovery,
+                selection_reason="current_turn_semantic_recovery",
+            )
+            await self._trace_step(
+                event.event_id,
+                stage="candidate_generation",
+                component="semantic_recovery",
+                status="selected" if recovery.winner is not None else "unresolved",
+                summary="the current turn was converted into response meanings without replay",
+                details={
+                    "candidate_count": len(recovery_candidates),
+                    "candidates": tuple(
+                        {
+                            "source": candidate.source,
+                            "renderer": candidate.renderer,
+                            "text": candidate.text,
+                            "metadata": dict(candidate.metadata),
+                        }
+                        for candidate in recovery_candidates
+                    ),
+                    "selection": _decision_trace_details(recovery),
+                },
+            )
+        exploration = await self._select_data_exploration(
+            event,
+            utterance,
+            profile=profile,
+            structural_weights=structural_weights,
+        )
+        if (
+            exploration.winner is not None
+            and (
+                decision.winner is None
+                or decision.winner.source == "semantic_recovery"
+            )
+        ) or decision.winner is None:
+            decision = merge_recovery_decision(
+                decision,
+                exploration,
+                selection_reason="learned_language_before_semantic_recovery",
+            )
+        decision = replace(decision, latency_ms=(perf_counter() - started) * 1000.0)
+        await self._trace_step(
+            event.event_id,
+            stage="selection",
+            component="response_arbitrator",
+            status="selected" if decision.winner is not None else "failed",
+            summary="local evidence selection completed without scripted recovery",
+            details=_decision_trace_details(decision),
+        )
+        if self._arbitration_repository is not None:
+            try:
+                await self._arbitration_repository.save_decision(
+                    event,
+                    decision,
+                    mode="active",
+                    prompt=context.prompt,
+                    legacy_text=None,
+                    legacy_source=None,
+                )
+            except Exception:
+                _failure_logger.exception(
+                    "event=%s reason=arbitration_persistence_failed decision=%s",
+                    event.event_id,
+                    decision.decision_id,
+                )
+        self._log_arbitration(event, decision, mode="active", legacy_text=None, legacy_source=None)
+        if remember:
+            self._remember_arbitration(event.event_id, decision)
+        if decision.winner is None:
+            return ""
+        if remember:
+            self._remember_candidate_source(event.event_id, f"arbitrated:{decision.winner.source}")
+        return decision.winner.text
 
     async def _generate_legacy_checked(self, event: Event, utterance) -> str:
         self._remember_candidate_source(
@@ -1682,12 +2687,16 @@ class SafeMentionReplyService:
         legacy_text: str | None = None,
         legacy_source: str | None = None,
         remember: bool = True,
+        replan: bool = False,
     ) -> str:
         """Collect applicable sources before selecting a cross-source winner."""
-
+        if self._meaning_first_replies:
+            return await self._generate_evidence_reply(event, utterance, remember=remember)
         started = perf_counter()
         reference_definitions = list(utterance.context.reference_definitions)
         prompt = utterance.context.prompt
+        evidence_context = resolve_evidence_context(utterance.context)
+        resumes_prior_request = evidence_context.prompt != prompt
         entity_analysis = analyze_entities(prompt, event.payload)
         analyses = await self._word_analyses(event, prompt)
         resolved_bindings = (
@@ -1702,12 +2711,13 @@ class SafeMentionReplyService:
             entity_analysis,
             resolved_bindings,
         )
-        analyses = await self._resolve_unknowns_autonomously(
-            event,
-            prompt,
-            analyses,
-            initial_understanding,
-        )
+        if not replan:
+            analyses = await self._resolve_unknowns_autonomously(
+                event,
+                prompt,
+                analyses,
+                initial_understanding,
+            )
         understanding = understand_utterance(
             prompt,
             analyses,
@@ -1719,16 +2729,22 @@ class SafeMentionReplyService:
             task = understanding.task
             frontier = task.frontier
             await self._trace_step(
-                event.event_id, stage="planning", component="comprehension_task",
+                event.event_id,
+                stage="planning",
+                component="comprehension_task",
                 status="interpreted" if task.interpretation_ready else "incomplete",
                 summary="interpretation dependencies are separate from answer evidence",
                 details={
-                    "goal": task.goal, "answer_slot": task.answer_slot,
+                    "goal": task.goal,
+                    "answer_slot": task.answer_slot,
                     "interpretation_ready": task.interpretation_ready,
-                    "answer_ready": task.answer_ready, "pending": frontier.pending,
-                    "lexical_states": task.lexical_states, "lookup_terms": task.lookup_terms,
+                    "answer_ready": task.answer_ready,
+                    "pending": frontier.pending,
+                    "lexical_states": task.lexical_states,
+                    "lookup_terms": task.lookup_terms,
                     "incidental_terms": task.incidental_terms,
-                    "cycles": frontier.cycles, "limited": frontier.limited,
+                    "cycles": frontier.cycles,
+                    "limited": frontier.limited,
                 },
             )
         structured_bundle = self._log_structured_analysis(
@@ -1840,6 +2856,7 @@ class SafeMentionReplyService:
                 reference_definitions.extend(((title, meaning), (title, f"{title} — {meaning}")))
         meaning_utterance = utterance
         if not explicit_lexical_lookup:
+
             def unsuitable_meaning_fact(fact: str) -> bool:
                 return unrequested_definition(fact, prompt, tuple(reference_definitions)) or (
                     (head := definition_head(fact)) is not None
@@ -1872,7 +2889,8 @@ class SafeMentionReplyService:
         )
         meaning_plan_surface = (
             realize_response_meaning(
-                response_meaning_plan, allow_rough=self._productive_only_replies,
+                response_meaning_plan,
+                allow_rough=self._productive_only_replies,
             )
             if response_meaning_plan is not None
             else None
@@ -2038,6 +3056,9 @@ class SafeMentionReplyService:
                 details=inquiry_trace(semantic_inquiry),
             )
         dialogue_move_plans = (
+            ()
+            if is_contact_request(prompt) and resumes_prior_request
+            else
             plan_dialogue_moves(
                 dialogue_act,
                 self_state=self_state_frame,
@@ -2048,11 +3069,14 @@ class SafeMentionReplyService:
                 structure=(structured_bundle[0] if structured_bundle is not None else None),
                 prompt=prompt,
                 context_messages=utterance.context.dialogue_messages,
-                exchange=(utterance.context.dialogue_state.exchange
-                          if utterance.context.dialogue_state is not None else None),
+                exchange=(
+                    utterance.context.dialogue_state.exchange
+                    if utterance.context.dialogue_state is not None
+                    else None
+                ),
                 resolve_from_context=False,
             )
-            if self._productive_only_replies
+            if self._productive_only_replies or replan
             else ()
         )
         position_decision = await self._position_reasoning.resolve(
@@ -2144,7 +3168,8 @@ class SafeMentionReplyService:
         )
         recalled_event = (
             recall_event_slot(prompt, utterance.context.assertion_memory, event)
-            if utterance.context.assertion_memory is not None else None
+            if utterance.context.assertion_memory is not None
+            else None
         )
         study_terms = tuple(
             dict.fromkeys(
@@ -2164,11 +3189,18 @@ class SafeMentionReplyService:
             utterance.context.dialogue_state.exchange if utterance.context.dialogue_state else None
         )
         if foreground_lookup_target is None:
-            study_terms = (() if recalled_event is not None else tuple(
-                term for term in study_terms if term not in understanding.nonblocking_unknown_terms
-            ))
+            study_terms = (
+                ()
+                if recalled_event is not None
+                else tuple(
+                    term
+                    for term in study_terms
+                    if term not in understanding.nonblocking_unknown_terms
+                )
+            )
         if (
-            exchange is not None and exchange.status == "matched"
+            exchange is not None
+            and exchange.status == "matched"
             and foreground_lookup_target is None
         ):
             # A compatible answer closes the conversational gap. Confirming its
@@ -2245,7 +3277,8 @@ class SafeMentionReplyService:
             )
             meaning_plan_surface = (
                 realize_response_meaning(
-                    response_meaning_plan, allow_rough=self._productive_only_replies,
+                    response_meaning_plan,
+                    allow_rough=self._productive_only_replies,
                 )
                 if response_meaning_plan is not None
                 else None
@@ -2546,11 +3579,11 @@ class SafeMentionReplyService:
         )
         structural_weights = (
             await self._arbitration_repository.structural_weights(event.guild_id)
-            if self._arbitration_repository is not None else {}
+            if self._arbitration_repository is not None
+            else {}
         )
         candidates: list[ResponseCandidate] = []
         pending_content: list[tuple[PendingText, dict]] = []
-        selected_message_key: str | None = None
         allowed_clarifications: tuple[str, ...] = ()
         suppressed_precomposed_sources: list[str] = []
         global_required_facts: tuple[str, ...] = ()
@@ -2566,18 +3599,27 @@ class SafeMentionReplyService:
             metadata: dict[str, object] | None = None,
         ) -> None:
             if isinstance(text, PendingText):
-                pending_content.append((text, {
-                    "source": source, "renderer": renderer, "confidence": confidence,
-                    "required_facts": required_facts, "key_points": key_points,
-                    "metadata": dict(metadata or {}),
-                }))
+                pending_content.append(
+                    (
+                        text,
+                        {
+                            "source": source,
+                            "renderer": renderer,
+                            "confidence": confidence,
+                            "required_facts": required_facts,
+                            "key_points": key_points,
+                            "metadata": dict(metadata or {}),
+                        },
+                    )
+                )
                 return
             if not text:
                 return
             # Legacy strings cannot consume the selected meaning's realization
             # budget. Each pending plan already bounds its own surface variants.
-            if (len(candidates) >= self._arbitration_max_total_candidates
-                    and not composer.metadata_for(text)):
+            if len(
+                candidates
+            ) >= self._arbitration_max_total_candidates and not composer.metadata_for(text):
                 return
             candidate_metadata = {**composer.metadata_for(text), **dict(metadata or {})}
             composed = bool(
@@ -2588,14 +3630,33 @@ class SafeMentionReplyService:
                 )
             )
             candidate_metadata["locally_composed"] = composed
+            if (
+                self._productive_only_replies
+                and candidate_metadata.get("semantic_scaffold") is True
+                and candidate_metadata.get("message_plan", {}).get("claim", {}).get("clause_kind")
+                != "question"
+            ):
+                # A semantic scaffold is still a realizable proposition.  It
+                # may be used when no evidence-backed meaning exists, but it
+                # must not make the whole turn disappear in productive mode.
+                # Keep the provenance as a soft arbitration signal instead of
+                # turning it into a hard stop.
+                candidate_metadata["productive_only_rejection"] = (
+                    "semantic_scaffold_without_grounded_evidence"
+                )
             candidate_metadata["allow_rough_surface"] = self._productive_only_replies and composed
             if unrequested_definition(text, prompt, tuple(reference_definitions)):
                 candidate_metadata["hard_rejection"] = "lexical_definition_not_requested"
             locally_realized_semantics = bool(
-                source in _AUTONOMOUS_LOCAL_PRODUCTIVE_SOURCES
-                and candidate_metadata.get("authored_reply_template") is False
-                and candidate_metadata.get("role_order")
-                and candidate_metadata.get("semantic_scaffold") is not True
+                composed
+                and (
+                    candidate_metadata.get("semantic_scaffold") is not True
+                    or (
+                        dialogue_act is not None
+                        and not dialogue_act.complete
+                        and candidate_metadata.get("reader_checked") is True
+                    )
+                )
             )
             if (
                 self._autonomous_planning_required
@@ -2831,10 +3892,7 @@ class SafeMentionReplyService:
                         candidate_metadata["response_signal_mismatch"] = mismatch
                     else:
                         candidate_metadata["hard_rejection"] = mismatch
-            if (
-                self._productive_only_replies
-                and not composed
-            ):
+            if self._productive_only_replies and not composed:
                 rejection = "productive_only:surface_not_productively_realized"
                 candidate_metadata["productive_only_rejection"] = rejection
                 candidate_metadata.setdefault("hard_rejection", rejection)
@@ -2852,53 +3910,100 @@ class SafeMentionReplyService:
                 )
             )
 
-        def select_and_express_content() -> None:
-            nonlocal selected_message_key
-            ordered = sorted(pending_content, key=lambda item: composer.priority(
-                item[0], item[1]["metadata"], item[1]["confidence"],
-            ), reverse=True)
+        def realize_content_candidates() -> None:
+            ordered = sorted(
+                pending_content,
+                key=lambda item: composer.priority(
+                    item[0],
+                    item[1]["metadata"],
+                    item[1]["confidence"],
+                ),
+                reverse=True,
+            )
             pending_content.clear()
-            for index, (request, parameters) in enumerate(ordered):
+            for request, parameters in ordered:
                 if parameters["metadata"].get("hard_rejection"):
                     continue
                 first = len(candidates)
                 # This is the first point where this proposed meaning receives
                 # words. A failed realization advances to the next meaning.
                 for surface in composer.realize(request):
-                    add(surface.text, **{
-                        **parameters,
-                        "confidence": min(parameters["confidence"], surface.confidence),
-                        "renderer": parameters["renderer"].replace("planned", surface.source),
-                        "metadata": {
-                            **{key: surface.text if isinstance(value, PendingText) else value
-                               for key, value in parameters["metadata"].items()},
-                            "role_order": surface.role_order,
-                            "construction_id": surface.construction_id,
+                    add(
+                        surface.text,
+                        **{
+                            **parameters,
+                            "confidence": min(parameters["confidence"], surface.confidence),
+                            "renderer": parameters["renderer"].replace("planned", surface.source),
+                            "metadata": {
+                                **{
+                                    key: surface.text if isinstance(value, PendingText) else value
+                                    for key, value in parameters["metadata"].items()
+                                },
+                                "role_order": surface.role_order,
+                                "construction_id": surface.construction_id,
+                            },
                         },
-                    })
-                check = self._arbitrator.decide(
-                    event_id=event.event_id, prompt=prompt, focus_concepts=(),
-                    candidates=tuple(candidates[first:]), recent_replies=recent_self_replies,
-                    profile=ArbitrationProfile.baseline(event.guild_id),
-                    clarifiable_terms=allowed_clarifications,
+                    )
+                composer.records.append(
+                    {
+                        "status": "content_realized",
+                        "plan_key": request.plan.key,
+                        "candidate_count": len(candidates) - first,
+                    }
                 )
-                if check.winner is not None:
-                    selected_message_key = request.plan.key
-                    composer.records.append({
-                        "status": "content_selected", "plan_key": selected_message_key,
-                        "unrealized_alternatives": len(ordered) - index - 1,
-                    })
-                    break
+                # A successfully worded thought is a candidate, not a command
+                # to discard other meanings. Final arbitration owns selection.
+
+        evidence_planning = plan_from_evidence(evidence_context, analyses)
+        evidence_composer = (
+            ResponseComposer(analyze_structured_utterance(evidence_context.prompt))
+            if resumes_prior_request
+            else composer
+        )
+        await self._trace_step(
+            event.event_id,
+            stage="reasoning",
+            component="evidence_planner",
+            status="derived" if evidence_planning.proposals else "unresolved",
+            summary="response meanings derived from attributed propositions",
+            details={"planning": evidence_planning},
+        )
+        for proposal in evidence_planning.proposals:
+            for surface in evidence_composer.compose(
+                proposal.plan,
+                evidence_context.dependency_patterns,
+            ):
+                add(
+                    surface.text,
+                    source="semantic_reasoning",
+                    renderer=f"evidence_planner:{proposal.operation}",
+                    confidence=proposal.confidence,
+                    key_points=evidence_planning.objective.topics,
+                    metadata={
+                        "authored_reply_template": False,
+                        "role_order": surface.role_order,
+                        "semantic_origin": "derived",
+                        "semantic_frame_fit": 0.96,
+                        "meaning_origin": "derived",
+                        "reasoning_evidence": proposal.plan.claim.evidence,
+                        "premises": proposal.premises,
+                        "derivation": proposal.operation,
+                        "response_move": "answer",
+                        "focused_request": evidence_context.prompt,
+                    },
+                )
 
         premise_inference = (
             infer_from_premises(structured_bundle[0], analyses)
-            if structured_bundle is not None else None
+            if structured_bundle is not None
+            else None
         )
         if premise_inference is not None:
             inference_surface = realize_premise_inference(premise_inference, composer=composer)
             if inference_surface is not None:
                 add(
-                    inference_surface.text, source="semantic_reasoning",
+                    inference_surface.text,
+                    source="semantic_reasoning",
                     renderer=f"premise_chain:{premise_inference.kind}",
                     confidence=inference_surface.confidence,
                     key_points=(premise_inference.target,),
@@ -2907,56 +4012,86 @@ class SafeMentionReplyService:
                         "role_order": inference_surface.role_order,
                         "reasoning_evidence": premise_inference.evidence,
                         "conditional_assumption": premise_inference.assumption is not None,
-                        "response_move": "answer", "semantic_frame_fit": 0.95,
+                        "response_move": "answer",
+                        "semantic_frame_fit": 0.95,
                     },
                 )
             await self._trace_step(
-                event.event_id, stage="inquiry", component="premise_inference",
+                event.event_id,
+                stage="inquiry",
+                component="premise_inference",
                 status="concluded" if inference_surface else "unrealized",
                 summary="lexical premises were connected to a response conclusion",
                 details={"inference": premise_inference, "surface": inference_surface},
             )
         if recalled_event is not None:
             for surface in composer.express(recalled_event, limit=1):
-                add(surface.text, source="semantic_reasoning", renderer="event_slot_recall",
-                    confidence=0.94, metadata={
-                        "authored_reply_template": False, "role_order": surface.role_order,
+                add(
+                    surface.text,
+                    source="semantic_reasoning",
+                    renderer="event_slot_recall",
+                    confidence=0.94,
+                    metadata={
+                        "authored_reply_template": False,
+                        "role_order": surface.role_order,
                         "reasoning_evidence": recalled_event.evidence,
-                        "response_move": "answer", "truth_grounding": 0.94,
-                        "semantic_frame_fit": 0.98, "claim_source": "user_report",
-                    })
-        definition_thought = (
-            ruwordnet_answer_thought(prompt, analyses) or definition_answer_thought(
-                prompt, tuple((item.lemma or item.normalized_form, item.semantic_relations)
-                              for item in analyses),
-            )
+                        "response_move": "answer",
+                        "truth_grounding": 0.94,
+                        "semantic_frame_fit": 0.98,
+                        "claim_source": "user_report",
+                    },
+                )
+        definition_thought = ruwordnet_answer_thought(
+            prompt, analyses
+        ) or definition_answer_thought(
+            prompt,
+            tuple(
+                (item.lemma or item.normalized_form, item.semantic_relations) for item in analyses
+            ),
         )
         if definition_thought is not None:
             for surface in composer.express(definition_thought, limit=1):
-                add(surface.text, source="semantic_thought", renderer="definition_relations",
+                add(
+                    surface.text,
+                    source="semantic_thought",
+                    renderer="definition_relations",
                     confidence=surface.confidence,
-                    metadata={"authored_reply_template": False, "role_order": surface.role_order,
-                              "reasoning_evidence": definition_thought.evidence,
-                              "semantic_frame_fit": 0.96, "truth_grounding": 0.9})
+                    metadata={
+                        "authored_reply_template": False,
+                        "role_order": surface.role_order,
+                        "reasoning_evidence": definition_thought.evidence,
+                        "semantic_frame_fit": 0.96,
+                        "truth_grounding": 0.9,
+                    },
+                )
 
         continuation = utterance.context.assertion_continuation
         await self._trace_step(
-            event.event_id, stage="reasoning", component="assertion_memory",
+            event.event_id,
+            stage="reasoning",
+            component="assertion_memory",
             status="resolved" if continuation is not None else "observed",
             summary="attributed claims and cross-turn links evaluated locally",
             details={
-                "assertions": tuple({
-                    "source_event_id": claim.source_event_id,
-                    "speaker": claim.speaker,
-                    "predicate": claim.thought.predicate.lemma,
-                    "negated": claim.thought.negated,
-                    "temporarily_bounded": claim.temporarily_bounded,
-                    "parsing_confidence": claim.parsing_confidence,
-                } for claim in utterance.context.assertion_memory.assertions),
-                "links": tuple({
-                    "kind": link.kind, "earlier_event_id": link.earlier_event_id,
-                    "later_event_id": link.later_event_id,
-                } for link in utterance.context.assertion_memory.links),
+                "assertions": tuple(
+                    {
+                        "source_event_id": claim.source_event_id,
+                        "speaker": claim.speaker,
+                        "predicate": claim.thought.predicate.lemma,
+                        "negated": claim.thought.negated,
+                        "temporarily_bounded": claim.temporarily_bounded,
+                        "parsing_confidence": claim.parsing_confidence,
+                    }
+                    for claim in utterance.context.assertion_memory.assertions
+                ),
+                "links": tuple(
+                    {
+                        "kind": link.kind,
+                        "earlier_event_id": link.earlier_event_id,
+                        "later_event_id": link.later_event_id,
+                    }
+                    for link in utterance.context.assertion_memory.links
+                ),
                 "continuation_kind": continuation.kind if continuation else None,
                 "feedback_counts": utterance.context.assertion_feedback_counts,
                 "source_event_ids": continuation.source_event_ids if continuation else (),
@@ -2965,7 +4100,8 @@ class SafeMentionReplyService:
         if continuation is not None:
             for surface in composer.express(continuation.thought, limit=1):
                 add(
-                    surface.text, source="dialogue_context",
+                    surface.text,
+                    source="dialogue_context",
                     renderer=f"assertion_memory:{continuation.kind}",
                     confidence=continuation.confidence,
                     metadata={
@@ -3001,17 +4137,30 @@ class SafeMentionReplyService:
         identity_proposition = identity_thought(prompt, event.payload)
         if identity_proposition is not None:
             for surface in composer.express(identity_proposition, limit=1):
-                add(surface.text, source="discord_identity", renderer="identity_proposition",
-                    confidence=0.99, metadata={
-                        "authored_reply_template": False, "role_order": surface.role_order,
-                        "response_move": "answer", "answer_slot": "как",
+                add(
+                    surface.text,
+                    source="discord_identity",
+                    renderer="identity_proposition",
+                    confidence=0.99,
+                    metadata={
+                        "authored_reply_template": False,
+                        "role_order": surface.role_order,
+                        "response_move": "answer",
+                        "answer_slot": "как",
                         "reasoning_evidence": identity_proposition.evidence,
-                        "context_relevance": 1.0, "truth_grounding": 1.0,
+                        "context_relevance": 1.0,
+                        "truth_grounding": 1.0,
                         "semantic_frame_fit": 1.0,
-                    })
+                    },
+                )
         else:
-            add(identity_text, source="discord_identity", renderer="identity_fact",
-                confidence=0.99, key_points=(identity_text,) if identity_text else ())
+            add(
+                identity_text,
+                source="discord_identity",
+                renderer="identity_fact",
+                confidence=0.99,
+                key_points=(identity_text,) if identity_text else (),
+            )
 
         exact_answer = utterance.context.exact_answer
         retrieval_rejection = None
@@ -3061,8 +4210,11 @@ class SafeMentionReplyService:
                 }
             ),
         )
-        if (exact_answer is not None and retrieval_rejection is None
-                and not self._productive_only_replies):
+        if (
+            exact_answer is not None
+            and retrieval_rejection is None
+            and not self._productive_only_replies
+        ):
             global_required_facts = tuple(dict.fromkeys((*global_required_facts, exact_answer)))
 
         add(
@@ -3086,7 +4238,8 @@ class SafeMentionReplyService:
                 else {
                     "semantic_plan": True,
                     "proposition_count": len(response_meaning_plan.propositions)
-                    if response_meaning_plan is not None else 0,
+                    if response_meaning_plan is not None
+                    else 0,
                     "authored_reply_template": False,
                 }
             ),
@@ -3595,22 +4748,30 @@ class SafeMentionReplyService:
             reviewed = prior_claim_review_thought(prompt, utterance.context.consultation_messages)
             if reviewed is not None:
                 acknowledgment, claim = reviewed
-                surfaces = composer.compose(MessagePlan(
-                    composer.goal, acknowledgment,
-                    follow_up=unmet_requirement_thought("review_prior_claim"),
-                ), limit=1)
+                surfaces = composer.compose(
+                    MessagePlan(
+                        composer.goal,
+                        acknowledgment,
+                    ),
+                    limit=1,
+                )
                 if surfaces:
                     add(
-                        surfaces[0].text, source="semantic_reasoning",
-                        renderer="review_own_claim", confidence=0.86,
+                        surfaces[0].text,
+                        source="semantic_reasoning",
+                        renderer="review_own_claim",
+                        confidence=0.86,
                         key_points=tuple(content_lemmas(claim)),
                         metadata={
-                            "reviewed_agent_claim": claim, "claim_source": "dialogue",
+                            "reviewed_agent_claim": claim,
+                            "claim_source": "dialogue",
                             "response_move": "targeted_repair",
                             "reasoning_evidence": acknowledgment.evidence,
                             "role_order": surfaces[0].role_order,
-                            "authored_reply_template": False, "semantic_origin": "derived",
-                            "truth_grounding": 0.9, "semantic_frame_fit": 0.95,
+                            "authored_reply_template": False,
+                            "semantic_origin": "derived",
+                            "truth_grounding": 0.9,
+                            "semantic_frame_fit": 0.95,
                         },
                     )
         add(
@@ -3876,7 +5037,7 @@ class SafeMentionReplyService:
                 for candidate in candidates
             ]
 
-        select_and_express_content()
+        realize_content_candidates()
         has_bound_answer = any(
             candidate.source in _CONVERSATIONAL_REASONING_SOURCES
             and candidate.source_confidence >= self._response_confidence_threshold
@@ -4237,13 +5398,16 @@ class SafeMentionReplyService:
                 action_thought = definition_action_thought(prompt, title, definition)
                 for surface in composer.express(action_thought, limit=1) if action_thought else ():
                     add(
-                        surface.text, source="semantic_synthesis",
-                        renderer="definition_action_roles", confidence=surface.confidence,
+                        surface.text,
+                        source="semantic_synthesis",
+                        renderer="definition_action_roles",
+                        confidence=surface.confidence,
                         metadata={
                             "authored_reply_template": False,
                             "role_order": surface.role_order,
                             "reasoning_evidence": action_thought.evidence,
-                            "response_move": "answer", "answer_slot": answer_slot,
+                            "response_move": "answer",
+                            "answer_slot": answer_slot,
                             "completed_subgoals": ("study", "answer"),
                             "foreground_research": True,
                         },
@@ -4277,7 +5441,8 @@ class SafeMentionReplyService:
                 )
                 add(
                     realize_response_meaning(
-                        consulted_meaning, allow_rough=self._productive_only_replies,
+                        consulted_meaning,
+                        allow_rough=self._productive_only_replies,
                     ),
                     source="semantic_synthesis",
                     renderer="internal_meaning_plan_after_foreground_research",
@@ -4637,27 +5802,29 @@ class SafeMentionReplyService:
                 "productive_only_replies": self._productive_only_replies,
             },
         )
-        select_and_express_content()
+        realize_content_candidates()
         composer.deferred = False
-        if selected_message_key is not None:
-            candidates = [replace(candidate, metadata={
-                **candidate.metadata, "hard_rejection": "outside_selected_message_plan",
-            }) if candidate.metadata.get("message_plan_key") != selected_message_key
-            else candidate for candidate in candidates]
         # Foreground research can identify a definition after an older cached
         # candidate has already been generated. Apply the same boundary to all
         # candidates before arbitration, including legacy and memory surfaces.
         candidates = [
-            replace(candidate, metadata={
-                **candidate.metadata, "hard_rejection": "lexical_definition_not_requested",
-            }) if unrequested_definition(
-                candidate.text, prompt, tuple(reference_definitions)
-            ) else candidate
+            replace(
+                candidate,
+                metadata={
+                    **candidate.metadata,
+                    "hard_rejection": "lexical_definition_not_requested",
+                },
+            )
+            if unrequested_definition(candidate.text, prompt, tuple(reference_definitions))
+            else candidate
             for candidate in candidates
         ]
         await self._trace_step(
-            event.event_id, stage="planning", component="communicative_composition",
-            status="checked", summary="reader goal and thoughts precede wording and role checks",
+            event.event_id,
+            stage="planning",
+            component="communicative_composition",
+            status="checked",
+            summary="reader goal and thoughts precede wording and role checks",
             details={"goal": composer.goal, "attempts": composer.records},
         )
         await self._trace_step(
@@ -4695,7 +5862,11 @@ class SafeMentionReplyService:
             measured_candidates: list[ResponseCandidate] = []
             prompt_has_content = bool(content_lemmas(prompt))
             for candidate, measured in zip(candidates, relevance, strict=True):
-                metadata = {**candidate.metadata, "context_relevance": measured.score}
+                metadata = {
+                    **candidate.metadata,
+                    "lexical_context_relevance": measured.score,
+                    "context_relevance": measured.score,
+                }
                 candidate_words = tuple(_WORD_SURFACE_RE.findall(candidate.text))
                 if (
                     candidate.source == "graph"
@@ -4736,11 +5907,26 @@ class SafeMentionReplyService:
                 if understanding.unknown_terms and not understanding.sufficient
                 else ()
             )
+            # Elliptical and social turns still need a conversational surface
+            # when their primary generators miss.  Keep factual questions on
+            # the stricter evidence threshold so an unsupported answer cannot
+            # sneak in merely because recovery was enabled.
+            recovery_minimum = self._arbitrator.minimum_score
+            if (
+                (self._productive_only_replies or self._autonomous_planning_required)
+                and dialogue_act is not None
+                and (
+                    not dialogue_act.complete
+                    or dialogue_act.response_obligation != "answer_question"
+                )
+            ):
+                recovery_minimum = min(recovery_minimum, 0.25)
             recovery_candidates: list[ResponseCandidate] = []
             gap_plans = (
                 epistemic_gap_candidates_for_question(structured_bundle[0])
                 if (
                     structured_bundle is not None
+                    and not explicit_lexical_lookup
                     and _allows_epistemic_recovery(dialogue_act, structured_bundle[0])
                 )
                 else ()
@@ -4828,9 +6014,7 @@ class SafeMentionReplyService:
                         source_confidence=0.45,
                     )
                 )
-            fallback_decision = ResponseArbitrator(
-                minimum_score=self._arbitrator.minimum_score
-            ).decide(
+            fallback_decision = ResponseArbitrator(minimum_score=recovery_minimum).decide(
                 clarifiable_terms=allowed_clarifications,
                 event_id=event.event_id,
                 prompt=prompt,
@@ -4842,20 +6026,30 @@ class SafeMentionReplyService:
                 used_fallback=True,
             )
             if fallback_decision.winner is None and (
-                self._autonomous_planning_required or self._productive_only_replies
+                self._autonomous_planning_required
+                or self._productive_only_replies
+                or replan
                 or response_requirement(prompt) is not None
             ):
                 semantic_recovery_attempt = fallback_decision
                 required_goal = response_requirement(prompt)
                 repair_thought = (
-                    unmet_requirement_thought(required_goal) if required_goal is not None
-                    else (event_followup_thought(event)
-                          if understanding.referential_unknown_terms else None)
-                    or grounded_repair_thought(
-                        structured_bundle[0], clarifiable_terms=allowed_clarifications,
+                    unmet_requirement_thought(required_goal)
+                    if required_goal is not None
+                    else (
+                        event_followup_thought(event)
+                        if understanding.referential_unknown_terms
+                        else None
                     )
-                    if structured_bundle is not None else None
+                    or grounded_repair_thought(
+                        structured_bundle[0],
+                        clarifiable_terms=allowed_clarifications,
+                    )
+                    if structured_bundle is not None
+                    else None
                 )
+                if explicit_lexical_lookup:
+                    repair_thought = None
                 grounded_repair_candidates = tuple(
                     ResponseCandidate.create(
                         event_id=event.event_id,
@@ -4867,7 +6061,11 @@ class SafeMentionReplyService:
                         metadata={
                             "semantic_recovery": True,
                             "unresolved_requirement": required_goal,
-                            "gap_kind": "contextual_clarification",
+                            "gap_kind": (
+                                "answer_gap"
+                                if "answer_not_derived" in repair_thought.evidence
+                                else "contextual_clarification"
+                            ),
                             "reasoning_evidence": repair_thought.evidence,
                             "context_relevance": 0.95,
                             "truth_grounding": 1.0,
@@ -4879,14 +6077,13 @@ class SafeMentionReplyService:
                     )
                     for surface_index, surface in enumerate(
                         composer.express(repair_thought, limit=1)
-                        if repair_thought is not None else ()
+                        if repair_thought is not None
+                        else ()
                     )
                 )
                 fallback_decision = merge_recovery_decision(
                     semantic_recovery_attempt,
-                    ResponseArbitrator(
-                        minimum_score=self._arbitrator.minimum_score
-                    ).decide(
+                    ResponseArbitrator(minimum_score=recovery_minimum).decide(
                         clarifiable_terms=allowed_clarifications,
                         event_id=event.event_id,
                         prompt=prompt,
@@ -4910,8 +6107,13 @@ class SafeMentionReplyService:
             answer_evidence: tuple[str, ...] = ()
             if winner is not None and not winner.metadata.get("unresolved_requirement"):
                 if winner.source in {
-                    "semantic_thought", "semantic_reasoning", "discord_identity",
-                    "dialogue_context", "personal_action", "runtime_state", "relation_reasoning",
+                    "semantic_thought",
+                    "semantic_reasoning",
+                    "discord_identity",
+                    "dialogue_context",
+                    "personal_action",
+                    "runtime_state",
+                    "relation_reasoning",
                     "causal_reasoning",
                 }:
                     answer_evidence = tuple(winner.metadata.get("reasoning_evidence", ()))
@@ -4919,7 +6121,9 @@ class SafeMentionReplyService:
                     answer_evidence = tuple(f.text for f in winner.required_facts)
             completed_task = task.with_answer_evidence(answer_evidence)
             await self._trace_step(
-                event.event_id, stage="reasoning", component="comprehension_task_result",
+                event.event_id,
+                stage="reasoning",
+                component="comprehension_task_result",
                 status="resolved" if completed_task.answer_ready else "unresolved",
                 summary="answer readiness requires applicable evidence, not familiar vocabulary",
                 details={
@@ -5076,14 +6280,18 @@ class SafeMentionReplyService:
             metadata.get("unresolved_reference")
             or response_move in {"clarify_reference", "clarify_intended_meaning"}
         )
-        if response_obligation in {
-            "answer_question",
-            "repair_previous_answer",
-            "repair_understanding",
-            "address_negative_evaluation",
-            "resolve_relation",
-            "resolve_self_state",
-        } and not genuine_clarification:
+        if (
+            response_obligation
+            in {
+                "answer_question",
+                "repair_previous_answer",
+                "repair_understanding",
+                "address_negative_evaluation",
+                "resolve_relation",
+                "resolve_self_state",
+            }
+            and not genuine_clarification
+        ):
             return "question_does_not_fulfill_answer_or_repair"
         if any(_QUESTION_OBJECTION_RE.search(message) for message in dialogue_messages[-8:]):
             return "question_loop_after_user_objection"
@@ -5156,8 +6364,11 @@ class SafeMentionReplyService:
         ):
             return "broken_fragment"
         coherence = evaluate_surface(text)
-        issues = tuple(issue for issue in coherence.hard_issues
-                       if not (allow_rough and issue in COMPOSED_SURFACE_SOFT_ISSUES))
+        issues = tuple(
+            issue
+            for issue in coherence.hard_issues
+            if not (allow_rough and issue in COMPOSED_SURFACE_SOFT_ISSUES)
+        )
         if issues:
             return issues[0]
         return None
@@ -5171,15 +6382,26 @@ class SafeMentionReplyService:
     ) -> tuple[WordAnalysis, ...]:
         """Resolve missing meanings before composing the answer, without asking a speaker."""
 
-        if (self._russian_reference is None or is_contact_request(prompt)
-                or is_identity_question(prompt)):
+        if (
+            self._russian_reference is None
+            or is_contact_request(prompt)
+            or is_identity_question(prompt)
+        ):
             return analyses
         unknown_by_term = {
             item.lemma or item.normalized_form: item
             for item in analyses
             if not item.has_usable_meaning
-            if item.requires_lexical_study or item.part_of_speech in {
-                "NOUN", "VERB", "INFN", "ADJF", "noun", "verb", "adjective",
+            if item.requires_lexical_study
+            or item.part_of_speech
+            in {
+                "NOUN",
+                "VERB",
+                "INFN",
+                "ADJF",
+                "noun",
+                "verb",
+                "adjective",
             }
             if (item.lemma or item.normalized_form) not in understanding.nonblocking_unknown_terms
             if understanding.task is None
@@ -5243,7 +6465,10 @@ class SafeMentionReplyService:
         return analyses
 
     async def _defer_pending_research(
-        self, event: Event, prompt: str, context_messages: tuple[str, ...] = (),
+        self,
+        event: Event,
+        prompt: str,
+        context_messages: tuple[str, ...] = (),
         resolved_bindings: tuple[tuple[str, str], ...] = (),
     ) -> tuple[str, ...]:
         reference = self._russian_reference
@@ -5254,20 +6479,35 @@ class SafeMentionReplyService:
         understanding = understand_utterance(
             prompt, analyses, context_messages, resolved_bindings=resolved_bindings
         )
-        terms = tuple(dict.fromkeys(
-            item.lemma or item.normalized_form for item in analyses
-            if not item.has_usable_meaning
-            if (item.lemma or item.normalized_form) not in understanding.nonblocking_unknown_terms
-            if item.requires_lexical_study or item.part_of_speech in {
-                "NOUN", "VERB", "INFN", "ADJF", "noun", "verb", "adjective",
-            }
-            if understanding.task is None or (item.lemma or item.normalized_form)
-            in understanding.task.lookup_terms
-        ))
+        terms = tuple(
+            dict.fromkeys(
+                item.lemma or item.normalized_form
+                for item in analyses
+                if not item.has_usable_meaning
+                if (item.lemma or item.normalized_form)
+                not in understanding.nonblocking_unknown_terms
+                if item.requires_lexical_study
+                or item.part_of_speech
+                in {
+                    "NOUN",
+                    "VERB",
+                    "INFN",
+                    "ADJF",
+                    "noun",
+                    "verb",
+                    "adjective",
+                }
+                if understanding.task is None
+                or (item.lemma or item.normalized_form) in understanding.task.lookup_terms
+            )
+        )
         delay = await retry_delay(terms) if terms and retry_delay is not None else None
         if delay is not None:
             await self._trace_step(
-                event.event_id, stage="research", component="russian_reference", status="waiting",
+                event.event_id,
+                stage="research",
+                component="russian_reference",
+                status="waiting",
                 summary="reply awaits reference lookup; delivery will resume the original event",
                 details={"terms": terms, "retry_after": delay},
             )
@@ -5358,8 +6598,12 @@ class SafeMentionReplyService:
                     )
                 )
         reference_target = lexical_lookup_target(prompt)
-        if (not facts and not is_social_routine(prompt) and self._knowledge_service is not None
-                and (understanding.task is None or understanding.task.research_allowed)):
+        if (
+            not facts
+            and not is_social_routine(prompt)
+            and self._knowledge_service is not None
+            and (understanding.task is None or understanding.task.research_allowed)
+        ):
             query = self._recovery_query(analyses, prompt, understanding)
             if query:
                 facts = await self._knowledge_service.investigate(event, query)
@@ -5744,7 +6988,7 @@ class SafeMentionReplyService:
         return None
 
     async def _failure_reply(self, event: Event) -> PreparedReply | None:
-        if self._productive_only_replies:
+        if self._meaning_first_replies or self._productive_only_replies:
             return await self._withhold_non_productive_failure(
                 event,
                 "fixed_failure_surface_disabled",
@@ -5907,9 +7151,7 @@ class SafeMentionReplyService:
             _one_line(text),
         )
 
-    async def _knowledge_context(
-        self, event: Event, prompt: str
-    ) -> KnowledgeGrounding:
+    async def _knowledge_context(self, event: Event, prompt: str) -> KnowledgeGrounding:
         if self._knowledge_service is None:
             return KnowledgeGrounding()
         evidence_for_event = getattr(self._knowledge_service, "grounding_evidence_for_event", None)

@@ -7,24 +7,39 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from math import inf
 
+from debilgi.cognition.dialogue_tasks import contact_response_binding
+from debilgi.language.clarification_policy import is_contact_request
+from debilgi.language.communication import reader_goal
 from debilgi.language.content import content_lemmas
 from debilgi.language.grammar import SoftGrammar, role
+from debilgi.language.lexical_matching import same_lexical_family
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
 from debilgi.language.planning import UtterancePlan
+from debilgi.language.structured_utterance import analyze_structured_utterance
 from debilgi.language.surface_coherence import evaluate_surface
 from debilgi.language.surface_policy import internal_surface_reason
 from debilgi.language.tokenizer import tokenize
 from debilgi.language.usage_learning import UsageGuidance
+from debilgi.language.word_relations import (
+    WordRelation,
+    grammatical_tokens,
+    relation_coherence,
+    relation_fit,
+)
 from debilgi.social.models import PrimitiveVector
 from debilgi.social.signals import reaction_affinity
 
 _END = "\0end"
+_START = "\0start"
 _BLOCKED_TOKENS = {"<user>", "<role>", "<channel>", "<url>"}
 _NO_SPACE_BEFORE = frozenset(",.!?:;)]}»…")
 _NO_SPACE_AFTER = frozenset("([{«")
 _SENTENCE_END = {".", "!", "?", "…"}
 _OPENING_DELIMITERS = {"(": ")", "[": "]", "{": "}", "«": "»", "“": "”", "„": "“"}
 _CLOSING_DELIMITERS = frozenset(_OPENING_DELIMITERS.values())
+_COGNITIVE_STATE_ACTIONS = frozenset(
+    {"понимать", "знать", "разбирать", "распознавать", "схватывать"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +69,19 @@ class GeneratedUtterance:
     text: str
     variant: int
     renderer: str = "memory_graph"
+
+
+@dataclass(frozen=True, slots=True)
+class LearnedUtterance:
+    text: str
+    score: float
+    variant: int
+    source_event_ids: tuple[str, ...]
+    relation_support: float = 0.0
+    relation_conflicts: int = 0
+    topicality: float = 0.0
+    unresolved_reaction: bool = False
+    cognitive_predicate: str | None = None
 
 
 class MemoryPhraseGenerator:
@@ -86,6 +114,622 @@ class MemoryPhraseGenerator:
             generated.append(GeneratedUtterance(text, variant))
         return tuple(generated)
 
+    def generate_explorations(
+        self, plan: UtterancePlan, *, recent_replies: tuple[str, ...] = (), limit: int = 12
+    ) -> tuple[LearnedUtterance, ...]:
+        """Construct language from observed transitions even with an incomplete parse.
+
+        This is a statistical search over the bot's own corpus, not a bank of
+        authored replies. Grammar and repetition affect ranking; input copies
+        are excluded, including cosmetic changes of word order or perspective.
+        The result is explicitly an exploration, never a verified proposition.
+        """
+        context = plan.context
+        documents = tuple(
+            dict.fromkeys(
+                (
+                    *(report.answer_text for report in context.dialogue_reports),
+                    *(text for _, text in context.corpus_utterances),
+                    *(
+                        text.partition(": ")[2]
+                        for text in context.consultation_messages
+                        if text.startswith("user: ")
+                    ),
+                )
+            )
+        )
+        documents = tuple(text for text in documents if internal_surface_reason(text) is None)
+        if context.response_options:
+            # Search only the domain supplied by the human, for any vocabulary.
+            # Counts are a provisional choice, never evidence of truth or desire.
+            terms = set(content_lemmas(context.prompt))
+            connected = tuple(
+                (source_id, text)
+                for source_id, text in context.corpus_utterances
+                if not terms or terms.intersection(content_lemmas(text))
+            )
+            ranked = []
+            for option in context.response_options:
+                lemma = DEFAULT_MORPHOLOGY.lemma(option)
+                source_ids = tuple(
+                    source_id
+                    for source_id, text in connected
+                    if lemma in {DEFAULT_MORPHOLOGY.lemma(word) for word in tokenize(text)}
+                )
+                count = sum(count for gram, count in context.generation_ngrams if option in gram)
+                digest = hashlib.sha256(f"{context.prompt}|{option}".encode()).hexdigest()[:8]
+                tie = int(digest, 16) / 2**32
+                ranked.append(
+                    LearnedUtterance(
+                        option[:1].upper() + option[1:],
+                        len(source_ids) + count * 0.01 + tie * 0.001,
+                        0,
+                        source_ids,
+                    )
+                )
+            # The statistical rank decides; sentence-length scoring cannot
+            # invent another answer or turn a binary choice into a question.
+            return (max(ranked, key=lambda item: item.score),)
+        prompt = self._usable_tokens(grammatical_tokens(context.prompt, human_perspective=True))
+        prompt_terms = set(content_lemmas(prompt))
+        contact_request = is_contact_request(context.prompt)
+        active_task = (
+            context.dialogue_situation.active_task
+            if context.dialogue_situation is not None
+            else None
+        )
+        open_generation = bool(
+            active_task is not None
+            and active_task.goal == "satisfy_directive"
+            and any(
+                value.endswith(("-нибудь", "-то", "-либо"))
+                for _, value in active_task.objective.required_roles
+            )
+        )
+        unresolved_input_recovery = bool(
+            active_task is not None
+            and active_task.goal == "respond_relevantly"
+        )
+        stored = context.generation_ngrams or (() if documents else context.memory_ngrams)
+        observed_terms = {lemma for text in documents[:96] for lemma in content_lemmas(text)}
+        observed_terms.update(lemma for gram, _ in stored for lemma in content_lemmas(gram))
+        prompt_signal_terms = prompt_terms or {
+            DEFAULT_MORPHOLOGY.lemma(token)
+            for token in prompt
+            if self._is_word(token)
+        }
+        unresolved_terms = {
+            term
+            for term in prompt_signal_terms
+            if not any(same_lexical_family(term, observed) for observed in observed_terms)
+        }
+        anchors = prompt_terms | {
+            lemma
+            for lemma in observed_terms
+            if any(same_lexical_family(lemma, term) for term in prompt_terms)
+        }
+        # A technical memory summary is not observed speech. Select complete
+        # human sentences connected to the current words before building a model.
+        all_sources = tuple(
+            sentence
+            for text in documents[:96]
+            for sentence in self._sentences(
+                self._usable_tokens(grammatical_tokens(text, human_perspective=True))
+            )
+        )
+        topical_sources = tuple(
+            sentence
+            for sentence in all_sources
+            if not prompt_terms or anchors.intersection(content_lemmas(sentence))
+        )
+        relation_neighbors = {
+            lemma
+            for link in context.word_relations
+            if {link.governor, link.dependent}.intersection(anchors)
+            for lemma in (link.governor, link.dependent)
+        }
+        topical_neighbors = {
+            lemma
+            for source in topical_sources
+            for lemma in content_lemmas(source)
+            if lemma not in anchors
+        }
+        connected_sources = tuple(
+            source
+            for source in all_sources
+            if (anchors | relation_neighbors | topical_neighbors).intersection(
+                content_lemmas(source)
+            )
+        )
+        # A lexical walk must remain in the current connected component. The
+        # previous backoff appended every sentence in the channel; that let a
+        # mention of one word jump into an unrelated article or old argument.
+        # Contact calls have no propositional topic, so they may inspect the
+        # conversational corpus but still face the task-binding gate below.
+        sources = tuple(
+            dict.fromkeys(
+                connected_sources
+                or (
+                    all_sources
+                    if contact_request or open_generation or not prompt_terms
+                    else ()
+                )
+            )
+        )[:64]
+        if contact_request:
+            contact_surfaces = self._contact_explorations(
+                context.word_relations,
+                sources,
+                context.seed,
+                recent_replies,
+                context.affect_features,
+                limit,
+            )
+            if contact_surfaces:
+                return contact_surfaces
+        vocabulary = set(prompt).union(*(set(source) for source in sources))
+        related_terms = anchors | {
+            lemma
+            for gram, _ in stored
+            if anchors.intersection(content_lemmas(gram))
+            for lemma in content_lemmas(gram)
+        }
+        related_terms.update(
+            lemma
+            for link in context.word_relations
+            if {link.governor, link.dependent}.intersection(anchors)
+            for lemma in (link.governor, link.dependent)
+        )
+        # Once a topic is known, disjoint learned walks cannot introduce an
+        # unrelated subject merely because it was frequent in the old archive.
+        stored = tuple(
+            (gram, count)
+            for gram, count in stored
+            if not prompt_terms
+            or open_generation
+            or all(
+                token in vocabulary
+                or token in {_START, _END}
+                or role(token)
+                in {"pronoun", "preposition", "conjunction", "particle", "question", "punctuation"}
+                or DEFAULT_MORPHOLOGY.lemma(token) in related_terms
+                for token in gram
+            )
+        )
+        model_sources = (*sources, *((prompt,) if prompt else ()))
+        model = self._build_model(
+            model_sources,
+            stored,
+            (),
+            sentence_starts_only=True,
+        )
+        profile = self._profile(plan)
+        goal = reader_goal(analyze_structured_utterance(context.prompt))
+        prompt_words = tuple(token for token in prompt if self._is_word(token))
+        recent_tokens = tuple(tokenize(text) for text in recent_replies)
+        ranked: dict[str, tuple[float, int]] = {}
+        prefixes = tuple(
+            dict.fromkeys(
+                source[index : index + 1]
+                for source in model_sources
+                for index in [
+                    next(
+                        (
+                            i
+                            for i, token in enumerate(source)
+                            if DEFAULT_MORPHOLOGY.lemma(token) in anchors
+                        ),
+                        0,
+                    )
+                ]
+            )
+        )
+        attempts = max(32, min(128, profile.candidate_count * 2)) if sources or stored else 0
+        for variant in range(attempts):
+            candidate = self._exploration_candidate(
+                model,
+                context.word_relations,
+                f"{context.seed}|explore:{variant}",
+                prefix=prefixes[(variant // 2) % len(prefixes)]
+                if prefixes and variant % 2 == 0
+                else (),
+            )
+            if not candidate:
+                continue
+            if any(self._is_source_copy(candidate, source) for source in sources):
+                continue
+            candidate = grammatical_tokens(self._detokenize(candidate), prune_unbound=True)
+            if not candidate:
+                continue
+            if any(self._is_source_copy(candidate, source) for source in sources):
+                continue
+            question = (
+                role(next((token for token in candidate if self._is_word(token)), "")) == "question"
+            )
+            if question:
+                candidate = (
+                    (*candidate[:-1], "?") if candidate[-1] in _SENTENCE_END else (*candidate, "?")
+                )
+            elif candidate[-1] not in _SENTENCE_END:
+                candidate = (*candidate, ".")
+            text = self._truncate_complete(self._detokenize(candidate), self.max_output_chars)
+            if not text or internal_surface_reason(text) is not None:
+                continue
+            text = text[:1].upper() + text[1:]
+            from debilgi.language.copying import is_input_copy
+
+            if is_input_copy(text, context.prompt):
+                continue
+            terms = set(content_lemmas(candidate))
+            topicality = min(1.0, len(terms & anchors) / max(1, len(prompt_terms)))
+            surface = evaluate_surface(text)
+            morphology = DEFAULT_MORPHOLOGY.analyze_sentence(text)
+            relation = relation_coherence(text, context.word_relations)
+            if surface.hard_issues or surface.sentence_completeness < 0.72:
+                continue
+            if relation.conflicts:
+                continue
+            if (
+                prompt_terms
+                and not contact_request
+                and not open_generation
+                and not terms.intersection(anchors)
+            ):
+                continue
+            contact_binding = (
+                contact_response_binding(text) if contact_request else 0.0
+            )
+            if contact_request and contact_binding < 0.80:
+                continue
+            actual_structure = analyze_structured_utterance(text)
+            actual = reader_goal(actual_structure)
+            unbound_arguments = sum(
+                token.semantic_role == "unassigned_content"
+                and token.part_of_speech in {"noun", "pronoun", "verb"}
+                and dict(token.grammatical_features).get("case") != "genitive"
+                for token in actual_structure.tokens
+            )
+            actual_subjects = set(actual.subject)
+            for clause in actual_structure.clauses:
+                if clause.subject_indices or clause.predicate_index is None:
+                    continue
+                features = dict(
+                    actual_structure.tokens[clause.predicate_index].grammatical_features
+                )
+                inferred = {
+                    ("first", "singular"): "я",
+                    ("first", "plural"): "мы",
+                    ("second", "singular"): "ты",
+                    ("second", "plural"): "вы",
+                }.get((features.get("person"), features.get("number")))
+                if inferred:
+                    actual_subjects.add(inferred)
+            expected_subjects = {lemma for name, lemma in goal.known_roles if name == "subject"}
+            subject_shift = bool(
+                expected_subjects
+                and actual_subjects
+                and not expected_subjects.intersection(actual_subjects)
+            )
+            repetition = max(
+                (self._sequence_similarity(candidate, prior) for prior in recent_tokens),
+                default=0.0,
+            )
+            score = (
+                self._score(
+                    candidate,
+                    prompt,
+                    sources,
+                    (),
+                    model,
+                    profile,
+                    plan.speech_act,
+                    context.usage_hints,
+                    context.learned_syntax_patterns,
+                    context.expected_response_acts,
+                )
+                + topicality * 3.0
+                - 8.0 * bool(prompt_terms and not terms.intersection(anchors))
+                + surface.score
+                + morphology.agreement_score * 1.5
+                + relation_fit(text, context.word_relations) * 2.0
+                + relation.score * 1.5
+                + contact_binding * 3.0
+                - len(surface.hard_issues) * 1.5
+                - len(morphology.issues) * 0.75
+                - subject_shift * 6.0
+                - unbound_arguments * 2.5
+                - repetition * 2.0
+                - 4.0
+                * (
+                    bool(prompt_words)
+                    and tuple(token for token in candidate if self._is_word(token)) == prompt_words
+                )
+            )
+            previous = ranked.get(text)
+            if previous is None or previous[0] < score:
+                ranked[text] = (score, variant)
+        has_bound_ranked = bool(
+            prompt_terms
+            and any(
+                set(content_lemmas(text)).intersection(anchors)
+                for text in ranked
+            )
+        )
+        if (
+            unresolved_input_recovery
+            and not contact_request
+            and unresolved_terms
+            and not has_bound_ranked
+        ):
+            unresolved_surfaces = self._unresolved_explorations(
+                context.word_relations,
+                all_sources,
+                context.seed,
+                recent_replies,
+                context.affect_features,
+                limit,
+            )
+            if unresolved_surfaces:
+                return unresolved_surfaces
+        if not ranked:
+            # The bootstrap uses no authored words or fictional knowledge.
+            # No lexical evidence is available for a new utterance. Punctuation
+            # expresses an inquiry without disguising input as a new answer.
+            ranked["?"] = (0.0, 0)
+        result = sorted(ranked.items(), key=lambda item: (item[1][0], item[0]), reverse=True)
+        return tuple(
+            LearnedUtterance(
+                text,
+                score,
+                variant,
+                tuple(
+                    event_id
+                    for event_id, source in context.corpus_utterances
+                    if set(tokenize(source)) & set(tokenize(text))
+                ),
+                relation_support=relation_coherence(text, context.word_relations).score,
+                relation_conflicts=relation_coherence(text, context.word_relations).conflicts,
+                topicality=min(
+                    1.0,
+                    len(set(content_lemmas(text)) & anchors) / max(1, len(prompt_terms)),
+                ),
+            )
+            for text, (score, variant) in result[: max(1, min(24, limit))]
+        )
+
+    def _contact_explorations(
+        self,
+        relations: tuple[WordRelation, ...],
+        sources: tuple[tuple[str, ...], ...],
+        seed: str,
+        recent_replies: tuple[str, ...],
+        affect_features: tuple[tuple[str, float], ...],
+        limit: int,
+    ) -> tuple[LearnedUtterance, ...]:
+        """Realize a contact intention from learned predicates, not reply text.
+
+        The relation DB supplies the available actions and their observed
+        subject role. Morphology supplies a first-person form. No remembered
+        sentence is selected, and an accidentally identical source surface is
+        still rejected by the ordinary copy guard.
+        """
+
+        counts: Counter[str] = Counter()
+        for link in relations:
+            if link.relation != "nsubj" or link.dependent not in {"я", "мы"}:
+                continue
+            counts[link.governor] += link.count
+        if not counts:
+            return ()
+
+        affect = dict(affect_features)
+        arousal = affect.get("emotion_arousal", 0.0)
+        affiliation = affect.get("emotion_affiliation", 0.0)
+        candidates: list[tuple[float, str]] = []
+        seen = set()
+        for lemma, count in counts.items():
+            form = DEFAULT_MORPHOLOGY.inflect(
+                lemma,
+                person="first",
+                number="singular",
+                tense="present",
+            )
+            if not form:
+                continue
+            for explicit_subject, raw in (
+                (False, f"{form}."),
+                (True, f"Я {form}."),
+            ):
+                text = raw[:1].upper() + raw[1:]
+                key = " ".join(text.casefold().split())
+                if key in seen or contact_response_binding(text) < 0.80:
+                    continue
+                tokens = tokenize(text)
+                if any(self._is_source_copy(tokens, source) for source in sources):
+                    continue
+                if any(
+                    self._sequence_similarity(tokens, tokenize(prior)) >= 0.72
+                    for prior in recent_replies
+                ):
+                    continue
+                seen.add(key)
+                tie = self._number(f"{seed}|contact:{lemma}:{explicit_subject}") / 2**64
+                # Affect changes preference among learned actions; it never
+                # supplies a word or turns a relation into a factual claim.
+                score = (
+                    float(count)
+                    + tie * 0.25
+                    + arousal * (0.10 if lemma in {"ответить", "сказать"} else 0.03)
+                    + affiliation * (
+                        0.12 if lemma in {"слушать", "слышать", "понимать"} else 0.02
+                    )
+                    - (0.04 if explicit_subject else 0.0)
+                )
+                candidates.append((score, text))
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return tuple(
+            LearnedUtterance(
+                text,
+                score,
+                variant,
+                (),
+                relation_support=relation_coherence(text, relations).score,
+                relation_conflicts=relation_coherence(text, relations).conflicts,
+                topicality=1.0,
+            )
+            for variant, (score, text) in enumerate(
+                candidates[: max(1, min(24, limit))]
+            )
+        )
+
+    def _unresolved_explorations(
+        self,
+        relations: tuple[WordRelation, ...],
+        sources: tuple[tuple[str, ...], ...],
+        seed: str,
+        recent_replies: tuple[str, ...],
+        affect_features: tuple[tuple[str, float], ...],
+        limit: int,
+    ) -> tuple[LearnedUtterance, ...]:
+        """Express a failed interpretation through a learned cognitive state.
+
+        The memory supplies the predicate and proof that the agent has used it
+        with a first-person subject. Negation is the result of the failed
+        semantic lookup in the current turn. No stored reply is selected.
+        """
+
+        counts: Counter[str] = Counter()
+        for link in relations:
+            if (
+                link.relation == "nsubj"
+                and link.dependent in {"я", "мы"}
+                and link.governor in _COGNITIVE_STATE_ACTIONS
+            ):
+                counts[link.governor] += link.count
+        if not counts:
+            return ()
+
+        affect = dict(affect_features)
+        arousal = affect.get("emotion_arousal", 0.0)
+        confidence = affect.get("emotion_confidence", 0.0)
+        candidates: list[tuple[float, str, str]] = []
+        for lemma, count in counts.items():
+            form = DEFAULT_MORPHOLOGY.inflect(
+                lemma,
+                person="first",
+                number="singular",
+                tense="present",
+            )
+            if not form:
+                continue
+            text = f"Я не {form}."
+            tokens = tokenize(text)
+            if any(self._is_source_copy(tokens, source) for source in sources):
+                continue
+            tie = self._number(f"{seed}|unresolved:{lemma}") / 2**64
+            semantic_preference = {
+                "понимать": 0.30,
+                "разбирать": 0.22,
+                "распознавать": 0.18,
+                "знать": 0.12,
+                "схватывать": 0.08,
+            }.get(lemma, 0.0)
+            repetition = max(
+                (
+                    self._sequence_similarity(tokens, tokenize(prior))
+                    for prior in recent_replies
+                ),
+                default=0.0,
+            )
+            score = (
+                float(count)
+                + semantic_preference
+                + tie * 0.20
+                + confidence * 0.08
+                - arousal * 0.03
+                - repetition * 0.45
+            )
+            candidates.append((score, text, lemma))
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return tuple(
+            LearnedUtterance(
+                text,
+                score,
+                variant,
+                (),
+                relation_support=relation_coherence(text, relations).score,
+                relation_conflicts=relation_coherence(text, relations).conflicts,
+                topicality=0.0,
+                unresolved_reaction=True,
+                cognitive_predicate=lemma,
+            )
+            for variant, (score, text, lemma) in enumerate(
+                candidates[: max(1, min(24, limit))]
+            )
+        )
+
+    @staticmethod
+    def _sentences(tokens: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+        sentences = []
+        start = 0
+        for index, token in enumerate(tokens):
+            if token in _SENTENCE_END:
+                if any(MemoryPhraseGenerator._is_word(item) for item in tokens[start : index + 1]):
+                    sentences.append(tokens[start : index + 1])
+                start = index + 1
+        if any(MemoryPhraseGenerator._is_word(item) for item in tokens[start:]):
+            sentences.append(tokens[start:])
+        return tuple(sentences)
+
+    def _exploration_candidate(
+        self,
+        model: _LanguageModel,
+        relations: tuple[WordRelation, ...],
+        seed: str,
+        *,
+        prefix: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        if not model.starts:
+            return ()
+        output = (
+            list(prefix)
+            if prefix
+            else [self._weighted_pick(model.grammar.reweight(model.starts, ()), f"{seed}:start")]
+        )
+        while len(output) < self.max_output_tokens:
+            available = tuple(
+                model.transitions[tuple(output[-size:])]
+                for size in range(min(3, len(output)), 0, -1)
+                if tuple(output[-size:]) in model.transitions
+            )
+            if not available:
+                break
+            # Always taking the longest observed n-gram walks an old sentence
+            # from start to finish.  Varying the history order lets separate
+            # learned paths meet at shared words, which is where an actually
+            # new sentence can emerge.  All choices still come from observed
+            # transitions and remain deterministic for the event seed.
+            options = available[
+                self._number(f"{seed}:history:{len(output)}") % len(available)
+            ]
+            weighted = model.grammar.reweight(options, tuple(output))
+            governors = {DEFAULT_MORPHOLOGY.lemma(token) for token in output[-3:]}
+            partners = {link.dependent for link in relations if link.governor in governors}
+            for token in weighted:
+                if DEFAULT_MORPHOLOGY.lemma(token) in partners:
+                    weighted[token] *= 1.5
+            following = self._weighted_pick(weighted, f"{seed}:{len(output)}")
+            if following in {_END, _START}:
+                break
+            if len(output) >= 2 and output[-1] == output[-2] == following:
+                break
+            output.append(following)
+            # There is no minimum sentence length: reaching a boundary ends
+            # the thought, even when the personality prefers a long response.
+            if following in _SENTENCE_END:
+                break
+        return tuple(output)
+
     def generate(self, plan: UtterancePlan) -> str:
         context = plan.context
         if context.exact_answer:
@@ -100,21 +744,17 @@ class MemoryPhraseGenerator:
             return ""
         relevant_terms = set(content_lemmas(prompt_tokens))
         relevant_terms.update(
-            lemma
-            for message in (*retrieved, *knowledge)
-            for lemma in content_lemmas(message)
+            lemma for message in (*retrieved, *knowledge) for lemma in content_lemmas(message)
         )
         stored_ngrams = tuple(
             item
             for item in context.memory_ngrams
-            if len(relevant_terms) >= 2
-            and relevant_terms.intersection(content_lemmas(item[0]))
+            if len(relevant_terms) >= 2 and relevant_terms.intersection(content_lemmas(item[0]))
         )
         experience_transitions = tuple(
             item
             for item in context.experience_transitions
-            if len(relevant_terms) >= 2
-            and relevant_terms.intersection(content_lemmas(item[0]))
+            if len(relevant_terms) >= 2 and relevant_terms.intersection(content_lemmas(item[0]))
         )
         tokenized = tuple(
             tokens
@@ -150,21 +790,18 @@ class MemoryPhraseGenerator:
             source_surface = evaluate_surface(source_preview)
             if source_surface.hard_issues or source_surface.score < 0.72:
                 continue
-            candidates[source] = (
-                self._score(
-                    source,
-                    prompt_tokens,
-                    source_tokens,
-                    knowledge_tokens,
-                    model,
-                    profile,
-                    plan.speech_act,
-                    context.usage_hints,
-                    context.learned_syntax_patterns,
-                    context.expected_response_acts,
-                )
-                + max(0.15, 0.75 - source_index * 0.20)
-            )
+            candidates[source] = self._score(
+                source,
+                prompt_tokens,
+                source_tokens,
+                knowledge_tokens,
+                model,
+                profile,
+                plan.speech_act,
+                context.usage_hints,
+                context.learned_syntax_patterns,
+                context.expected_response_acts,
+            ) + max(0.15, 0.75 - source_index * 0.20)
         if plan.speech_act != "clarifying_question":
             prompt_words = set(content_lemmas(context.prompt))
             maximum = min(plan.max_tokens, self.max_output_tokens)
@@ -324,6 +961,8 @@ class MemoryPhraseGenerator:
         messages: tuple[tuple[str, ...], ...],
         stored_ngrams: tuple[tuple[tuple[str, ...], int], ...],
         experience_transitions: tuple[tuple[tuple[str, ...], float], ...],
+        *,
+        sentence_starts_only: bool = False,
     ) -> _LanguageModel:
         starts: Counter[str] = Counter()
         transitions: dict[tuple[str, ...], Counter[str]] = defaultdict(Counter)
@@ -343,7 +982,10 @@ class MemoryPhraseGenerator:
             usable = cls._usable_tokens(gram)
             if len(usable) < 2 or count <= 0:
                 continue
-            if cls._is_word(usable[0]):
+            if usable[0] == _START:
+                starts[usable[1]] += count
+                continue
+            if not sentence_starts_only and cls._is_word(usable[0]):
                 starts[usable[0]] += count
             vocabulary.update(usable)
             transitions[usable[:-1]][usable[-1]] += count
@@ -408,9 +1050,7 @@ class MemoryPhraseGenerator:
         words = tuple(token for token in candidate if cls._is_word(token))
         unique = set(content_lemmas(candidate))
         prompt_words = set(content_lemmas(prompt))
-        source_words = {
-            lemma for source in sources[:8] for lemma in content_lemmas(source)
-        }
+        source_words = {lemma for source in sources[:8] for lemma in content_lemmas(source)}
         knowledge_words = {
             lemma for source in knowledge_sources for lemma in content_lemmas(source)
         }
@@ -484,29 +1124,20 @@ class MemoryPhraseGenerator:
         return best
 
     @staticmethod
-    def _usage_fit(
-        candidate: tuple[str, ...], hints: tuple[UsageGuidance, ...]
-    ) -> float:
+    def _usage_fit(candidate: tuple[str, ...], hints: tuple[UsageGuidance, ...]) -> float:
         """Reward learned collocations softly; never reject an unseen construction."""
 
         if not hints:
             return 0.0
         readings = tuple(DEFAULT_MORPHOLOGY.best(token) for token in candidate)
-        candidate_lemmas = {
-            reading.lemma
-            for reading in readings
-            if reading is not None
-        }
+        candidate_lemmas = {reading.lemma for reading in readings if reading is not None}
         scores: list[float] = []
         for hint in hints:
             target_readings = tuple(
                 reading
                 for token, reading in zip(candidate, readings, strict=True)
                 if reading is not None
-                and (
-                    reading.lemma == hint.lemma
-                    or token.casefold().replace("ё", "е") == hint.word
-                )
+                and (reading.lemma == hint.lemma or token.casefold().replace("ё", "е") == hint.word)
             )
             if not target_readings:
                 continue
@@ -530,6 +1161,29 @@ class MemoryPhraseGenerator:
         left_pairs = set(zip(left, left[1:], strict=False))
         right_pairs = set(zip(right, right[1:], strict=False))
         return len(left_pairs & right_pairs) / max(1, len(left_pairs | right_pairs))
+
+    @classmethod
+    def _is_source_copy(cls, candidate: tuple[str, ...], source: tuple[str, ...]) -> bool:
+        """Reject a stored sentence replay even when punctuation or one edge changes."""
+
+        left = tuple(token for token in candidate if cls._is_word(token))
+        right = tuple(token for token in source if cls._is_word(token))
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        if len(left) == 1 or len(right) == 1:
+            return left == right
+        left_pairs = set(zip(left, left[1:], strict=False))
+        right_pairs = set(zip(right, right[1:], strict=False))
+        # A generated excerpt can be much shorter than its source and still be
+        # a verbatim replay. Judge how much of the candidate came from the
+        # source, instead of diluting that evidence by the source's length.
+        containment = len(left_pairs & right_pairs) / max(1, len(left_pairs))
+        if len(left) >= 4 and containment >= 0.80:
+            return True
+        length_ratio = min(len(left), len(right)) / max(len(left), len(right))
+        return length_ratio >= 0.65 and cls._sequence_similarity(left, right) >= 0.72
 
     @staticmethod
     def _profile(plan: UtterancePlan) -> _Profile:

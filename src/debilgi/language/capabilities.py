@@ -588,15 +588,33 @@ def assess_capability_question(
         if predicate.lemma in _CAPABILITY_PREDICATES:
             action = next(
                 (
-                    token
-                    for token in structure.tokens[frame.predicate_index + 1 : frame.token_end]
-                    if token.part_of_speech == "verb" and "INFN" in token.grammemes
+                    structure.tokens[index]
+                    for index in frame.action_complement_indices
+                    if index != frame.predicate_index
+                    and structure.tokens[index].part_of_speech == "verb"
                 ),
                 None,
             )
-            if action is None or subject is None:
+            if action is None:
+                action = next(
+                    (
+                        token
+                        for token in structure.tokens[frame.token_start : frame.token_end]
+                        if token.index != frame.predicate_index
+                        and token.part_of_speech == "verb"
+                        and "INFN" in token.grammemes
+                    ),
+                    None,
+                )
+            context_action, context_object = _context_action(context_messages)
+            action_lemma = action.lemma if action is not None else context_action
+            if action_lemma is None or subject is None:
                 continue
-            action_object = _action_object(structure, frame, subject.index)
+            action_object = (
+                _action_object(structure, frame, subject.index)
+                or context_object
+                or _context_action_object(context_messages)
+            )
         elif (
             addressed_bot
             and frame.clause_kind == "command"
@@ -681,22 +699,22 @@ def assess_capability_question(
             continue
         if subject.lemma in {"ты", "вы"}:
             abstract_internal_state = bool(
-                action.lemma in _NON_ACTION_STATES
+                action_lemma in _NON_ACTION_STATES
                 and action_object is not None
                 and action_object.head.lemma in _ABSTRACT_INTERNAL_OBJECTS
             )
-            if action.lemma in _COMPUTATIONAL_ACTIONS:
+            if action_lemma in _COMPUTATIONAL_ACTIONS:
                 supported = True
                 reason = "internal_computational_action"
             elif abstract_internal_state:
                 supported = True
                 reason = "internal_cognitive_or_evaluative_state"
-            elif action_requires_external_agency(action.lemma):
+            elif action_requires_external_agency(action_lemma):
                 supported = False
                 reason = "action_requires_unavailable_external_agency"
             elif (
                 learned_support := _learned_capability_support(
-                    action.lemma,
+                    action_lemma,
                     action_object,
                     knowledge_facts,
                 )
@@ -717,7 +735,7 @@ def assess_capability_question(
                 subject.lemma,
                 subject.surface,
                 "bot",
-                action.lemma,
+                action_lemma,
                 supported,
                 reason,
                 0.96 if supported else 0.92,
@@ -725,12 +743,15 @@ def assess_capability_question(
                 "capability",
                 action_object,
             )
-        if subject.lemma in _KNOWN_HUMAN_SUBJECTS and action.lemma in _UNASSISTED_HUMAN_LIMITS:
+        if (
+            subject.lemma in _KNOWN_HUMAN_SUBJECTS
+            and action_lemma in _UNASSISTED_HUMAN_LIMITS
+        ):
             return CapabilityAssessment(
                 subject.lemma,
                 subject.surface,
                 "person",
-                action.lemma,
+                action_lemma,
                 False,
                 "human_requires_technology",
                 0.94,
@@ -1154,6 +1175,17 @@ def _context_action(
                 if predicate.lemma in (_CAPABILITY_PREDICATES | {"хотеть"})
                 else predicate
             )
+            if action is None and predicate.lemma in (_CAPABILITY_PREDICATES | {"хотеть"}):
+                action = next(
+                    (
+                        token
+                        for token in structure.tokens[frame.token_start : frame.token_end]
+                        if token.index != frame.predicate_index
+                        and token.part_of_speech == "verb"
+                        and "INFN" in token.grammemes
+                    ),
+                    None,
+                )
             if (
                 action is None
                 or action.part_of_speech != "verb"

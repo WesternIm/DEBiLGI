@@ -140,8 +140,8 @@ def test_topical_opinion_is_not_replaced_with_generic_process_description():
         )
 
 
-def test_attention_call_is_a_grounded_local_acknowledgement() -> None:
+def test_stretched_attention_call_uses_contact_semantics_in_legacy_route() -> None:
     plans = _plans("ауу")
 
-    assert {plan.strategy for plan in plans} == {"active_listening", "hold_attention"}
+    assert {plan.strategy for plan in plans} == {"answer_contact"}
     assert {plan.semantic_origin for plan in plans} == {"derived"}

@@ -8,6 +8,22 @@ from debilgi.language.semantic_repeat import repeats_proposition
 from debilgi.language.structured_utterance import analyze_structured_utterance
 
 
+@pytest.mark.parametrize("prompt", ["лошадка", "пиздээ", "не знаю"])
+def test_no_lexical_gap_does_not_invent_a_replacement_thought(prompt):
+    thought = grounded_repair_thought(
+        analyze_structured_utterance(prompt), clarifiable_terms=(),
+    )
+    assert thought is None
+
+
+def test_missing_fact_still_allows_honest_uncertainty():
+    thought = grounded_repair_thought(
+        analyze_structured_utterance("Сколько стоит гречка?"), clarifiable_terms=(),
+    )
+    assert thought is not None
+    assert "answer_not_derived" in thought.evidence
+
+
 @pytest.mark.parametrize(
     "prompt,subject",
     [

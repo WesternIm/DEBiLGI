@@ -31,6 +31,9 @@ class PreparedReply:
     semantic_reply_plan_id: str | None = None
     processing_outcome: ProcessingOutcome | None = None
     assertion_experience: dict[str, object] | None = None
+    meaning_intention_id: str | None = None
+    dialogue_task_id: str | None = None
+    dialogue_task_progress: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

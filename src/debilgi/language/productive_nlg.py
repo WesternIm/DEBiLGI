@@ -117,12 +117,8 @@ class DependencyPattern:
     def valid(self) -> bool:
         allowed = {*_ARGUMENT_ROLES, "predicate", "negation"}
         role_set = set(self.roles)
-        negation_index = (
-            self.roles.index("negation") if "negation" in role_set else None
-        )
-        predicate_index = (
-            self.roles.index("predicate") if "predicate" in role_set else None
-        )
+        negation_index = self.roles.index("negation") if "negation" in role_set else None
+        predicate_index = self.roles.index("predicate") if "predicate" in role_set else None
         return (
             bool(self.roles)
             and len(self.roles) == len(set(self.roles))
@@ -141,7 +137,8 @@ class DependencyPattern:
                 and negation_index + 1 == predicate_index
             )
             and self.clause_kind in {"statement", "question", "any"}
-            and self.predicate_class in {
+            and self.predicate_class
+            in {
                 "any",
                 "lexical",
                 "modal",
@@ -153,12 +150,8 @@ class DependencyPattern:
             and not (set(self.required_roles) & set(self.optional_roles))
             and (self.focus_role is None or self.focus_role in self.roles)
             and self.negation_mode in {"any", "required", "forbidden"}
-            and not (
-                self.negation_mode == "required" and "negation" not in role_set
-            )
-            and not (
-                self.negation_mode == "forbidden" and "negation" in role_set
-            )
+            and not (self.negation_mode == "required" and "negation" not in role_set)
+            and not (self.negation_mode == "forbidden" and "negation" in role_set)
             and -1.0 <= self.utility <= 1.0
         )
 
@@ -407,15 +400,11 @@ def observe_dependency_patterns(
             dict.fromkeys(role for _, role in sorted(positioned, key=lambda item: item[0]))
         )
         clause_kind = (
-            clause.clause_kind
-            if clause.clause_kind in {"statement", "question"}
-            else "any"
+            clause.clause_kind if clause.clause_kind in {"statement", "question"} else "any"
         )
         predicate_class = _observed_predicate_class(structure, clause.predicate_index, clause)
         focus_role = _observed_focus_role(clause)
-        required_roles = tuple(
-            role for role in roles if role in {"subject", "predicate"}
-        )
+        required_roles = tuple(role for role in roles if role in {"subject", "predicate"})
         optional_roles = tuple(role for role in roles if role not in required_roles)
         pattern = DependencyPattern(
             roles=roles,
@@ -435,6 +424,14 @@ def observe_dependency_patterns(
     return tuple(patterns)
 
 
+def realize_argument(
+    argument: ConceptArgument, *, predicate_lemma: str = "", role: str = "direct_object"
+) -> str:
+    """Render one selected semantic argument for a focused answer."""
+    case = _case_for_role(predicate_lemma, role, argument)
+    return _render_argument(argument, case=case)
+
+
 def realize_thought(
     thought: ClauseThought,
     patterns: tuple[DependencyPattern, ...] = (),
@@ -448,20 +445,18 @@ def realize_thought(
         return ()
     predicate_roles = set(role_values)
     if (
-        thought.predicate.lemma in {"мочь", "уметь"}
+        thought.predicate.lemma in {"мочь", "уметь", "хотеть"}
         and "action_complement" in predicate_roles
     ):
-        # The object belongs to the infinitive (``могу открыть бутылку``),
-        # not to the finite modal predicate.
-        predicate_roles.discard("direct_object")
+        # Arguments of the embedded action aren't arguments of the modal.
+        predicate_roles = {"subject", "action_complement"}
     valency = assess_predicate_valency(
         thought.predicate.lemma,
         present_roles=frozenset(predicate_roles),
         complement_roles=frozenset(
             role_name
             for role_name in role_values
-            if role_name
-            in {"predicate_complement", "action_complement", "location", "topic"}
+            if role_name in {"predicate_complement", "action_complement", "location", "topic"}
         ),
     )
     if valency.missing_roles or valency.unexpected_roles:
@@ -488,9 +483,7 @@ def realize_thought(
             continue
         ordered = tuple(role for role in pattern.roles if role in present_roles)
         missing = tuple(
-            role
-            for role in _CORE_ROLE_ORDER
-            if role in present_roles and role not in ordered
+            role for role in _CORE_ROLE_ORDER if role in present_roles and role not in ordered
         )
         complete = (*ordered, *missing)
         if set(complete) == present_roles:
@@ -521,6 +514,7 @@ def realize_thought(
             "negation",
             "predicate",
             "action_complement",
+            "predicate_complement",
             "direct_object",
             "indirect_object",
             "location",
@@ -546,9 +540,7 @@ def realize_thought(
             )
         )
     focused_argument = (
-        role_values.get(thought.focus_role)
-        if thought.focus_role is not None
-        else None
+        role_values.get(thought.focus_role) if thought.focus_role is not None else None
     )
     requires_fronted_question_focus = bool(
         thought.clause_kind == "question"
@@ -560,11 +552,7 @@ def realize_thought(
         # ``focus_role`` is an explicit information-structure instruction.
         # A learned order may not demote its WH argument into an unlicensed
         # in-situ position such as ``думаешь ты что о ...``.
-        orders = [
-            item
-            for item in orders
-            if item[0] and item[0][0] == thought.focus_role
-        ]
+        orders = [item for item in orders if item[0] and item[0][0] == thought.focus_role]
 
     surfaces: list[ProductiveSurface] = []
     seen_orders: set[tuple[str, ...]] = set()
@@ -639,6 +627,12 @@ def _realize_order(
         if role == "negation":
             words.append("не")
         elif role == "predicate":
+            if (
+                thought.predicate_class == "copular"
+                and thought.predicate.lemma == "быть"
+                and predicate_features.get("tense", "present") == "present"
+            ):
+                continue
             predicate = _realize_predicate(
                 thought.predicate,
                 predicate_features,
@@ -649,7 +643,31 @@ def _realize_order(
             if argument is None:
                 continue
             case = _case_for_role(thought.predicate.lemma, role, argument)
-            rendered = _render_argument(argument, case=case)
+            if (
+                thought.predicate_class in {"copular", "modal"}
+                and role == "predicate_complement"
+                and subject
+                and argument.head.part_of_speech
+                in {
+                    "adjective",
+                    "participle",
+                }
+            ):
+                agreement = dict(argument.head.features)
+                subject_features = _inferred_head_features(subject.head)
+                for name in ("number", "gender"):
+                    if subject_features.get(name):
+                        agreement[name] = subject_features[name]
+                argument = replace(
+                    argument, head=replace(argument.head, features=tuple(agreement.items()))
+                )
+            rendered = _render_argument(
+                argument,
+                case=case,
+                predicative=(
+                    role == "predicate_complement" and thought.predicate_class == "copular"
+                ),
+            )
             if not rendered:
                 return ""
             words.append(rendered)
@@ -756,27 +774,52 @@ def _case_for_role(
     if argument.preposition:
         expected = DEFAULT_MORPHOLOGY.expected_cases(argument.preposition)
         return (
-            sorted(expected)[0]
-            if len(expected) == 1
-            else dict(argument.head.features).get("case")
+            sorted(expected)[0] if len(expected) == 1 else dict(argument.head.features).get("case")
         )
     return dict(argument.head.features).get("case")
 
 
-def _render_argument(argument: ConceptArgument, *, case: str | None) -> str:
+def _render_argument(
+    argument: ConceptArgument, *, case: str | None, predicative: bool = False
+) -> str:
     head_features = _inferred_head_features(argument.head)
     requested: dict[str, str] = {}
     if case:
         requested["case"] = case
     if head_features.get("number"):
         requested["number"] = head_features["number"]
-    if argument.head.part_of_speech == 'adjective' and head_features.get('gender'):
-        requested['gender'] = head_features['gender']
+    if argument.head.part_of_speech in {"adjective", "participle"} and head_features.get("gender"):
+        requested["gender"] = head_features["gender"]
+    inflection_base = argument.head.lemma
+    if argument.head.part_of_speech == "participle":
+        # Its lemma is a verb; inflect the observed participle to retain voice.
+        inflection_base = argument.head.surface
+        reading = DEFAULT_MORPHOLOGY.best(inflection_base)
+        if reading and "PRTS" in reading.grammemes:
+            requested.pop("case", None)
+    if predicative and argument.head.part_of_speech in {"participle", "adjective"}:
+        short = {k: v for k, v in requested.items() if k != "case"}
+        short["form"] = (
+            "short_participle"
+            if argument.head.part_of_speech == "participle"
+            else "short_adjective"
+        )
+        short_surface = DEFAULT_MORPHOLOGY.inflect(argument.head.surface, **short)
+        original = DEFAULT_MORPHOLOGY.best(argument.head.surface)
+        short_reading = DEFAULT_MORPHOLOGY.best(short_surface) if short_surface else None
+        if short_surface and (
+            argument.head.part_of_speech == "participle"
+            or dict(argument.head.features).get("case") == "instrumental"
+            or original
+            and "ADJS" in original.grammemes
+            or short_reading
+            and short_reading.part_of_speech == "participle"
+        ):
+            return short_surface
     head = (
         argument.head.surface
         if argument.head.entity_kind is not None or head_features.get("indeclinable") == "true"
-        else DEFAULT_MORPHOLOGY.inflect(argument.head.lemma, **requested)
-        or argument.head.surface
+        else DEFAULT_MORPHOLOGY.inflect(inflection_base, **requested) or argument.head.surface
     )
     modifier_features = dict(requested)
     for name in ("number", "gender"):
@@ -789,10 +832,7 @@ def _render_argument(argument: ConceptArgument, *, case: str | None) -> str:
     if (
         case == "accusative"
         and head_features.get("animacy")
-        and (
-            head_features.get("number") == "plural"
-            or head_features.get("gender") == "masculine"
-        )
+        and (head_features.get("number") == "plural" or head_features.get("gender") == "masculine")
     ):
         modifier_features["animacy"] = head_features["animacy"]
     modifiers = tuple(

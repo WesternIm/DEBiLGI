@@ -70,6 +70,21 @@ _DIGITAL_TYPE_TERMS = frozenset(
 _ABSTRACT_TYPE_TERMS = frozenset(
     {"действие", "процесс", "состояние", "понятие", "свойство", "явление", "отношение"}
 )
+_BIOLOGICAL_TYPE_TERMS = frozenset(
+    {
+        "человек",
+        "женщина",
+        "мужчина",
+        "родственник",
+        "родство",
+        "семья",
+        "родитель",
+        "мать",
+        "отец",
+        "предок",
+        "потомок",
+    }
+)
 _POSSESSIBLE_CLASSES = frozenset({"physical", "cognitive", "identity", "digital"})
 
 
@@ -85,6 +100,7 @@ class RelationQuestionFrame:
     query_negated: bool
     complete: bool
     confidence: float
+    query_quantity: bool = False
 
     @property
     def study_terms(self) -> tuple[str, ...]:
@@ -182,12 +198,6 @@ def analyze_relation_question(
         ),
         None,
     )
-    if predicate is None:
-        return None
-    query_negated = predicate.normalized == "нет" or any(
-        token.lemma == "не" and token.index < predicate.index for token in words
-    )
-
     holder = None
     possession_preposition = next(
         (token for token in words if token.lemma == "у"),
@@ -204,7 +214,7 @@ def analyze_relation_question(
             ),
             None,
         )
-    if holder is None and predicate.lemma in {"иметь", "обладать"}:
+    if holder is None and predicate is not None and predicate.lemma in {"иметь", "обладать"}:
         holder = next(
             (
                 token
@@ -217,13 +227,28 @@ def analyze_relation_question(
     if holder is None:
         return None
 
-    excluded = {holder.index, predicate.index}
+    quantity_token = next((token for token in words if token.lemma == "сколько"), None)
+    if predicate is None and quantity_token is None:
+        return None
+    query_negated = bool(
+        predicate is not None
+        and (
+            predicate.normalized == "нет"
+            or any(token.lemma == "не" and token.index < predicate.index for token in words)
+        )
+    )
+
+    excluded = {holder.index}
+    if predicate is not None:
+        excluded.add(predicate.index)
+    if quantity_token is not None:
+        excluded.add(quantity_token.index)
     if possession_preposition is not None:
         excluded.add(possession_preposition.index)
     after_predicate = tuple(
         token
         for token in words
-        if token.index > predicate.index
+        if token.index > (predicate.index if predicate is not None else holder.index)
         and token.index not in excluded
         and token.part_of_speech == "noun"
     )
@@ -260,7 +285,7 @@ def analyze_relation_question(
     confidence = min(
         0.98,
         0.48
-        + predicate.confidence * 0.16
+        + (predicate.confidence if predicate is not None else quantity_token.confidence) * 0.16
         + holder.confidence * 0.14
         + object_token.confidence * 0.14
         + (0.08 if possession_preposition is not None else 0.04),
@@ -276,6 +301,7 @@ def analyze_relation_question(
         query_negated=query_negated,
         complete=bool(object_lemmas),
         confidence=confidence,
+        query_quantity=quantity_token is not None,
     )
 
 
@@ -459,6 +485,7 @@ def classify_object_terms(
         ("cognitive", terms & _COGNITIVE_TYPE_TERMS),
         ("identity", terms & _IDENTITY_TYPE_TERMS),
         ("digital", terms & _DIGITAL_TYPE_TERMS),
+        ("biological", terms & _BIOLOGICAL_TYPE_TERMS),
         ("abstract", terms & _ABSTRACT_TYPE_TERMS),
     )
     ranked = sorted(classes, key=lambda item: len(item[1]), reverse=True)

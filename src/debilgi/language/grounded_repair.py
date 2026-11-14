@@ -16,23 +16,53 @@ from debilgi.language.structured_utterance import StructuredUtterance, analyze_s
 _CONTACT = CONTACT_WORDS
 
 
+def direct_address_thought(*, evidence: tuple[str, ...] = ()) -> ClauseThought:
+    """Express the agent taking the current turn without a stored phrase."""
+
+    return ClauseThought(
+        predicate=ConceptLexeme(
+            "отвечать",
+            "отвечаю",
+            "verb",
+            (("person", "first"), ("number", "singular"), ("tense", "present")),
+        ),
+        dependencies=(
+            SemanticDependency("subject", ConceptArgument(ConceptLexeme("я", "я", "pronoun"))),
+            SemanticDependency(
+                "indirect_object",
+                ConceptArgument(
+                    ConceptLexeme("ты", "тебе", "pronoun"), grammatical_case="dative"
+                ),
+            ),
+        ),
+        confidence=0.94,
+        evidence=evidence or ("current_message:direct_address",),
+    )
+
+
 def unmet_requirement_thought(requirement: str) -> ClauseThought:
     """State a gap in justification rather than invent a cause or a denial."""
     target = "причина" if requirement == "explain_reason" else "обоснование"
     return ClauseThought(
-        predicate=ConceptLexeme("знать", "знаю", "verb",
-                               (("person", "first"), ("tense", "present"))),
+        predicate=ConceptLexeme(
+            "знать", "знаю", "verb", (("person", "first"), ("tense", "present"))
+        ),
         dependencies=(
             SemanticDependency("subject", ConceptArgument(ConceptLexeme("я", "я", "pronoun"))),
-            SemanticDependency("direct_object", ConceptArgument(
-                ConceptLexeme(target, target, "noun"), grammatical_case="genitive")),
-        ), negated=True, confidence=0.85,
+            SemanticDependency(
+                "direct_object",
+                ConceptArgument(ConceptLexeme(target, target, "noun"), grammatical_case="genitive"),
+            ),
+        ),
+        negated=True,
+        confidence=0.85,
         evidence=(f"unresolved_requirement:{requirement}", "no_eligible_grounded_explanation"),
     )
 
 
 def prior_claim_review_thought(
-    prompt: str, consultation_messages: tuple[str, ...],
+    prompt: str,
+    consultation_messages: tuple[str, ...],
 ) -> tuple[ClauseThought, str] | None:
     """Acknowledge an actual own utterance, without treating it as a true fact."""
     focus = set(content_lemmas(prompt)) - {"сказать", "говорить", "написать"}
@@ -52,38 +82,66 @@ def prior_claim_review_thought(
             predicate=ConceptLexeme("говорить", "говорил", "verb", (("tense", "past"),)),
             dependencies=(
                 SemanticDependency("subject", ConceptArgument(ConceptLexeme("я", "я", "pronoun"))),
-                SemanticDependency("direct_object", ConceptArgument(
-                    ConceptLexeme(text, quoted, "noun", entity_kind="quoted_claim"))),
-            ), confidence=0.9, evidence=("source:own_dialogue_turn", f"reviewed_claim:{text}"),
+                SemanticDependency(
+                    "direct_object",
+                    ConceptArgument(
+                        ConceptLexeme(text, quoted, "noun", entity_kind="quoted_claim")
+                    ),
+                ),
+            ),
+            confidence=0.9,
+            evidence=("source:own_dialogue_turn", f"reviewed_claim:{text}"),
         ), text
     return None
 
 
 def grounded_repair_thought(
-    structure: StructuredUtterance, *, clarifiable_terms: tuple[str, ...] | None = None,
+    structure: StructuredUtterance,
+    *,
+    clarifiable_terms: tuple[str, ...] | None = None,
 ) -> ClauseThought | None:
     words = tuple(t for t in structure.tokens if t.surface[:1].isalnum())
     if not words:
         return None
     # A command with a missing object asks for that object, not a definition of
     # its verb. The action lexeme is supplied by the utterance itself.
-    command = next((c for c in structure.clauses if c.clause_kind == "command"
-                    and c.predicate_index is not None and not c.direct_object_indices), None)
+    command = next(
+        (
+            c
+            for c in structure.clauses
+            if c.clause_kind == "command"
+            and c.predicate_index is not None
+            and not c.direct_object_indices
+        ),
+        None,
+    )
     if command is not None:
         verb = structure.tokens[command.predicate_index]
         if dict(verb.grammatical_features).get("transitivity") == "transitive":
             return ClauseThought(
-                predicate=ConceptLexeme("хотеть", "хочешь", "verb",
-                    (("person", "second"), ("number", "singular"))),
+                predicate=ConceptLexeme(
+                    "хотеть", "хочешь", "verb", (("person", "second"), ("number", "singular"))
+                ),
                 dependencies=(
-                    SemanticDependency("subject", ConceptArgument(
-                        ConceptLexeme("ты", "ты", "pronoun"))),
-                    SemanticDependency("action_complement", ConceptArgument(
-                        ConceptLexeme(verb.lemma, verb.lemma, "verb"))),
-                    SemanticDependency("direct_object", ConceptArgument(
-                        ConceptLexeme("что", "что", "pronoun"), grammatical_case="accusative")),
-                ), clause_kind="question", focus_role="direct_object", predicate_class="modal",
-                confidence=0.9, evidence=(f"current_message:missing_command_object:{verb.lemma}",),
+                    SemanticDependency(
+                        "subject", ConceptArgument(ConceptLexeme("ты", "ты", "pronoun"))
+                    ),
+                    SemanticDependency(
+                        "action_complement",
+                        ConceptArgument(ConceptLexeme(verb.lemma, verb.lemma, "verb")),
+                    ),
+                    SemanticDependency(
+                        "direct_object",
+                        ConceptArgument(
+                            ConceptLexeme("что", "что", "pronoun"), grammatical_case="accusative"
+                        ),
+                    ),
+                ),
+                clause_kind="question",
+                focus_role="direct_object",
+                predicate_class="modal",
+                confidence=0.9,
+                evidence=(f"current_message:missing_command_object:{verb.lemma}",),
             )
     if all(t.part_of_speech in {"particle", "pronoun", "adverb"} for t in words) and any(
         t.lemma in {"почему", "зачем", "как", "ну"} for t in words
@@ -117,23 +175,7 @@ def grounded_repair_thought(
     if len(words) <= 2 and any(
         t.lemma in _CONTACT or t.surface.casefold() in _CONTACT for t in words
     ):
-        return ClauseThought(
-            predicate=ConceptLexeme(
-                "слушать",
-                "слушаю",
-                "verb",
-                (("person", "first"), ("number", "singular"), ("tense", "present")),
-            ),
-            dependencies=(
-                SemanticDependency("subject", ConceptArgument(ConceptLexeme("я", "я", "pronoun"))),
-                SemanticDependency(
-                    "direct_object",
-                    ConceptArgument(
-                        ConceptLexeme("ты", "тебя", "pronoun"), grammatical_case="accusative"
-                    ),
-                ),
-            ),
-            confidence=0.94,
+        return direct_address_thought(
             evidence=("current_message:contact_request",),
         )
     # Ask for the referent of a subject instead of asserting a guessed event.
@@ -190,10 +232,12 @@ def grounded_repair_thought(
         target = next((t for t in words if t.part_of_speech == "verb"), None)
     if target is None and len(words) == 1:
         target = words[0]
-    if target is None or (
-        clarifiable_terms is not None and target.lemma not in clarifiable_terms
-    ):
-        return unresolved_answer_thought()
+    if target is None or (clarifiable_terms is not None and target.lemma not in clarifiable_terms):
+        if any(clause.clause_kind == "question" for clause in structure.clauses):
+            return unresolved_answer_thought()
+        # No missing reference was found. Do not invent a clarification goal
+        # merely because another producer failed to supply an answer.
+        return None
     return ClauseThought(
         predicate=ConceptLexeme(
             "подразумевать",
@@ -232,12 +276,19 @@ def grounded_repair_thought(
 
 def unresolved_answer_thought() -> ClauseThought:
     return ClauseThought(
-        predicate=ConceptLexeme("знать", "знаю", "verb",
-                               (("person", "first"), ("tense", "present"))),
+        predicate=ConceptLexeme(
+            "знать", "знаю", "verb", (("person", "first"), ("tense", "present"))
+        ),
         dependencies=(
             SemanticDependency("subject", ConceptArgument(ConceptLexeme("я", "я", "pronoun"))),
-            SemanticDependency("direct_object", ConceptArgument(
-                ConceptLexeme("ответ", "ответ", "noun"), grammatical_case="genitive")),
-        ), negated=True, confidence=0.85,
+            SemanticDependency(
+                "direct_object",
+                ConceptArgument(
+                    ConceptLexeme("ответ", "ответ", "noun"), grammatical_case="genitive"
+                ),
+            ),
+        ),
+        negated=True,
+        confidence=0.85,
         evidence=("answer_not_derived", "no_blocking_lexical_gap"),
     )

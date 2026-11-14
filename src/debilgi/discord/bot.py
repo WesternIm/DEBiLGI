@@ -12,12 +12,14 @@ from discord.ext import commands
 from debilgi.autonomy.policy import InitiativePolicy
 from debilgi.autonomy.repository import AutonomyRepository
 from debilgi.background import BackgroundLearningService
+from debilgi.cognition.affect import AffectEngine, AffectRepository
 from debilgi.cognition.continuous import (
     ContinuousCognitionConfig,
     ContinuousCognitionService,
 )
 from debilgi.cognition.core import CognitiveCore, CognitiveCoreConfig
 from debilgi.cognition.core_repository import CognitiveRepository
+from debilgi.cognition.dialogue_tasks import DialogueTaskRepository
 from debilgi.cognition.expectations import ExpectationPredictor
 from debilgi.cognition.features import BehaviorFeatureExtractor, FeatureConfig
 from debilgi.cognition.learning import LearningConfig, LearningEngine
@@ -36,6 +38,7 @@ from debilgi.discord.reply_workflow import ReplyWorkflow
 from debilgi.events.pipeline import EventPipeline
 from debilgi.events.repository import EventRepository
 from debilgi.experience.consolidation import ExperienceConsolidator
+from debilgi.experience.meaning_intents import MeaningIntentRepository
 from debilgi.experience.repository import ExperienceRepository
 from debilgi.knowledge.policy import KnowledgeQueryPolicy
 from debilgi.knowledge.repository import KnowledgeRepository
@@ -57,6 +60,7 @@ from debilgi.language.morphology import MorphologyRepository
 from debilgi.language.open_questions import OpenLanguageQuestionService
 from debilgi.language.position_reasoning import PositionReasoningService, PositionRepository
 from debilgi.language.processing_outcomes import ProcessingOutcomeRepository
+from debilgi.language.proposition_memory import PropositionMemory
 from debilgi.language.response_trace import ResponseTraceRepository
 from debilgi.language.russian_reference import RussianReferenceService, WiktionaryClient
 from debilgi.language.ruwordnet import open_ruwordnet
@@ -102,9 +106,7 @@ class DebilgiBot(commands.Bot):
                 max_reply_chains=settings.memory_max_reply_chains,
                 max_chain_events=settings.memory_max_chain_events,
                 max_context_events=settings.memory_max_context_events,
-                relevance_half_life=timedelta(
-                    minutes=settings.memory_relevance_half_life_minutes
-                ),
+                relevance_half_life=timedelta(minutes=settings.memory_relevance_half_life_minutes),
                 min_context_relevance=settings.memory_min_context_relevance,
             )
         )
@@ -158,6 +160,7 @@ class DebilgiBot(commands.Bot):
             content_character_limit=settings.language_context_chars,
         )
         self.semantic_memory = SemanticMemoryRepository(database)
+        self.proposition_memory = PropositionMemory(database)
         self.causal_reasoning = CausalReasoningRepository(database)
         self.character_markov = CharacterMarkovRepository(
             database,
@@ -165,8 +168,9 @@ class DebilgiBot(commands.Bot):
         )
         self.lexicon = LexiconService(
             database,
-            ruwordnet=(open_ruwordnet(settings.ruwordnet_path)
-                       if settings.ruwordnet_enabled else None),
+            ruwordnet=(
+                open_ruwordnet(settings.ruwordnet_path) if settings.ruwordnet_enabled else None
+            ),
             unknown_word_threshold=settings.unknown_word_threshold,
             curiosity_threshold=settings.curiosity_threshold,
             curiosity_question_cooldown=timedelta(
@@ -210,15 +214,19 @@ class DebilgiBot(commands.Bot):
             self.cognitive_repository,
             self.genome,
         )
+        self.affect_repository = AffectRepository(database)
+        self.affect_engine = AffectEngine(
+            self.affect_repository, self.social_reaction_repository
+        )
         self.experience_repository = ExperienceRepository(database)
+        self.meaning_intents = MeaningIntentRepository(database)
+        self.dialogue_tasks = DialogueTaskRepository(database)
         self.self_dataset = SelfDatasetRepository(database)
         self.arbitration_repository = ArbitrationRepository(
             database,
             learning_enabled=settings.arbitration_learning_enabled,
             learning_rate=settings.arbitration_learning_rate,
-            minimum_feedback_observations=(
-                settings.arbitration_minimum_feedback_observations
-            ),
+            minimum_feedback_observations=(settings.arbitration_minimum_feedback_observations),
             maximum_weight_delta=settings.arbitration_maximum_weight_delta,
         )
         self.position_repository = PositionRepository(database)
@@ -229,18 +237,12 @@ class DebilgiBot(commands.Bot):
             database,
             enabled=settings.continuous_cognition_enabled,
             config=ContinuousCognitionConfig(
-                active_interval=timedelta(
-                    seconds=settings.continuous_cognition_active_seconds
-                ),
-                idle_interval=timedelta(
-                    seconds=settings.continuous_cognition_idle_seconds
-                ),
+                active_interval=timedelta(seconds=settings.continuous_cognition_active_seconds),
+                idle_interval=timedelta(seconds=settings.continuous_cognition_idle_seconds),
                 work_per_pulse=settings.continuous_cognition_work_per_pulse,
             ),
         )
-        self.response_traces.set_completion_notifier(
-            self.continuous_cognition.wake
-        )
+        self.response_traces.set_completion_notifier(self.continuous_cognition.wake)
         self.abstract_reasoning = AbstractReasoningService(database)
         self.lexical_usage_learning = LexicalUsageLearningService(database, self.self_dataset)
         self.utterance_understandings = UtteranceUnderstandingRepository(database)
@@ -261,9 +263,7 @@ class DebilgiBot(commands.Bot):
         self.processing_outcomes.set_quality_observer(
             self.learning_quality.observe_processing_outcome
         )
-        self.response_traces.set_quality_observer(
-            self.learning_quality.observe_response_trace
-        )
+        self.response_traces.set_quality_observer(self.learning_quality.observe_response_trace)
         self.reflection_repository = ReflectionRepository(database)
         self.reflection_engine = ReflectionEngine(
             self.reflection_repository,
@@ -309,9 +309,7 @@ class DebilgiBot(commands.Bot):
             settings.semantic_consultant_account_id or "",
             settings.semantic_consultant_api_token or "",
             model=settings.semantic_consultant_model,
-            instruction=settings.semantic_consultant_instruction_path.read_text(
-                encoding="utf-8"
-            ),
+            instruction=settings.semantic_consultant_instruction_path.read_text(encoding="utf-8"),
             timeout_seconds=settings.semantic_consultant_timeout_seconds,
         )
         self.semantic_consultant = SemanticConsultationService(
@@ -319,9 +317,7 @@ class DebilgiBot(commands.Bot):
             semantic_provider,
             enabled=settings.semantic_consultant_enabled,
             trigger_threshold=settings.semantic_consultant_trigger_threshold,
-            minimum_result_confidence=(
-                settings.semantic_consultant_minimum_confidence
-            ),
+            minimum_result_confidence=(settings.semantic_consultant_minimum_confidence),
             assimilator=self.semantic_assimilation,
         )
         self.background_learning = BackgroundLearningService(
@@ -351,13 +347,9 @@ class DebilgiBot(commands.Bot):
                 settings.initiative_enabled and settings.background_initiative_enabled
             ),
             initiative_probability=settings.background_initiative_probability,
-            initiative_cooldown=timedelta(
-                minutes=settings.background_initiative_cooldown_minutes
-            ),
+            initiative_cooldown=timedelta(minutes=settings.background_initiative_cooldown_minutes),
         )
-        self.lexicon.set_study_notifier(
-            self.background_learning.wake_for_study
-        )
+        self.lexicon.set_study_notifier(self.background_learning.wake_for_study)
         self.assertion_experiences = AssertionExperienceRepository(database)
         self.reply_service = SafeMentionReplyService(
             self.cognitive_repository,
@@ -388,8 +380,7 @@ class DebilgiBot(commands.Bot):
             understanding_repository=self.utterance_understandings,
             arbitration_repository=self.arbitration_repository,
             context_gate=self.context_gate,
-            # The consultant proposes word-free semantic alternatives. The
-            # local personality selects one and local morphology authors text.
+            # Kept for compatible routes; meaning-first generation never calls it.
             semantic_consultant=self.semantic_consultant,
             semantic_assimilation=self.semantic_assimilation,
             position_reasoning=self.position_reasoning,
@@ -400,13 +391,16 @@ class DebilgiBot(commands.Bot):
             assertion_experiences=self.assertion_experiences,
             arbitration_mode=settings.arbitration_mode,
             arbitration_minimum_score=settings.arbitration_minimum_score,
-            arbitration_max_total_candidates=(
-                settings.arbitration_max_total_candidates
-            ),
+            arbitration_max_total_candidates=(settings.arbitration_max_total_candidates),
             response_confidence_threshold=settings.response_confidence_threshold,
             response_plan_retry_limit=settings.response_plan_retry_limit,
             context_character_limit=settings.language_context_chars,
             productive_only_replies=settings.productive_only_replies,
+            meaning_first_replies=True,
+            proposition_memory=self.proposition_memory,
+            meaning_intents=self.meaning_intents,
+            affect=self.affect_repository,
+            dialogue_tasks=self.dialogue_tasks,
             enabled=settings.test_replies_enabled,
         )
         self.pipeline = EventPipeline(
@@ -416,11 +410,13 @@ class DebilgiBot(commands.Bot):
                 self.arbitration_repository.observe_feedback,
                 self.position_repository.observe_feedback,
                 self.assertion_experiences.observe_feedback,
+                self.meaning_intents.observe,
                 self.memory.observe,
                 self.context_gate.observe,
                 self.long_term_memory.observe,
                 self.discourse_memory.observe,
                 self.semantic_memory.observe,
+                self.proposition_memory.observe,
                 self.causal_reasoning.observe,
                 self.character_markov.observe,
                 self.lexicon.observe,
@@ -433,6 +429,7 @@ class DebilgiBot(commands.Bot):
                 self.cognitive_core.observe,
                 self.continuous_cognition.observe,
                 self.social_reaction_engine.observe,
+                self.affect_engine.observe,
                 self.experience_consolidator.observe,
                 self.self_dataset.observe,
                 self.learning_quality.observe_feedback,
@@ -442,9 +439,11 @@ class DebilgiBot(commands.Bot):
         )
         self.archive_importer = ArchiveImporter(self.archive_repository)
         self.reply_delivery = ReplyDeliveryService(
-            DeliveryRepository(database), repository,
-            ReplyWorkflow(self, self.pipeline, self.reply_service,
-                          self.context_gate, self.response_traces),
+            DeliveryRepository(database),
+            repository,
+            ReplyWorkflow(
+                self, self.pipeline, self.reply_service, self.context_gate, self.response_traces
+            ),
             DiscordReplyTransport(self),
         )
         self.archive_manager = ArchiveImportManager(
@@ -455,6 +454,7 @@ class DebilgiBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.database.initialize()
+        await self.proposition_memory.restore_from_events()
         reflected = await self.reflection_engine.backfill()
         if reflected:
             logger.info("Backfilled %d internal reflections", reflected)
@@ -476,10 +476,8 @@ class DebilgiBot(commands.Bot):
             social_curriculum = await self.semantic_assimilation.install_social_curriculum(
                 guild_id=self.settings.dev_guild_id,
             )
-            productive_curriculum = (
-                await self.semantic_assimilation.install_productive_curriculum(
-                    guild_id=self.settings.dev_guild_id,
-                )
+            productive_curriculum = await self.semantic_assimilation.install_productive_curriculum(
+                guild_id=self.settings.dev_guild_id,
             )
             if social_curriculum or productive_curriculum:
                 logger.info(
