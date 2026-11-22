@@ -145,9 +145,7 @@ def extract_causal_observations(
     """Extract oriented links; temporal order remains distinct from causation."""
 
     sentence_parts = tuple(
-        part.strip()
-        for part in re.split(r"(?<=[.!?])\s+", text.strip())
-        if part.strip()
+        part.strip() for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part.strip()
     )
     if len(sentence_parts) > 1:
         return tuple(
@@ -167,9 +165,8 @@ def extract_causal_observations(
     )
     for cue in marker_cues:
         marker = cue.cue.casefold().replace("ё", "е")
-        leading_cause = (
-            cue.orientation == "effect_before_cause"
-            and lowered.lstrip().startswith(marker)
+        leading_cause = cue.orientation == "effect_before_cause" and lowered.lstrip().startswith(
+            marker
         )
         if leading_cause:
             split = _split_leading_cause(cleaned, lowered, marker)
@@ -253,11 +250,12 @@ def analyze_causal_query(
     normalized = cleaned.casefold().replace("ё", "е")
     normalized_syntax = " ".join(re.sub(r"[,;:]+", " ", normalized).split())
     asks_cause = bool(
-        any(c.question_target_index is not None
+        any(
+            c.question_target_index is not None
             and structure.tokens[c.question_target_index].lemma == "почему"
-            for c in structure.clauses)
-        or
-        lemma_set & {"почему", "причина"}
+            for c in structure.clauses
+        )
+        or lemma_set & {"почему", "причина"}
         or normalized.startswith("почему ")
         or normalized.rstrip(" ?!") == "почему"
         or "из-за чего" in normalized
@@ -282,9 +280,7 @@ def analyze_causal_query(
             (
                 tuple(
                     dict.fromkeys(
-                        lemma
-                        for lemma in content_lemmas(message)
-                        if lemma not in _QUERY_WORDS
+                        lemma for lemma in content_lemmas(message) if lemma not in _QUERY_WORDS
                     )
                 )
                 for message in reversed(context_messages[-8:])
@@ -330,8 +326,7 @@ def infer_compositional_consequence(query: CausalQuery) -> CausalInference | Non
         return None
 
     subject = (
-        DEFAULT_MORPHOLOGY.inflect(query.object_lemma, case="nominative")
-        or query.object_lemma
+        DEFAULT_MORPHOLOGY.inflect(query.object_lemma, case="nominative") or query.object_lemma
     )
     predicate = (
         DEFAULT_MORPHOLOGY.inflect(
@@ -419,12 +414,18 @@ class CausalReasoningRepository:
         content = event.payload.get("content")
         if not isinstance(content, str) or not content.strip():
             return
-        observations = extract_causal_observations(content, await self.cues())
+        from debilgi.language.lexicon import LexiconService
+        from debilgi.language.semantic_graph import canonical_meanings
+
+        canon = await LexiconService.for_meaning(self._database).canonical_lemmas(event.guild_id)
+        with canonical_meanings(canon):
+            observations = extract_causal_observations(content, await self.cues())
         for observation in observations:
             await self._store_observation(
                 guild_id=event.guild_id,
                 source_event_id=event.event_id,
                 source="event",
+                event=event,
                 observation=observation,
                 observed_at=event.utc_timestamp,
             )
@@ -577,9 +578,7 @@ class CausalReasoningRepository:
                ORDER BY confidence DESC, fetched_at DESC LIMIT ?""",
             (max(1, min(limit, 100_000)),),
         )
-        guild_rows = await self._database.fetchall(
-            "SELECT DISTINCT guild_id FROM events"
-        )
+        guild_rows = await self._database.fetchall("SELECT DISTINCT guild_id FROM events")
         cues = await self.cues()
         stored = 0
         for guild in guild_rows:
@@ -608,6 +607,7 @@ class CausalReasoningRepository:
         source: str,
         observation: CausalObservation,
         observed_at: datetime,
+        event: Event | None = None,
     ) -> None:
         now = observed_at.isoformat()
         cause_id = _scoped_proposition_id(guild_id, observation.cause)
@@ -656,14 +656,35 @@ class CausalReasoningRepository:
                         now,
                     ),
                 )
-            existing = await connection.execute(
-                """SELECT positive_evidence, negative_evidence
-                   FROM language_causal_links WHERE link_id = ?""",
-                (link_id,),
-            )
-            row = await existing.fetchone()
-            positive = (int(row[0]) if row else 0) + int(observation.supports_link)
-            negative = (int(row[1]) if row else 0) + int(not observation.supports_link)
+            cursor = await connection.execute(
+                "SELECT positive_evidence,negative_evidence FROM language_causal_links "
+                "WHERE link_id=?", (link_id,))
+            previous_link = await cursor.fetchone()
+            positive, negative = tuple(previous_link) if previous_link else (0, 0)
+            cursor = await connection.execute(
+                "SELECT actor_id FROM events WHERE event_id=? AND guild_id=? "
+                "AND actor_id IS NOT NULL AND COALESCE(json_extract(payload_json,"
+                "'$.author_is_bot'),0)=0 AND instr(source,'corpus')=0 "
+                "AND source NOT LIKE 'seed:%'", (source_event_id, guild_id))
+            voter = await cursor.fetchone()
+            if (event is not None and event.actor_id is not None
+                and not event.payload.get("author_is_bot") and "corpus" not in event.source
+                and not event.source.startswith("seed:")):
+                voter = (event.actor_id,)
+            current_polarity = 1 if observation.supports_link else -1
+            update_position = False
+            if voter:
+                cursor = await connection.execute(
+                    "SELECT polarity,observed_at,source_event_id FROM language_causal_positions "
+                    "WHERE link_id=? AND actor_id=?", (link_id, voter[0]))
+                previous = await cursor.fetchone()
+                if previous is None or (now, source_event_id) > (previous[1], previous[2]):
+                    update_position = True
+                    if previous:
+                        positive -= int(previous[0] == 1)
+                        negative -= int(previous[0] == -1)
+                    positive += int(current_polarity == 1)
+                    negative += int(current_polarity == -1)
             evidence_confidence = (positive + 1.0) / (positive + negative + 2.0)
             confidence = min(
                 0.98,
@@ -700,6 +721,12 @@ class CausalReasoningRepository:
                     now,
                 ),
             )
+            if update_position:
+                await connection.execute(
+                    "INSERT INTO language_causal_positions VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(link_id,actor_id) DO UPDATE SET polarity=excluded.polarity,"
+                    "observed_at=excluded.observed_at,source_event_id=excluded.source_event_id",
+                    (link_id, voter[0], current_polarity, now, source_event_id))
             evidence_id = _digest(f"{link_id}|{source_event_id}", "causal-evidence")
             await connection.execute(
                 """INSERT OR IGNORE INTO language_causal_evidence (
@@ -807,7 +834,12 @@ def _proposition_from_text(text: str) -> CausalProposition | None:
     terms = tuple(content_lemmas(surface))
     if not terms:
         return None
-    key = "|".join((subject or "", predicate, direct_object or "", str(frame.negated)))
+    from debilgi.language.semantic_graph import parse_proposition, proposition_key
+
+    thought = parse_proposition(structure)
+    if thought is None:
+        return None
+    key = json.dumps(proposition_key(thought), ensure_ascii=False, separators=(",", ":"))
     return CausalProposition(
         _digest(key, "causal-proposition"),
         "clause",
@@ -885,9 +917,7 @@ def _row_proposition(row, prefix: str) -> CausalProposition:
         str(row[f"{prefix}_kind"]),
         str(row[f"{prefix}_surface"]),
         str(row[f"{prefix}_subject"]) if row[f"{prefix}_subject"] is not None else None,
-        str(row[f"{prefix}_predicate"])
-        if row[f"{prefix}_predicate"] is not None
-        else None,
+        str(row[f"{prefix}_predicate"]) if row[f"{prefix}_predicate"] is not None else None,
         str(row[f"{prefix}_object"]) if row[f"{prefix}_object"] is not None else None,
         tuple(str(item) for item in json.loads(str(row[f"{prefix}_terms"]))),
         bool(row[f"{prefix}_negated"]),

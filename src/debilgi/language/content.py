@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from functools import lru_cache
 
 from debilgi.language.abbreviations import (
     abbreviation_mentions,
@@ -81,7 +82,12 @@ def content_lemmas(value: str | Iterable[str]) -> tuple[str, ...]:
 
 
 def _content_items(value: str | Iterable[str]) -> tuple[tuple[str, str], ...]:
-    """Keep surface forms and context-selected lemmas aligned in one parse."""
+    return _cached_content_items(value if isinstance(value, str) else tuple(value))
+
+
+@lru_cache(maxsize=16384)
+def _cached_content_items(value: str | tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    """Keep surface forms and context-selected lemmas aligned in one pure parse."""
 
     if isinstance(value, str):
         tokens = tokenize(value)

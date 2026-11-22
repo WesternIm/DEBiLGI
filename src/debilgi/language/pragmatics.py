@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 
 from debilgi.language.tokenizer import ChatTokenNormalization, normalize_chat_token, tokenize
 
@@ -134,6 +135,11 @@ _ELONGATED_VOCALIZATIONS: dict[str, tuple[str, float]] = {
     "у": ("strong_impression", 0.72),
     "э": ("hesitation", 0.70),
 }
+_EXPRESSIVE_0_RE = re.compile(r"ау+")
+_EXPRESSIVE_1_RE = re.compile(r"хм+")
+_EXPRESSIVE_2_RE = re.compile(r"мда+")
+_EXPRESSIVE_3_RE = re.compile(r"о+го+")
+_OPENING_RE = re.compile(r"\s*(ебать|охуеть|ахуеть)\s*[,!]\s*\S", re.IGNORECASE)
 _LAUGHTER_RE = re.compile(
     r"(?=[ахеahe]{4,}$)(?=.*[хh])(?=.*[аеae])[ахеahe]+",
     re.IGNORECASE,
@@ -302,9 +308,9 @@ def _expressive_cue(
             return PragmaticCue(word, "particle", "emphatic_affirmation", 0.92, 0.78)
         if canonical in {"нет", "не"}:
             return PragmaticCue(word, "particle", "emphatic_rejection", 0.92, 0.82)
-    if re.fullmatch(r"ау+", word):
+    if _EXPRESSIVE_0_RE.fullmatch(word):
         return PragmaticCue(word, "interjection", "attention_call", 0.92, 0.74)
-    if re.fullmatch(r"хм+", word):
+    if _EXPRESSIVE_1_RE.fullmatch(word):
         return PragmaticCue(word, "interjection", "hesitation", 0.86, 0.68)
     if _LAUGHTER_RE.fullmatch(word):
         repetitions = max(2, len(word) // 2)
@@ -315,13 +321,14 @@ def _expressive_cue(
             0.94,
             min(1.0, 0.62 + repetitions * 0.055),
         )
-    if re.fullmatch(r"мда+", word):
+    if _EXPRESSIVE_2_RE.fullmatch(word):
         return PragmaticCue(word, "interjection", "skepticism_or_disappointment", 0.86, 0.74)
-    if re.fullmatch(r"о+го+", word):
+    if _EXPRESSIVE_3_RE.fullmatch(word):
         return PragmaticCue(word, "interjection", "surprise_or_admiration", 0.84, 0.82)
     return None
 
 
+@lru_cache(maxsize=32768)
 def analyze_pragmatics(text: str) -> PragmaticAnalysis:
     raw_words = tuple(
         token.casefold().replace("ё", "е")
@@ -366,7 +373,7 @@ def analyze_pragmatics(text: str) -> PragmaticAnalysis:
             cues.append(PragmaticCue(word, category, function, confidence, intensity))
     # An infinitive before a detached opening comma can be an exclamation.
     # Its ordinary lexical use inside a clause retains its verb reading.
-    opening = re.match(r"\s*(ебать|охуеть|ахуеть)\s*[,!]\s*\S", text, re.IGNORECASE)
+    opening = _OPENING_RE.match(text)
     if opening is not None and len(words) >= 3:
         cues.append(
             PragmaticCue(opening.group(1).casefold(), "interjection", "coarse_emphasis", 0.9, 0.85)

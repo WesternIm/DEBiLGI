@@ -351,6 +351,10 @@ class ConversationRepository:
         )
 
     async def _restore_context(self, connection, guild_id: int, topics: tuple[str, ...]) -> str:
+        # No topic can intersect an old summary. Avoid parsing thirty long
+        # episodes under the write transaction on a cold social address.
+        if not topics:
+            return ""
         rows = await (
             await connection.execute(
                 """SELECT main_topic, summary FROM language_conversation_episodes

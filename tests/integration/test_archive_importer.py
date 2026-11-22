@@ -118,9 +118,9 @@ async def test_ingestion_is_idempotent_and_extracts_reply_patterns(
     )
     assert (("ну", "привет"), 1) in await repository.common_bigrams(1)
     character_rows = await database.fetchall(
-        "SELECT * FROM language_character_transitions WHERE guild_id = ?", (1,)
+        "SELECT name FROM sqlite_master WHERE name = ?", ("language_character_transitions",)
     )
-    assert character_rows
+    assert character_rows == []  # Dead table is removed by migration 063.
 
 
 async def test_reply_retrieval_ignores_pronoun_only_overlap(database: Database) -> None:

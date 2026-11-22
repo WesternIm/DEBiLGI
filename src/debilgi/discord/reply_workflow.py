@@ -22,14 +22,23 @@ class ReplyWorkflow:
         self._response_traces = response_traces
 
     async def prepare(self, event: Event) -> PreparedReply | None:
+        try:
+            return await self._prepare(event)
+        finally:
+            if finish := getattr(self._pipeline, "finish_response", None):
+                finish(event.event_id)
+
+    async def _prepare(self, event: Event) -> PreparedReply | None:
         upstream_failure = None
         bot_addressed = bool(event.payload.get("bot_mentioned"))
         reply_to = event.payload.get("reply_to_message_id")
-        if not await self._pipeline.wait_until_processed(
-            event.event_id, timeout=5.0
-        ):
+        wait = getattr(self._pipeline, "wait_until_ready", self._pipeline.wait_until_processed)
+        if not await wait(event.event_id, timeout=5.0):
             logger.warning("Message event was not processed in time: %s", event.event_id)
             upstream_failure = "event_processing_timeout"
+        cognition = getattr(self._bot, "continuous_cognition", None)
+        if cognition is not None and bot_addressed:
+            await cognition.wait_until_awake(event)
         await self._response_traces.begin(
             event,
             prompt=str(event.payload.get("content", "")),
@@ -50,21 +59,11 @@ class ReplyWorkflow:
                 "reply_to_message_id": reply_to,
             },
         )
-        bound_explanation = (
-            await self._reply_service.prepare_bound_explanation(event)
-            if upstream_failure is None
-            else None
-        )
-        bound_short_act = (
-            await self._reply_service.prepare_bound_short_act(event)
-            if upstream_failure is None and bound_explanation is None
-            else None
-        )
-        if bound_explanation is not None:
-            prepared = bound_explanation
-        elif bound_short_act is not None:
-            prepared = bound_short_act
-        elif bot_addressed:
+        if cognition is not None and cognition.sleeping and not bot_addressed:
+            await self._response_traces.finish(
+                event.event_id, status="no_reply", selected_route="sleep_observation")
+            return None
+        if bot_addressed:
             prepared = await self._reply_service.prepare_guaranteed_reply(
                 event,
                 upstream_failure=upstream_failure,
@@ -78,6 +77,11 @@ class ReplyWorkflow:
         else:
             prepared = None
         if prepared:
+            steps = await self._response_traces.steps_for_event(event.event_id)
+            reasoning = next((s["details"].get("deliberation", {}) for s in reversed(steps)
+                              if s["stage"] == "candidate_generation"), {})
+            prepared = replace(prepared, deliberation_steps=(
+                len(reasoning.get("self_questions", ())) + reasoning.get("candidate_count", 0)))
             await self._response_traces.step(
                 event.event_id,
                 stage="route",
@@ -94,15 +98,24 @@ class ReplyWorkflow:
             )
             return prepared
         elif bot_addressed:
+            steps = await self._response_traces.steps_for_event(event.event_id)
+            last_failure = next(
+                (step for step in reversed(steps)
+                 if step["status"] in {"withheld", "failed"}
+                 and step["details"].get("reason")),
+                None,
+            )
             await self._response_traces.finish(
                 event.event_id,
                 status=(
+                    last_failure["status"] if last_failure else
                     "withheld"
                     if self._reply_service.productive_only_replies
                     else "failed"
                 ),
-                failure_stage="preparation",
+                failure_stage=last_failure["stage"] if last_failure else "preparation",
                 failure_reason=(
+                    str(last_failure["details"]["reason"]) if last_failure else
                     "productive_only_no_surface"
                     if self._reply_service.productive_only_replies
                     else "no_prepared_reply"
@@ -118,6 +131,10 @@ class ReplyWorkflow:
         return None
 
     async def validate(self, event: Event, prepared: PreparedReply) -> PreparedReply | None:
+        # Recovered prepared jobs also cross the unit boundary before sending.
+        cognition = getattr(self._bot, "continuous_cognition", None)
+        if cognition is not None and cognition.sleeping:
+            await cognition.wait_until_awake(event)
         if requests_word_definition(prepared.text):
             await self._response_traces.finish(
                 event.event_id, status="withheld", failure_stage="autonomous_research",
@@ -198,6 +215,9 @@ class ReplyWorkflow:
             reply=prepared,
             created_at=sent.created_at,
         )
+        cognition = getattr(self._bot, "continuous_cognition", None)
+        if cognition is not None:
+            await cognition.record_sleep_trial(event, prepared, sent.id)
         await self._response_traces.finish(
             event.event_id,
             status="sent",

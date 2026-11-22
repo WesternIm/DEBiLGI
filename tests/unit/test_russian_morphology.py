@@ -315,3 +315,19 @@ def test_exposes_derivational_verb_features_and_preserves_full_readings() -> Non
         "transitivity": "transitive",
     }.items()
     assert genitive_genders >= {"masculine", "feminine", "neuter"}
+
+
+def test_clause_initial_instrumental_question_is_not_a_comparative_conjunction():
+    morphology = RussianMorphology()
+    reading = morphology.analyze_sentence("Чем занимаешься?").readings[0]
+    assert reading.lemma == "что"
+    assert reading.case == "instrumental"
+    assert reading.part_of_speech == "pronoun"
+
+
+def test_chat_ok_is_acknowledgment_without_a_preposition_expansion():
+    from debilgi.language.dialogue_learning import reactive_act
+    from debilgi.language.morphology import DEFAULT_MORPHOLOGY
+
+    assert DEFAULT_MORPHOLOGY.lemma("ок") == "ок"
+    assert reactive_act("ну ок") == "acknowledgment"

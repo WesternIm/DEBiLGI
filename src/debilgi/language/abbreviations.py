@@ -80,6 +80,7 @@ _ROMAN_NUMBERS = {
     "ix": 9,
     "x": 10,
 }
+_NORMALIZE_RE = re.compile(r"[\s._-]+")
 _WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]+(?:[-'][A-Za-zА-Яа-яЁё]+)*|[0-9]+")
 _DOTTED_RE = re.compile(r"^(?:[A-Za-zА-Яа-яЁё]\.){2,}[A-Za-zА-Яа-яЁё]?$")
 _MENTION_RE = re.compile(
@@ -103,7 +104,7 @@ _PARENTHETICAL_SHORT_RE = re.compile(
 def normalize_abbreviation(value: str) -> str:
     """Return a comparison form that ignores case, dots, spaces, and separators."""
 
-    return re.sub(r"[\s._-]+", "", value.casefold().replace("ё", "е"))
+    return _NORMALIZE_RE.sub("", value.casefold().replace("ё", "е"))
 
 
 def abbreviation_meanings(value: str) -> tuple[str, ...]:

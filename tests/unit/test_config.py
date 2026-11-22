@@ -174,24 +174,16 @@ def test_language_limits_must_be_positive(monkeypatch: pytest.MonkeyPatch) -> No
 def test_language_development_limits_are_configurable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("DEBILGI_CHARACTER_MARKOV_MIN_ORDER", "3")
-    monkeypatch.setenv("DEBILGI_CHARACTER_MARKOV_MAX_ORDER", "7")
     monkeypatch.setenv("DEBILGI_CONVERSATION_IDLE_TIMEOUT_MINUTES", "35")
     monkeypatch.setenv("DEBILGI_CONVERSATION_MAX_IDLE_TIMEOUT_MINUTES", "55")
     monkeypatch.setenv("DEBILGI_CURIOSITY_THRESHOLD", "0.72")
-    monkeypatch.setenv("DEBILGI_RESPONSE_CONFIDENCE_THRESHOLD", "0.51")
-    monkeypatch.setenv("DEBILGI_RESPONSE_PLAN_RETRY_LIMIT", "3")
     monkeypatch.setenv("DEBILGI_OPEN_QUESTION_TTL_MESSAGES", "4")
 
     settings = Settings.from_env()
 
-    assert settings.character_markov_min_order == 3
-    assert settings.character_markov_max_order == 7
     assert settings.conversation_idle_timeout_minutes == 35
     assert settings.conversation_max_idle_timeout_minutes == 55
     assert settings.curiosity_threshold == pytest.approx(0.72)
-    assert settings.response_confidence_threshold == pytest.approx(0.51)
-    assert settings.response_plan_retry_limit == 3
     assert settings.open_question_ttl_messages == 4
 
 
@@ -247,9 +239,7 @@ def test_context_gate_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_response_arbitration_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DEBILGI_ARBITRATION_MODE", "shadow")
     monkeypatch.setenv("DEBILGI_ARBITRATION_MIN_SCORE", "0.52")
-    monkeypatch.setenv("DEBILGI_ARBITRATION_MAX_TOTAL_CANDIDATES", "36")
     monkeypatch.setenv("DEBILGI_ARBITRATION_LEARNING_ENABLED", "true")
     monkeypatch.setenv("DEBILGI_ARBITRATION_LEARNING_RATE", "0.02")
     monkeypatch.setenv("DEBILGI_ARBITRATION_MIN_FEEDBACK_OBSERVATIONS", "30")
@@ -257,32 +247,15 @@ def test_response_arbitration_is_configurable(monkeypatch: pytest.MonkeyPatch) -
 
     settings = Settings.from_env()
 
-    assert settings.arbitration_mode == "shadow"
     assert settings.arbitration_minimum_score == pytest.approx(0.52)
-    assert settings.arbitration_max_total_candidates == 36
     assert settings.arbitration_learning_enabled is True
     assert settings.arbitration_learning_rate == pytest.approx(0.02)
     assert settings.arbitration_minimum_feedback_observations == 30
     assert settings.arbitration_maximum_weight_delta == pytest.approx(0.04)
 
 
-def test_invalid_response_arbitration_mode_is_rejected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("DEBILGI_ARBITRATION_MODE", "random")
-
-    with pytest.raises(ConfigurationError, match="off, shadow or active"):
-        Settings.from_env()
 
 
-def test_language_development_ranges_are_validated(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("DEBILGI_CHARACTER_MARKOV_MIN_ORDER", "9")
-    monkeypatch.setenv("DEBILGI_CHARACTER_MARKOV_MAX_ORDER", "8")
-
-    with pytest.raises(ConfigurationError, match="minimum order"):
-        Settings.from_env()
 
 
 def test_wikipedia_mode_and_language_are_configurable(

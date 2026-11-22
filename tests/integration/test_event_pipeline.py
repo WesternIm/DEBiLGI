@@ -272,3 +272,97 @@ async def test_reaction_redelivery_is_once_but_add_and_remove_are_distinct(
         assert await repository.count(1) == 2
     finally:
         await pipeline.stop()
+
+
+async def test_answer_waits_only_for_required_observers(database):
+    repository = EventRepository(database)
+    before, after = asyncio.Event(), asyncio.Event()
+
+    async def required(_event):
+        before.set()
+
+    async def learning(_event):
+        after.set()
+
+    pipeline = EventPipeline(repository, [required], post_handlers=[learning])
+    await pipeline.start()
+    try:
+        waiter = asyncio.create_task(pipeline.wait_until_ready("pipeline:1"))
+        await asyncio.sleep(0)
+        await pipeline.publish(make_event())
+        assert await asyncio.wait_for(waiter, 1)
+        assert before.is_set() and not after.is_set()
+        pipeline.finish_response("pipeline:1")
+        await asyncio.wait_for(pipeline.join(), 1)
+        assert after.is_set()
+        assert await pipeline.wait_until_processed("pipeline:1")
+    finally:
+        pipeline.finish_response("pipeline:1")
+        await pipeline.stop()
+
+
+async def test_timed_out_waiter_does_not_disconnect_another_waiter(database):
+    release = asyncio.Event()
+
+    async def required(_event):
+        await release.wait()
+
+    pipeline = EventPipeline(EventRepository(database), [required])
+    await pipeline.start()
+    try:
+        await pipeline.publish(make_event())
+        first = asyncio.create_task(pipeline.wait_until_processed("pipeline:1", timeout=.01))
+        second = asyncio.create_task(pipeline.wait_until_processed("pipeline:1", timeout=1))
+        assert not await first
+        release.set()
+        assert await second
+    finally:
+        release.set()
+        await pipeline.stop()
+
+
+async def test_recovered_event_does_not_reuse_cancelled_wait_result(database):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def required(_event):
+        entered.set()
+        await release.wait()
+
+    pipeline = EventPipeline(EventRepository(database), [required])
+    await pipeline.start()
+    try:
+        await pipeline.publish(make_event())
+        await asyncio.wait_for(entered.wait(), 1)
+        await pipeline.stop(drain=False)
+        assert not await pipeline.wait_until_processed("pipeline:1")
+        await pipeline.start()
+        waiter = asyncio.create_task(pipeline.wait_until_processed("pipeline:1"))
+        await asyncio.sleep(0)
+        release.set()
+        assert await asyncio.wait_for(waiter, 1)
+    finally:
+        release.set()
+        await pipeline.stop()
+
+
+async def test_previous_turn_learning_does_not_block_next_turn_readiness(database):
+    learning_entered, release = asyncio.Event(), asyncio.Event()
+
+    async def learning(event):
+        if event.event_id == "first":
+            learning_entered.set()
+            await release.wait()
+
+    pipeline = EventPipeline(EventRepository(database), post_handlers=[learning])
+    await pipeline.start()
+    try:
+        await pipeline.publish(make_event("first"))
+        await asyncio.wait_for(learning_entered.wait(), 1)
+        await pipeline.publish(make_event("second"))
+        assert await pipeline.wait_until_ready("second", timeout=.5)
+        pipeline.finish_response("second")
+        assert not release.is_set()
+    finally:
+        release.set()
+        pipeline.finish_response("second")
+        await pipeline.stop()

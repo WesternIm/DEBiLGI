@@ -8,11 +8,6 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from debilgi.language.character_markov import (
-    CharacterMarkovConfig,
-    character_transition_rows,
-    words_from_text,
-)
 from debilgi.language.content import content_lemmas
 from debilgi.language.discourse import store_discourse_turn
 from debilgi.language.models import ArchivedMessage, ArchiveImportJob, ImportStatus
@@ -39,11 +34,8 @@ class ArchiveRepository:
     def __init__(
         self,
         database: Database,
-        *,
-        character_markov_config: CharacterMarkovConfig | None = None,
     ) -> None:
         self._database = database
-        self._character_markov_config = character_markov_config or CharacterMarkovConfig()
 
     async def create_job(
         self,
@@ -223,11 +215,6 @@ class ArchiveRepository:
             2: ngram_frequencies(tokens, 2),
             3: ngram_frequencies(tokens, 3),
         }
-        character_rows, _ = character_transition_rows(
-            message.guild_id,
-            words_from_text(message.content),
-            self._character_markov_config,
-        )
 
         async with self._database.transaction() as connection:
             job_row = await (
@@ -296,16 +283,6 @@ class ArchiveRepository:
                 content=message.content,
                 observed_at=message.created_at.astimezone(UTC).isoformat(),
             )
-
-            if character_rows:
-                await connection.executemany(
-                    """INSERT INTO language_character_transitions (
-                        guild_id, order_size, prefix, next_character, count
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT (guild_id, order_size, prefix, next_character)
-                    DO UPDATE SET count = count + excluded.count""",
-                    character_rows,
-                )
 
             if token_counts:
                 await connection.executemany(

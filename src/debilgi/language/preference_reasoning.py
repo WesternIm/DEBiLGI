@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from debilgi.language.character_markov import normalize_word
 from debilgi.language.content import content_lemmas
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
 from debilgi.language.productive_nlg import (
@@ -13,6 +12,7 @@ from debilgi.language.productive_nlg import (
     ConceptLexeme,
     SemanticDependency,
 )
+from debilgi.language.tokenizer import normalize_word
 from debilgi.personality.perspective import PersonalityPerspective
 
 _APPRAISAL_DIMENSIONS: tuple[tuple[str, float, frozenset[str]], ...] = (

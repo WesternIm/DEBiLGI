@@ -91,11 +91,19 @@ def plan_dialogue_moves(
     context_messages: tuple[str, ...] = (),
     exchange: DialogueExchange | None = None,
     resolve_from_context: bool = True,
+    observed_forms: tuple = (),
+    reaction_act: str | None = None,
+    allow_hook_question: bool = True,
+    alignment: float | None = None,
 ) -> tuple[DialogueMovePlan, ...]:
     """Build competing moves from state, stance and conversational context."""
 
     if frame is None:
         return ()
+    if reaction_act is not None:
+        return _fragment_moves(frame, personality=personality, reaction=reaction, prompt=prompt,
+                               observed_forms=observed_forms, reaction_act=reaction_act,
+                               allow_hook_question=allow_hook_question, alignment=alignment)
     if is_contact_request(prompt):
         return (DialogueMovePlan(
             move="engage", strategy="answer_contact",
@@ -381,7 +389,29 @@ def _fragment_moves(
     personality: PersonalityExpression | None,
     reaction: SocialReaction | None,
     prompt: str,
+    observed_forms: tuple = (),
+    reaction_act: str | None = None,
+    allow_hook_question: bool = True,
+    alignment: float | None = None,
 ) -> tuple[DialogueMovePlan, ...]:
+    if reaction_act is not None:
+        cores = [f for f in observed_forms if f.component == "core" and (
+            f.clause_kind != "question" or allow_hook_question)]
+        # Input features have already propagated through the learned exchange
+        # graph. Bind the winning meaning without a fixed act priority table.
+        winner = max(cores, key=lambda f: (f.activation, f.relevance, f.support,
+                                           f.rule_id or ""), default=None)
+        meanings = [winner.meaning] if winner is not None else []
+        confidence = winner.activation if winner and winner.rule_id else 1.0
+        return tuple(DialogueMovePlan(
+            move=m, strategy="observed_exchange", thought=ClauseThought(
+                ConceptLexeme(m, m, "dialogue_act"), (), clause_kind="fragment",
+                predicate_class="dialogue_act", confidence=confidence,
+                evidence=tuple(dict.fromkeys(e for f in observed_forms if f.meaning == m
+                                             for e in f.evidence_ids)),
+            ), confidence=confidence, stance="follow_event_valence", evidence=(),
+            semantic_origin="derived",
+        ) for m in meanings[:1])
     target = frame.objects[0] if frame.objects else ""
     arousal = reaction.vector.arousal if reaction is not None else 0.0
     curiosity = personality.curiosity if personality is not None else 0.5

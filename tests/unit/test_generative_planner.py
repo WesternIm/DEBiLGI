@@ -196,7 +196,7 @@ def test_frequency_modifier_survives_proposition_reconstruction():
     )
 
 
-def test_contact_resumes_user_content_request_without_an_attention_script():
+def test_contact_opens_new_episode_instead_of_resuming_a_content_request():
     result = plan_from_evidence(
         ReplyContext(
             prompt="але",
@@ -204,8 +204,8 @@ def test_contact_resumes_user_content_request_without_an_attention_script():
             knowledge_facts=("Кварц является минералом.",),
         )
     )
-    assert len(result.proposals) == 1
-    assert result.proposals[0].plan.claim.predicate.lemma == "являться"
+    assert not result.proposals
+    assert result.objective.predicate is None
 
 
 def test_connected_memory_conflict_is_not_presented_as_a_continuation():
@@ -291,7 +291,7 @@ def test_self_capability_is_planned_before_distributional_wording(
     assert proposal.plan.claim.negated
 
 
-def test_contact_resumes_unanswered_capability_before_planning() -> None:
+def test_contact_does_not_resume_an_unanswered_capability() -> None:
     question = "Ты машиной управлять можешь?"
     result = plan_from_evidence(
         ReplyContext(
@@ -301,9 +301,8 @@ def test_contact_resumes_unanswered_capability_before_planning() -> None:
         )
     )
 
-    assert len(result.proposals) == 1
-    assert result.proposals[0].operation == "resolve_capability"
-    assert result.proposals[0].plan.claim.negated
+    assert not result.proposals
+    assert result.objective.kind == "respond"
 
 
 @pytest.mark.parametrize("prompt", ["ну так что? Можешь?", "але", "аууу"])
@@ -326,6 +325,10 @@ def test_elliptical_modal_and_contact_skip_incomplete_turns_to_recover_action(
     )
 
     resolved = resolve_evidence_context(context)
+    if prompt in {"але", "аууу"}:
+        assert resolved.prompt == prompt
+        assert not plan_from_evidence(context).proposals
+        return
     assert resolved.prompt == question
     result = plan_from_evidence(context)
     assert len(result.proposals) == 1

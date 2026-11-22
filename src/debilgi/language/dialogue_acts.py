@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
@@ -77,6 +78,98 @@ class DialogueActFrame:
     complete: bool
     confidence: float
     evidence: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TurnForm:
+    """Observable turn shape. No open-class word needs a dictionary reading."""
+
+    kind: str
+    tone: tuple[str, ...]
+    addressed: bool = False
+    address_evidence: tuple[str, ...] = ()
+    follows_bot: bool = False
+    prior_bot_move: str | None = None
+    habitual_tone: tuple[str, ...] = ()
+    tone_change: tuple[str, ...] = ()
+
+
+def analyze_turn_form(
+    text: str, *, addressed: bool = False, address_evidence: tuple[str, ...] = (),
+    follows_bot: bool = False, previous_bot_text: str = "",
+    habitual_tone: tuple[str, ...] = (),
+) -> TurnForm:
+    """Closed grammar, punctuation and social cues precede semantic analysis.
+
+    Unmarked foreign/slang fragments stay fragments: their hostile meaning
+    cannot honestly be inferred from an unfamiliar spelling alone.
+    """
+    text = re.sub(r"<@!?\d+>", " ", text)
+    words = tuple(t.casefold().replace("ё", "е") for t in tokenize(text) if t[:1].isalnum())
+    pragmatics = analyze_pragmatics(text)
+    functions = pragmatics.functions
+    counts = evidence_counts(words)
+    tone = tuple(sorted(
+        ({"coarse"} if "coarse_emphasis" in functions else set())
+        | ({"caps"} if any(t.isupper() for t in re.findall(r"[^\W\d_]{2,}", text)) else set())
+        | ({"smile"} if ")" in text else set())
+        | ({"sad"} if "(" in text else set())
+        | ({"emphatic"} if "!" in text else set())
+    ))
+    wh = {"кто", "что", "че", "чё", "где", "куда", "откуда", "когда", "почему",
+          "зачем", "как", "какой", "какая", "какую", "какие", "чем", "сколько"}
+    question = "?" in text or bool(set(words) & wh)
+    if question and "?" not in text and set(words) & wh == {"что"}:
+        # «что» that only introduces a complement clause («ты говорил, что…») is a conjunction.
+        from debilgi.language.structured_utterance import analyze_structured_utterance
+
+        linked = analyze_structured_utterance(text)
+        question = not any(
+            link.relation == "ccomp" and linked.tokens[link.marker_index].lemma == "что"
+            for link in linked.clause_links
+        )
+    call = "attention_call" in functions or bool(words and len(words) <= 3 and re.fullmatch(
+        r"а(?:л+[оауе]+|у+)", words[0]))
+    # Surface inflections are cues, not a demand for a known predicate lemma.
+    imperative = any(re.fullmatch(r"[а-я]{2,}(?:й|йте|ись|итесь)", w) for w in words
+                     if not w.endswith(("ый", "ий"))
+                     and w not in {"мой", "твой", "свой", "такой", "какой"})
+    quality_shape = bool(set(words) & {"ты", "вы"}) and any(
+        w.endswith(("ый", "ий", "ой", "ая", "ое", "ые")) for w in words)
+    from debilgi.language.structured_utterance import analyze_structured_utterance
+
+    has_predicate = follows_bot and any(
+        t.part_of_speech == "verb" for t in analyze_structured_utterance(text).tokens)
+    repair = follows_bot and (
+        bool(set(words) & {"почему", "зачем"}) and len(words) <= 6 and not has_predicate
+        or bool(set(words) & {"какую", "какой", "какие", "какая"})
+        and len(words) <= 4 and not has_predicate
+        or {"к", "чему"} <= set(words)
+        or bool(set(words) & {"че", "что"}) and "так" in words and len(words) <= 5
+        or bool(set(words) & {"че", "что"}) and len(words) <= 5 and not has_predicate
+        and bool((set(words) - {"че", "что", "а", "это"}) & {
+            t.casefold().replace("ё", "е") for t in tokenize(previous_bot_text)
+        })
+        or "не" in words and bool(set(words) & {"понял", "поняла", "понимаю", "понятно"})
+        and bool(set(words) & {"ты", "тебя", "это", "я"})
+    )
+    kind = (
+        "repair" if repair
+        else "greeting" if "greeting" in functions and len(words) <= 3
+        else "call" if call
+        else "question" if question
+        else "request" if imperative and not quality_shape
+        else "self_report" if set(words) & {"я", "мне"} and len(words) > 1
+        else "evaluation" if set(words) & {"ты", "вы"} and len(words) > 1
+        else "amusement" if "amusement" in functions
+        else "positive_evaluation" if counts["approval"]
+        else "negative_evaluation" if counts["disapproval"] or counts["aversion"]
+        else "emotion" if functions & {"regret", "joy", "annoyance", "aversion"}
+        else "fragment" if words else "empty"
+    )
+    prior = ("question" if "?" in previous_bot_text else "statement") if previous_bot_text else None
+    return TurnForm(kind, tone, addressed, address_evidence, follows_bot, prior,
+                    habitual_tone, tuple(t for t in tone if t not in habitual_tone))
 
 
 def analyze_dialogue_act(

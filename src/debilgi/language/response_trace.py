@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -18,6 +19,124 @@ _SENSITIVE_KEY_PARTS = ("authorization", "cookie", "password", "secret", "token"
 _MAX_TEXT = 4_000
 _MAX_ITEMS = 100
 _MAX_DEPTH = 7
+
+
+def content_diagnostic(
+    *, source: str, renderer: str, speech_act: str, metadata: Mapping[str, Any],
+    candidate_id: str, text: str = "",
+) -> dict[str, Any]:
+    """Describe existing content, never create a plan or affect admission/scoring.
+
+    A surface-only ID explicitly records the absence of a prior semantic plan.
+    It must not be mistaken for a validated meaning or a new memory claim.
+    """
+    origin = metadata.get("meaning_origin") or metadata.get("semantic_origin") or source
+    plan_key = metadata.get("intention_plan_key") or metadata.get("message_plan_key")
+    if source == "interlocutor_clarification":
+        content_source = "clarification_recovery"
+    elif source == "learned_distribution":
+        content_source = "corpus_generation"
+    elif source == "learned_dialogue_structure":
+        content_source = "social_form"
+    elif source == "discord_identity":
+        content_source = "runtime_identity"
+    elif source == "affective_stance":
+        content_source = "affective_stance"
+    elif plan_key:
+        content_source = "semantic_plan"
+    elif source in {"proposition_memory", "knowledge_retrieval", "retrieval"}:
+        content_source = "proposition_memory"
+    elif source == "dialogue_task":
+        content_source = "current_turn_request"
+    else:
+        content_source = "other"
+    act = metadata.get("learned_response_act") or speech_act
+    if source == "interlocutor_clarification" or metadata.get("genuine_clarification"):
+        category = "clarification"
+    elif (metadata.get("communicative_status") == "express_limit"
+          or metadata.get("derivation") == "query_unobserved_relation"):
+        category = "epistemic"
+    elif (metadata.get("reaction_meaning") or metadata.get("observed_form", {}).get("reactive_act")
+          or act in {"greeting", "farewell", "thanks", "gratitude", "contact"}
+          or (source == "learned_dialogue_structure" and act == "fragment"
+              and set(text.casefold().rstrip(".!?").split()) & {"спасибо", "благодарю"})):
+        category = "social"
+    else:
+        category = "informative"
+    identity = str(plan_key or candidate_id)
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    premises = metadata.get("premises") or ()
+    return {
+        "content_source": content_source, "origin": origin, "producer": source,
+        "renderer": renderer, "speech_act": act, "category": category,
+        "plan_id": f"plan:{digest}" if plan_key else f"surface-only:{digest}",
+        "meaning_id": f"meaning:{digest}" if plan_key else f"observed-content:{digest}",
+        "plan_basis": "semantic_plan" if plan_key else "surface_only",
+        "plan_key": plan_key, "intention_id": metadata.get("meaning_intention_id"),
+        "operation": metadata.get("derivation") or metadata.get("semantic_operation"),
+        "exchange_pattern_id": metadata.get("exchange_pattern_id"),
+        "exchange_clause_kind": metadata.get("exchange_clause_kind"),
+        "reaction_meaning": metadata.get("reaction_meaning"),
+        "event_valence": metadata.get("event_valence"),
+        "condition_report": metadata.get("condition_report"),
+        "part_search": metadata.get("part_search"),
+        "reverse_check": metadata.get("reverse_check"),
+        "response_mixture": metadata.get("response_mixture"),
+        "known_slots": metadata.get("known_slots"),
+        "hypothesis": metadata.get("hypothesis"),
+        "hypothetical_assertions": metadata.get("hypothetical_assertions"),
+        "personal_choice": metadata.get("choice_context", {}).get("choice"),
+        "surface_choice": metadata.get("surface_choice"),
+        "scope_candidates": metadata.get("choice_context", {}).get("scope_candidates", ()),
+        "fact_previews": metadata.get("choice_context", {}).get("fact_previews", ()),
+        "coalition": metadata.get("coalition"),
+        "borrowed_support": metadata.get("borrowed_support"),
+        "reconsideration": {k: metadata.get("choice_context", {}).get(k)
+                            for k in ("failures", "questions", "reactivation")},
+        "reaction_rule": next(({k: p.get(k) for k in (
+            "rule_id", "rule_weight", "activation", "input_features", "target_features",
+            "activation_source_ids", "evidence_ids",
+        )} for p in metadata.get("reaction_parts", ()) if p["component"] == "core"), None),
+        "reaction_parts": tuple({"part_id": p["pattern_id"], "component": p["component"],
+                                 "meaning": p["meaning"], "evidence_ids": p["evidence_ids"]}
+                                for p in metadata.get("reaction_parts", ())),
+        "evidence_kinds": tuple(dict.fromkeys(getattr(p, "kind", "unknown") for p in premises)),
+        "premise_references": tuple({
+            "evidence_id": getattr(p, "evidence_id", None),
+            "kind": getattr(p, "kind", "unknown"), "reference": getattr(p, "text", None),
+        } for p in premises),
+        "evidence_ids": tuple(dict.fromkeys((
+            *metadata.get("reasoning_evidence", ()),
+            *metadata.get("corpus_source_event_ids", ()),
+        ))),
+    }
+
+
+def reason_kind(code: str, stage: str = "") -> str:
+    """Diagnostic labels only; preserve the original code and its stage as evidence."""
+    if stage in {"send", "delivery"}:
+        return "delivery_failure"
+    if any(part in code for part in (
+        "parse_failure", "parse_failed", "unparseable", "unsupported_query_construction",
+    )):
+        return "parse_failure"
+    if any(part in code for part in (
+        "ungrounded", "not_grounded", "missing_fact", "no_evidence", "query_has_no_supported_fact",
+    )):
+        return "missing_fact"
+    if any(part in code for part in ("ambiguous", "ambiguity", "intent_uncertain")):
+        return "ambiguity"
+    if any(part in code for part in (
+        "surface", "mismatch", "changed_", "missing_subject", "missing_predicate",
+        "missing_object", "agreement", "case_government", "unrealizable_selected_plan",
+    )):
+        return "realization_mismatch"
+    if ("timeout" in code or "exception" in code
+            or code in {"query_not_executed", "query_execution_failed"}):
+        return "upstream_failure"
+    if any(part in code for part in ("disabled", "budget", "automatic_definition")):
+        return "policy"
+    return "selection_failure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +300,14 @@ class ResponseTraceRepository:
         completed_at: datetime | None = None,
     ) -> None:
         timestamp = completed_at or datetime.now(UTC)
+        diagnostic = None
+        try:
+            diagnostic = await self.diagnostics_for_event(
+                event_id, status=status, selected_route=selected_route, final_text=final_text,
+                failure_stage=failure_stage, failure_reason=failure_reason,
+            )
+        except Exception:
+            _logger.exception("trace_diagnostic_failed event=%s", event_id)
         await self.step(
             event_id,
             stage="completed",
@@ -198,6 +325,7 @@ class ResponseTraceRepository:
                 "arbitration_decision_id": arbitration_decision_id,
                 "failure_stage": failure_stage,
                 "failure_reason": failure_reason,
+                "diagnostic": diagnostic,
             },
             created_at=timestamp,
         )
@@ -269,6 +397,115 @@ class ResponseTraceRepository:
             }
             for row in rows
         )
+
+    async def diagnostics_for_event(
+        self, event_id: str, *, status: str | None = None, selected_route: str | None = None,
+        final_text: str | None = None, failure_stage: str | None = None,
+        failure_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Read-only projection over existing traces, not a second reply policy.
+
+        Categories describe acts, not usefulness. `ambiguity` may be merely the
+        legacy recovery label; its code remains visible, not certified as a parse.
+        Feedback is an observed consequence, separately from preparation/delivery.
+        """
+        steps = await self.steps_for_event(event_id)
+        row = await self._database.fetchone(
+            "SELECT * FROM language_response_traces WHERE source_event_id = ?", (event_id,),
+        )
+        root = dict(row) if row else {}
+        route = next((s["details"] for s in reversed(steps) if s["stage"] == "route"), {})
+        status = status or root.get("status") or "started"
+        selected_route = (
+            selected_route or root.get("selected_route") or route.get("response_source")
+        )
+        final_text = final_text or root.get("final_text") or route.get("text")
+        failure_stage = failure_stage or root.get("failure_stage")
+        failure_reason = failure_reason or root.get("failure_reason")
+        delivery = next((s for s in reversed(steps) if s["stage"] == "delivery"), None)
+        if delivery and delivery["status"] in {"failed", "uncertain"} and status != "sent":
+            status, failure_stage = delivery["status"], "delivery"
+            failure_reason = delivery["details"].get("reason")
+        selections = [item for item in (
+            s["details"] if s["stage"] == "selection" else s["details"].get("selection", {})
+            for s in steps
+            if s["stage"] == "selection" or "selection" in s["details"]
+        ) if isinstance(item, dict)]
+        selected = next((
+            item for item in reversed(selections)
+            if item.get("winner_text") == final_text and item.get("diagnostic")
+            and (not selected_route or selected_route.removeprefix("arbitrated:")
+                 == item.get("winner_source"))
+        ), {})
+        content = selected.get("diagnostic")
+        if content is None and final_text:
+            content = content_diagnostic(
+                source=(selected_route or "other").removeprefix("arbitrated:"),
+                renderer="route_without_candidate", speech_act="unknown", metadata={},
+                candidate_id=f"{event_id}:{selected_route}",
+            )
+        category = (
+            "error" if status in {"failed", "uncertain", "error"} else
+            "withheld" if status in {"withheld", "no_reply"} else
+            content["category"] if content else "withheld"
+        )
+        reasons: dict[str, list[dict[str, Any]]] = {
+            key: [] for key in (
+                "parse_failure", "missing_fact", "ambiguity", "realization_mismatch",
+                "delivery_failure", "policy", "upstream_failure", "selection_failure",
+            )
+        }
+
+        def add_reason(code, stage):
+            if not isinstance(code, str) or not code:
+                return
+            bucket = reasons[reason_kind(code, stage)]
+            item = {"code": code, "stage": stage}
+            if item not in bucket:
+                bucket.append(item)
+
+        for step in steps:
+            if step["component"] == "response_mode":
+                decision = step["details"].get("decision", {})
+                if decision.get("mode") in {"silence_or_unknown", "clarification"}:
+                    add_reason(decision.get("reason"), "response_mode")
+            if step["status"] in {"withheld", "failed", "clarify", "uncertain"}:
+                add_reason(step["details"].get("reason"), step["stage"])
+            parsed = step["details"].get("input_parse")
+            if parsed and not parsed["has_tokens"]:
+                add_reason("parse_failure:no_tokens", "input_parse")
+            if parsed and parsed["ambiguities"]:
+                add_reason("ambiguity:parser_alternatives", "input_parse")
+        for selection in selections:
+            for score in selection.get("scores", ()):
+                for code in score.get("rejection_reasons", ()):
+                    add_reason(code, "candidate_rejection")
+        if category in {"withheld", "error"}:
+            failure_reason = failure_reason or "no_admissible_candidate"
+            add_reason(failure_reason, failure_stage or "preparation")
+        gate = next((s["status"] for s in reversed(steps) if s["stage"] == "context_gate"), None)
+        return {
+            "category": category, "content": content,
+            "plan_id": content["plan_id"] if content else f"no-content:{event_id}",
+            "meaning_id": content["meaning_id"] if content else f"meaning-turn:{event_id}",
+            "content_source": content["content_source"] if content else "none",
+            "decision_id": selected.get("decision_id"),
+            "withhold_reason": (
+                {"kind": reason_kind(failure_reason, failure_stage or "preparation"),
+                 "code": failure_reason, "stage": failure_stage or "preparation"}
+                if category in {"withheld", "error"} else None
+            ),
+            "reasons": reasons,
+            "selection_path": [
+                {"stage": s["stage"], "component": s["component"], "status": s["status"],
+                 "selection_reason": s["details"].get("selection_reason")}
+                for s in steps if s["stage"] != "completed"
+            ],
+            "preparation": "prepared" if route else "no_surface",
+            "gate": gate, "receipt": any(s["stage"] == "send" and s["status"] == "sent"
+                                         for s in steps),
+            "feedback": [s["details"] for s in steps if s["stage"] == "feedback"],
+        }
 
     async def trace_for_guild(
         self,

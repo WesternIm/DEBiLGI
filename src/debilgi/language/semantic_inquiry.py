@@ -17,6 +17,7 @@ from debilgi.language.productive_nlg import (
     DependencyPattern,
     ProductiveSurface,
     SemanticDependency,
+    identity_graph,
     realize_thought,
 )
 from debilgi.language.structured_utterance import (
@@ -202,6 +203,7 @@ def inquiry_trace(inquiry: SemanticInquiry) -> dict[str, object]:
                 "epistemic_status": item.epistemic_status,
                 "confidence": item.confidence,
                 "predicate": item.thought.predicate.lemma,
+                "proposition": identity_graph(item.thought),
                 "roles": tuple(
                     (dependency.role, dependency.argument.head.lemma)
                     for dependency in item.thought.dependencies

@@ -8,9 +8,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from debilgi.language.addressing import DEFAULT_ADDRESSING
-from debilgi.language.character_markov import normalize_word
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
-from debilgi.language.tokenizer import tokenize
+from debilgi.language.tokenizer import normalize_word, tokenize
 
 if TYPE_CHECKING:
     from debilgi.language.productive_nlg import ClauseThought

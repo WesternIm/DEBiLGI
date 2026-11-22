@@ -229,7 +229,9 @@ def build_response_meaning_plan(
 
 
 def realize_response_meaning(
-    plan: ResponseMeaningPlan, *, allow_rough: bool = False,
+    plan: ResponseMeaningPlan,
+    *,
+    allow_rough: bool = False,
 ) -> str | None:
     """Render complete propositions; return no candidate for an incomplete frame."""
 
@@ -542,31 +544,55 @@ def _rejection(
 
 
 def _proposition_signature(proposition: MeaningProposition) -> tuple[object, ...]:
-    return (
-        _argument_key(proposition.subject),
-        proposition.predicate.lemma if proposition.predicate else proposition.implicit_predicate,
-        _argument_key(proposition.predicate_complement),
-        _argument_key(proposition.direct_object),
-        _argument_key(proposition.indirect_object),
-        tuple(
-            (item.role, item.preposition, _argument_key(item.argument))
-            for item in proposition.complements
-        ),
-        proposition.negated,
+    from debilgi.language.productive_nlg import (
+        ClauseThought,
+        ConceptArgument,
+        ConceptLexeme,
+        SemanticDependency,
     )
+    from debilgi.language.semantic_graph import proposition_key
 
+    def word(w):
+        return ConceptLexeme(
+            w.lemma,
+            w.preferred_surface,
+            w.part_of_speech,
+            w.grammatical_features,
+            w.entity_kind,
+            f"entity:{w.entity_id}" if w.entity_id is not None else None,
+        )
 
-def _argument_key(argument: MeaningArgument | None) -> tuple[object, ...] | None:
-    if argument is None:
-        return None
-    entity_key = (
-        (argument.head.entity_kind, argument.head.entity_id)
-        if argument.head.entity_id is not None
-        else None
+    dependencies = []
+    for role, arg in (
+        ("subject", proposition.subject),
+        ("predicate_complement", proposition.predicate_complement),
+        ("direct_object", proposition.direct_object),
+        ("indirect_object", proposition.indirect_object),
+    ):
+        if arg:
+            dependencies.append(
+                SemanticDependency(
+                    role, ConceptArgument(word(arg.head), tuple(word(m) for m in arg.modifiers))
+                )
+            )
+    for item in proposition.complements:
+        dependencies.append(
+            SemanticDependency(
+                item.role,
+                ConceptArgument(
+                    word(item.argument.head),
+                    tuple(word(m) for m in item.argument.modifiers),
+                    preposition=item.preposition,
+                ),
+            )
+        )
+    predicate = (
+        word(proposition.predicate)
+        if proposition.predicate
+        else ConceptLexeme(proposition.implicit_predicate or "", "")
     )
-    return (
-        entity_key or argument.head.lemma,
-        tuple(item.lemma for item in argument.modifiers),
+    return proposition_key(
+        ClauseThought(predicate, tuple(dependencies), negated=proposition.negated)
     )
 
 

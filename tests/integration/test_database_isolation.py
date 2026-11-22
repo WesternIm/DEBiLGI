@@ -54,11 +54,14 @@ async def test_other_task_cannot_read_uncommitted_changes(
         await asyncio.wait_for(entered.wait(), timeout=2)
         read_task = asyncio.create_task(reader())
         await asyncio.wait_for(reading.wait(), timeout=2)
-        assert not read_task.done()
+        # The WAL reader may complete before the writer commits. Establish
+        # that ordering explicitly, then check a fresh post-commit snapshot.
+        rows = await asyncio.wait_for(read_task, timeout=2)
+        assert rows[0]["value"] == 1
         release.set()
         await asyncio.wait_for(write_task, timeout=2)
-        rows = await asyncio.wait_for(read_task, timeout=2)
-        assert rows[0]["value"] == (1 if rollback else 2)
+        current = await database.fetchone("SELECT value FROM isolation_probe")
+        assert current["value"] == (1 if rollback else 2)
     finally:
         release.set()
         tasks = [write_task] + ([read_task] if read_task is not None else [])
@@ -94,3 +97,41 @@ async def test_failed_initialization_can_be_retried(tmp_path: Path) -> None:
         assert await database.schema_version() == 1
     finally:
         await database.close()
+
+
+async def test_reader_uses_committed_snapshot_without_waiting_for_writer(database):
+    async with database.transaction() as connection:
+        await connection.execute("UPDATE isolation_probe SET value = 7")
+        async def committed_read():
+            return await database.fetchone("SELECT value FROM isolation_probe")
+        row = await asyncio.wait_for(asyncio.create_task(committed_read()), timeout=1)
+        assert row["value"] == 1
+        assert (await database.fetchone("SELECT value FROM isolation_probe"))["value"] == 7
+    assert (await database.fetchone("SELECT value FROM isolation_probe"))["value"] == 7
+
+
+async def test_overlapping_readers_do_not_reuse_a_pre_commit_cursor_snapshot(database):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def old_reader():
+        async with (
+            database._read_connection() as connection,
+            connection.execute("SELECT value FROM isolation_probe") as cursor,
+        ):
+            assert (await cursor.fetchone())["value"] == 1
+            entered.set()
+            await release.wait()
+
+    first = asyncio.create_task(old_reader())
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        await database.execute("UPDATE isolation_probe SET value = 8")
+        second = asyncio.create_task(database.fetchone("SELECT value FROM isolation_probe"))
+        await asyncio.sleep(0)
+        release.set()
+        await first
+        assert (await asyncio.wait_for(second, 1))["value"] == 8
+    finally:
+        release.set()
+        await asyncio.gather(first, *([second] if second else []), return_exceptions=True)

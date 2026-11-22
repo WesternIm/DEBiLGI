@@ -297,3 +297,74 @@ async def test_reconciliation_requires_nonce_and_bot_author():
     assert (await transport.find_sent(incoming, reply())).id == 102
     messages.pop()
     assert await transport.find_sent(incoming, reply()) is None
+
+
+@pytest.mark.parametrize('no_reply,cancel', [(False, False), (True, False), (False, True)])
+async def test_typing_spans_preparation_and_send_and_always_closes(
+    environment, monkeypatch, no_reply, cancel,
+):
+    from contextlib import asynccontextmanager
+
+    env = environment
+    active = []
+    sequence = []
+
+    @asynccontextmanager
+    async def typing(_event):
+        active.append(True)
+        sequence.append('typing')
+        try:
+            yield object()
+        finally:
+            active.pop()
+            sequence.append('closed')
+
+    async def prepare(_event):
+        assert active
+        sequence.append('prepare')
+        if cancel:
+            raise asyncio.CancelledError
+        return None if no_reply else replace(reply(), deliberation_steps=6)
+
+    async def send(*_args):
+        assert active
+        sequence.append('send')
+        return env.sent
+
+    async def sleep(seconds):
+        assert active and 0 < seconds <= 6
+        sequence.append('pace')
+
+    env.transport.typing = typing
+    env.workflow.prepare.side_effect = prepare
+    env.transport.send.side_effect = send
+    monkeypatch.setattr('debilgi.discord.delivery.asyncio.sleep', sleep)
+    await env.events.append(event())
+    if cancel:
+        with pytest.raises(asyncio.CancelledError):
+            await env.service.run_once()
+    else:
+        await env.service.run_once()
+    assert not active and sequence[-1] == 'closed'
+    if no_reply or cancel:
+        assert 'send' not in sequence and 'pace' not in sequence
+    else:
+        assert sequence == ['typing', 'prepare', 'pace', 'send', 'closed']
+
+
+async def test_invalid_typing_channel_is_terminal_before_preparation(environment):
+    from contextlib import asynccontextmanager
+
+    env = environment
+
+    @asynccontextmanager
+    async def typing(_event):
+        raise ValueError('delivery channel does not belong to the event guild')
+        yield  # pragma: no cover - makes this an async context manager
+
+    env.transport.typing = typing
+    await env.events.append(event())
+    await env.service.run_once()
+    assert (await env.repository.get(event().event_id))['status'] == 'failed'
+    env.workflow.prepare.assert_not_awaited()
+    env.transport.send.assert_not_awaited()

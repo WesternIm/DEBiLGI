@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from debilgi.language.generative_planner import ResponseDecision
 
 from debilgi.cognition.dialogue_tasks import DialogueSituation
 from debilgi.cognition.models import ActionIntent, ActionType
 from debilgi.language.assertion_memory import AssertionMemory, ContinuationPlan
+from debilgi.language.canonical_claims import Known, Unknown
 from debilgi.language.construction_nlg import ConstructionSpec
+from debilgi.language.dialogue_acts import TurnForm
 from debilgi.language.dialogue_obligations import BoundDialogueReport
 from debilgi.language.dialogue_state import DialogueStateAnalysis
 from debilgi.language.productive_nlg import DependencyPattern
 from debilgi.language.semantic_graph import MeaningGoal, MeaningRecord
 from debilgi.language.social_reasoning import SocialPolicy
+from debilgi.language.structured_utterance import StructuredUtterance, analyze_structured_utterance
 from debilgi.language.usage_learning import UsageGuidance
 from debilgi.language.word_relations import WordRelation
 from debilgi.personality.expression import PersonalityExpression
@@ -46,12 +52,11 @@ class ReplyContext:
     # The optional teacher receives labelled text. Local assertion reasoning
     # retains event provenance and participant bindings separately below.
     consultation_messages: tuple[str, ...] = ()
-    memory_ngrams: tuple[tuple[tuple[str, ...], int], ...] = ()
-    experience_transitions: tuple[tuple[tuple[str, ...], float], ...] = ()
     reply_heads: tuple[tuple[str, ...], ...] = ()
     knowledge_facts: tuple[str, ...] = ()
     # Scoped human statements retained in SQLite, with their source event IDs.
     proposition_reports: tuple[tuple[str, str], ...] = ()
+    claim_result: Known | Unknown | None = None
     dialogue_reports: tuple[BoundDialogueReport, ...] = ()
     meaning_records: tuple[MeaningRecord, ...] = ()
     meaning_goals: tuple[MeaningGoal, ...] = ()
@@ -60,7 +65,6 @@ class ReplyContext:
     dialogue_situation: DialogueSituation | None = None
     # Raw human language remains useful when a proposition cannot be parsed.
     corpus_utterances: tuple[tuple[str, str], ...] = ()
-    generation_ngrams: tuple[tuple[tuple[str, ...], int], ...] = ()
     word_relations: tuple[WordRelation, ...] = ()
     reference_definitions: tuple[tuple[str, str], ...] = ()
     required_facts: tuple[str, ...] = ()
@@ -82,6 +86,17 @@ class ReplyContext:
     assertion_memory: AssertionMemory = field(default_factory=AssertionMemory)
     assertion_continuation: ContinuationPlan | None = None
     assertion_feedback_counts: tuple[int, int] = (0, 0)
+    input_meaning: StructuredUtterance | None = None
+    response_decision: ResponseDecision | None = None
+    turn_form: TurnForm | None = None
+    prior_bot_turn: dict | None = None
+
+    @property
+    def structure(self) -> StructuredUtterance:
+        # Focusing an earlier request invalidates only that projection.
+        if self.input_meaning is not None and self.input_meaning.text == self.prompt:
+            return self.input_meaning
+        return analyze_structured_utterance(self.prompt)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,11 +105,6 @@ class UtterancePlan:
     max_tokens: int
     thought: StructuredThought
     context: ReplyContext = field(default_factory=ReplyContext)
-
-
-class PhraseGenerator(Protocol):
-    def generate(self, plan: UtterancePlan) -> str:
-        """Render a plan; implementations must not choose the underlying action."""
 
 
 def thought_from_intent(intent: ActionIntent) -> StructuredThought:
@@ -106,7 +116,8 @@ def thought_from_intent(intent: ActionIntent) -> StructuredThought:
         evidence=intent.evidence,
         intention_id=intent.intent_id,
         state_features=tuple(
-            (key, float(value)) for key, value in intent.decision_context.items()
+            (key, float(value))
+            for key, value in intent.decision_context.items()
             if key.startswith("state_") and isinstance(value, (int, float))
         ),
     )

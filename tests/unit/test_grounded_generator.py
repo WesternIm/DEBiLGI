@@ -35,7 +35,6 @@ def test_does_not_splice_memory_when_no_grounded_fact_exists() -> None:
                 "разговора выводы вывод",
                 "случайные слова из старого сообщения",
             ),
-            memory_ngrams=((('разговора', 'выводы'), 30),),
         )
     )
 

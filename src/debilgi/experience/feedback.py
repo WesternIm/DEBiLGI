@@ -63,9 +63,13 @@ class FeedbackAttributor:
             return self._neutral(event, target, "empty_reply")
         normalized = content.casefold().replace("ё", "е")
         words = set(tokenize(normalized))
-        if any(phrase in normalized for phrase in _NEGATIVE_PHRASES) or words & (
-            DISAPPROVAL | AVERSION
-        ):
+        short_answer_rejection = bool(
+            target is not None and len(words) <= 6
+            and words & {"бред", "чушь"} and words & {"что", "че", "чё"}
+        )
+        if (short_answer_rejection
+                or any(phrase in normalized for phrase in _NEGATIVE_PHRASES)
+                or words & (DISAPPROVAL | AVERSION)):
             return AttributedFeedback(
                 event.event_id,
                 target,

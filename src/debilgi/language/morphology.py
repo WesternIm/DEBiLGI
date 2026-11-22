@@ -11,9 +11,14 @@ from functools import lru_cache
 from typing import Any
 
 from debilgi.events.models import Event, EventType
-from debilgi.language.character_markov import is_word_form, normalize_word
 from debilgi.language.lexical_matching import false_friend_group, fuzzy_match_allowed
-from debilgi.language.tokenizer import normalize_chat_token, tokenize
+from debilgi.language.tokenizer import (
+    elongation_variants,
+    is_word_form,
+    normalize_chat_token,
+    normalize_word,
+    tokenize,
+)
 from debilgi.storage.database import Database
 
 try:
@@ -131,6 +136,42 @@ PREPOSITION_CASES: dict[str, frozenset[str]] = {
 }
 
 
+def _keep_unknown_word_lemma(
+    surface: str, readings: list[MorphologicalReading]
+) -> list[MorphologicalReading]:
+    """A word the dictionary does not know keeps its own spelling as a lemma (4.35, flag only).
+
+    pymorphy's predictor lemmatizes an unknown word by suffix paradigms, and sometimes rewrites
+    the stem to do it (``долбоёб`` -> verb ``долбоести``; the realizer then says ``долбоёл``).
+    A guessed reading is a stem rewrite when the word does not begin with the lemma's stem (the
+    lemma minus its citation ending): ``долбоёб`` is not ``долбоес-`` + ending, it only fits the
+    closed irregular class of ``-ести`` verbs. When another reading keeps the word itself as the
+    lemma, the rewrite is dropped, so an unknown word is never replaced by someone else's lemma.
+    """
+    from debilgi.config import thought_content_enabled
+
+    if (len(readings) < 2 or any(item.is_known for item in readings)
+            or not thought_content_enabled()):
+        return readings
+
+    plain = surface.replace("ё", "е")
+
+    def rewritten(item: MorphologicalReading) -> bool:
+        lemma = (item.lemma or "").replace("ё", "е")
+        if lemma == plain:
+            return False
+        stem = lemma[:-2] if lemma.endswith("ся") else lemma
+        for _ in range(2):
+            if stem and stem[-1] in "аяоеиыуюэьйтч":
+                stem = stem[:-1]
+        return not plain.startswith(stem)
+
+    if not any(item.lemma == surface for item in readings):
+        return readings
+    kept = [item for item in readings if not rewritten(item)]
+    return kept or readings
+
+
 @dataclass(frozen=True, slots=True)
 class MorphologicalReading:
     surface_form: str
@@ -244,12 +285,17 @@ def _existential_predicate_index(
 class RussianMorphology:
     def __init__(self) -> None:
         self._analyzer = pymorphy3.MorphAnalyzer() if pymorphy3 is not None else None
+        self._spelling_correction = lru_cache(maxsize=32768)(self._spelling_correction)
 
     @lru_cache(maxsize=50_000)  # noqa: B019 - process-lifetime singleton/service cache
     def parse_word(self, word: str) -> tuple[MorphologicalReading, ...]:
         normalized = normalize_word(word)
         if not normalized or self._analyzer is None:
             return ()
+        if normalized in {"ок", "окей"}:
+            return (MorphologicalReading(normalized, normalized, "interjection",
+                    None, None, None, None, None, None, None, None, None, None,
+                    1.0, frozenset({"INTJ"}), is_known=True),)
         if _NUMERIC_LITERAL_RE.fullmatch(normalized):
             return (_numeric_reading(normalized),)
         if not is_word_form(normalized):
@@ -258,7 +304,9 @@ class RussianMorphology:
             normalized,
             is_known=self._analyzer.word_is_known,
         )
-        analysis_form = chat_form.canonical
+        # Colloquial interrogatives retain their surface, but share the
+        # grammatical reading of the full form throughout the meaning IR.
+        analysis_form = {"че": "что", "чё": "что"}.get(chat_form.canonical, chat_form.canonical)
         parsed = self._analyzer.parse(analysis_form)
         corrected_form: str | None = analysis_form if analysis_form != normalized else None
         if corrected_form is not None:
@@ -297,6 +345,16 @@ class RussianMorphology:
                 continue
             seen.add(key)
             readings.append(_reading(normalized, item, corrected_form=corrected_form))
+        readings = _keep_unknown_word_lemma(normalized, readings)
+        if chat_form.kind == "elongation":
+            for variant in elongation_variants(normalized):
+                if variant == analysis_form or not self._analyzer.word_is_known(variant):
+                    continue
+                for item in self._analyzer.parse(variant):
+                    key = (str(item.normal_form), frozenset(map(str, item.tag.grammemes)))
+                    if key not in seen:
+                        seen.add(key)
+                        readings.append(_reading(normalized, item, corrected_form=variant))
         return tuple(readings)
 
     def best(self, word: str) -> MorphologicalReading | None:
@@ -409,6 +467,14 @@ class RussianMorphology:
     ) -> float:
         score = candidate.score
         surface = normalize_word(tokens[index])
+        if (surface == "чем" and index == 0
+                and candidate.lemma == "что" and candidate.case == "instrumental"
+                and "тем" not in {normalize_word(t) for t in tokens}
+                and any(r.part_of_speech == "verb" and "INFN" not in r.grammemes
+                        for options in alternatives[index + 1:] for r in options)):
+            # At a clause opening before a finite predicate, this is the
+            # instrumental interrogative, rather than comparative conjunction.
+            score += 1.40
         likely_finite_predicate = _has_likely_finite_predicate(alternatives)
         infinitive_governor = _infinitive_governor(index, alternatives)
         has_infinitive_alternative = any(
@@ -483,6 +549,13 @@ class RussianMorphology:
         if candidate.lemma == surface:
             score += 0.30
         expected = _governing_preposition_cases(self, index, tokens, alternatives)
+        if normalize_chat_token(surface).kind == "elongation" and not expected:
+            # A free expressive reaction favours the particle reading. A
+            # preposition instead supplies case evidence for the pronoun.
+            if candidate.part_of_speech in {"particle", "interjection"}:
+                score += 1.25
+            elif candidate.part_of_speech == "pronoun" and candidate.case != "nominative":
+                score -= 0.70
         if expected:
             if candidate.part_of_speech in {"noun", "pronoun", "adjective", "participle"}:
                 score += 1.20 if candidate.case in expected else -0.40
@@ -598,6 +671,29 @@ class RussianMorphology:
             if not likely_finite_predicate and not expected and next_has_noun:
                 score += 0.34 if candidate.case == "nominative" else -0.06
         return score
+
+    def near_known_words(self, word: str) -> tuple[str, ...]:
+        """Known words one edit away: an unknown word with such neighbours looks like a typo."""
+        word = normalize_word(word)
+        if self._analyzer is None or not 5 <= len(word) <= 32:
+            return ()
+        return tuple(sorted(
+            candidate for candidate in _single_edit_candidates(word)
+            if candidate[:1] == word[:1]
+            and fuzzy_match_allowed(word, candidate)
+            and self._analyzer.word_is_known(candidate)
+        ))
+
+    def has_known_neighbour(self, word: str) -> bool:
+        """The word is one keystroke away from a word the dictionary knows (a likely typo)."""
+
+        normalized = normalize_word(word)
+        if self._analyzer is None or len(normalized) < 4:
+            return False
+        return any(
+            candidate[:1] == normalized[:1] and self._analyzer.word_is_known(candidate)
+            for candidate in _single_edit_candidates(normalized)
+        )
 
     def _spelling_correction(self, word: str) -> str | None:
         if self._analyzer is None or not 5 <= len(word) <= 32:
@@ -1222,3 +1318,75 @@ def _feature_mismatches(
 
 
 DEFAULT_MORPHOLOGY = RussianMorphology()
+
+
+# --- Deixis: смена лица говорящий↔адресат -------------------------------------------------
+# Закрытая парадигма задаётся клетками (лицо, число); смена лица — это операция над признаками
+# (первое↔второе при том же числе), а не перечень пар «форма→форма». Лицо у местоимения — из
+# морфологического разбора леммы (NPRO + 1per/2per). Притяжательные pymorphy лица не несут, поэтому
+# их клетка определяется якорем клетки; падеж, род и число словоформы ставит реализатор по лемме.
+_PERSON_FEATURE = {"1per": "first", "2per": "second"}
+_NUMBER_FEATURE = {"sing": "singular", "plur": "plural"}
+DEIXIS_CELLS: dict[tuple[str, str], tuple[str, str]] = {
+    ("first", "singular"): ("я", "мой"),
+    ("second", "singular"): ("ты", "твой"),
+    ("first", "plural"): ("мы", "наш"),
+    ("second", "plural"): ("вы", "ваш"),
+}
+_SWAPPED_PERSON = {"first": "second", "second": "first"}
+
+
+@lru_cache(maxsize=512)
+def person_cell(lemma: str) -> tuple[str, str, str] | None:
+    """(лицо, число, вид) личного или притяжательного местоимения по лемме; иначе None.
+
+    Вид: ``personal`` — по тегам NPRO+1per/2per; ``possessive`` — прилагательное-Apro, чья лемма
+    является якорем притяжательного для клетки парадигмы.
+    """
+    analyzer = DEFAULT_MORPHOLOGY._analyzer
+    if analyzer is None:
+        return None
+    for parse in analyzer.parse(lemma):
+        if parse.normal_form != lemma:
+            continue
+        tag = parse.tag
+        if "NPRO" in tag:
+            person = next((_PERSON_FEATURE[g] for g in tag.grammemes if g in _PERSON_FEATURE), None)
+            number = next((_NUMBER_FEATURE[g] for g in tag.grammemes if g in _NUMBER_FEATURE), None)
+            if person and number:
+                return person, number, "personal"
+        if "Apro" in tag and "ADJF" in tag:
+            for (person, number), (_, possessive) in DEIXIS_CELLS.items():
+                if possessive == lemma:
+                    return person, number, "possessive"
+    return None
+
+
+def deictic_counterpart(
+    lemma: str, *, possessives: bool = True, inclusive_possessives: bool = True
+) -> str | None:
+    """Лемма того же вида и числа с противоположным лицом (говорящий↔адресат).
+
+    ``possessives=False`` — только личные местоимения. ``inclusive_possessives=False`` —
+    множественные
+    притяжательные не меняются: «наш» может включать или не включать собеседника, и без сигнала в
+    контексте смена лица была бы выдумкой (решение В2).
+    """
+    cell = person_cell(lemma)
+    if cell is None:
+        return None
+    person, number, kind = cell
+    if kind == "possessive" and (
+        not possessives or (number == "plural" and not inclusive_possessives)
+    ):
+        return None
+    target = DEIXIS_CELLS.get((_SWAPPED_PERSON[person], number))
+    if target is None:
+        return None
+    return target[0] if kind == "personal" else target[1]
+
+
+def deictic_person(person: str | None, number: str | None) -> str | None:
+    """Лемма личного местоимения клетки (лицо, число) — для подлежащего по лицу глагола."""
+    cell = DEIXIS_CELLS.get((person, number))  # type: ignore[arg-type]
+    return cell[0] if cell else None

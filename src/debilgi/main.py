@@ -9,6 +9,7 @@ from pathlib import Path
 from debilgi.config import ConfigurationError, Settings
 from debilgi.discord.bot import create_bot
 from debilgi.events.repository import EventRepository
+from debilgi.language import grammarian
 from debilgi.language.syntax_backend import configure_syntax_backend
 from debilgi.logging import configure_logging
 from debilgi.runtime_lock import InstanceAlreadyRunningError, SingleInstanceLock
@@ -30,6 +31,10 @@ async def run() -> None:
             configure_syntax_backend,
             settings.slovnet_model_dir if settings.slovnet_enabled else None,
         )
+        if grammarian.enabled():
+            # DEBILGI_GRAMMARIAN=1: load the weights before the first reply, not inside it
+            status = await asyncio.to_thread(grammarian.warm_up)
+            logger.info("Grammarian: %s", status)
         database = Database(settings.database_path, settings.migrations_path)
         repository = EventRepository(database)
         bot = create_bot(settings, database, repository)

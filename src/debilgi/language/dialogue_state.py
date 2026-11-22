@@ -118,11 +118,13 @@ class DialogueStateAnalysis:
 def analyze_dialogue_state(
     prompt: str,
     context_messages: tuple[str, ...] = (),
+    *,
+    structure: StructuredUtterance | None = None,
 ) -> DialogueStateAnalysis:
     """Resolve topic movement and references against a bounded recent window."""
 
     recent_messages = tuple(message.strip() for message in context_messages[-8:] if message.strip())
-    prompt_structure = analyze_structured_utterance(prompt)
+    prompt_structure = structure or analyze_structured_utterance(prompt)
     topic = _topic_state(prompt, recent_messages, prompt_structure)
     repair_target = _repair_target(prompt, recent_messages)
     candidates = _reference_candidates(recent_messages)
@@ -565,3 +567,91 @@ def _repair_target(prompt: str, messages: tuple[str, ...]) -> str | None:
         ),
         None,
     )
+
+
+# --- Anaphora by grammar -----------------------------------------------------------------
+_ARGUMENT_ROLES = frozenset(
+    {
+        "subject",
+        "direct_object",
+        "indirect_object",
+        "predicate_complement",
+        "instrument",
+        "complement",
+    }
+)
+
+
+def is_anaphoric_reference(token: TokenInterpretation) -> bool:
+    """A pronoun that points to something already mentioned, decided by its morphology.
+
+    Third-person personal pronouns (NPRO + 3per + Anph, any case, number, gender) and
+    demonstrative pronoun-adjectives used without a noun (Apro + Anph + Subx in an
+    argument role). Reflexives (no person / not Subx), first- and second-person
+    pronouns, interrogatives and indefinites are not anaphors.
+    """
+    grammemes = set(token.grammemes)
+    if token.part_of_speech != "pronoun" and token.part_of_speech != "adjective":
+        return False
+    if "Anph" not in grammemes or token.semantic_role == "question_target":
+        return False
+    if "NPRO" in grammemes and "3per" in grammemes:
+        return True
+    return (
+        "Apro" in grammemes
+        and "Subx" in grammemes
+        and token.semantic_role in _ARGUMENT_ROLES
+    )
+
+
+def _antecedent_compatible(anaphor: TokenInterpretation, candidate: TokenInterpretation) -> bool:
+    expected = dict(anaphor.grammatical_features)
+    actual = dict(candidate.grammatical_features)
+    number, other_number = expected.get("number"), actual.get("number")
+    if number and other_number and number != other_number:
+        return False
+    if number == "singular":
+        gender, other_gender = expected.get("gender"), actual.get("gender")
+        if gender and other_gender and gender != other_gender:
+            return False
+    return True
+
+
+def has_antecedent(
+    anaphor: TokenInterpretation,
+    context: tuple[TokenInterpretation, ...],
+    preceding: tuple[TokenInterpretation, ...] = (),
+) -> bool:
+    """Is there a mentioned noun/entity that the anaphor agrees with in number and gender?
+
+    ``context`` is the turn being answered, ``preceding`` the earlier words of the same
+    text. A plural anaphor is also satisfied by two or more coordinated singular nouns.
+    Neuter singular may refer to a whole situation, so any content in context binds it.
+    """
+    candidates = [
+        t
+        for t in (*context, *preceding)
+        if (t.part_of_speech == "noun" or t.entity_kind is not None)
+        and not is_anaphoric_reference(t)
+    ]
+    features = dict(anaphor.grammatical_features)
+    if features.get("number") == "singular" and features.get("gender") == "neuter":
+        return bool(candidates) or any(t.part_of_speech == "verb" for t in context)
+    if any(_antecedent_compatible(anaphor, t) for t in candidates):
+        return True
+    return features.get("number") == "plural" and len(candidates) >= 2
+
+
+def unbound_anaphors(
+    structure: StructuredUtterance, context: StructuredUtterance | None
+) -> tuple[TokenInterpretation, ...]:
+    """Anaphoric pronouns of ``structure`` with no antecedent in ``context`` or earlier."""
+    context_tokens = tuple(context.tokens) if context is not None else ()
+    result = []
+    for token in structure.tokens:
+        if not is_anaphoric_reference(token):
+            continue
+        preceding = tuple(t for t in structure.tokens if t.index < token.index)
+        if not has_antecedent(token, context_tokens, preceding):
+            result.append(token)
+    return tuple(result)

@@ -17,6 +17,15 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def thought_content_enabled() -> bool:
+    """``DEBILGI_THOUGHT_CONTENT=1``: own doings and the request focus (stage 4.32); off by default.
+
+    Read per call (like ``DEBILGI_GRAMMARIAN``), so a test or a probe can switch it per process.
+    """
+    return os.environ.get("DEBILGI_THOUGHT_CONTENT", "0").strip().lower() in {
+        "1", "true", "yes", "on"}
+
+
 def _path_from_env(name: str, default: str, root: Path) -> Path:
     value = Path(os.getenv(name, default)).expanduser()
     return value if value.is_absolute() else root / value
@@ -72,6 +81,7 @@ class Settings:
     dev_guild_id: int | None = None
     test_replies_enabled: bool = False
     productive_only_replies: bool = False
+    response_deliberation_enabled: bool = True
     initiative_enabled: bool = False
     wikipedia_enabled: bool = False
     wikipedia_language: str = "ru"
@@ -87,10 +97,6 @@ class Settings:
     language_context_chars: int = 600
     discourse_context_turns: int = 80
     discourse_max_turns: int = 20_000
-    character_markov_min_order: int = 2
-    character_markov_max_order: int = 8
-    character_markov_max_word_length: int = 32
-    character_markov_generation_attempts: int = 24
     conversation_idle_timeout_minutes: int = 45
     conversation_max_idle_timeout_minutes: int = 60
     neologism_min_response_interval: int = 75
@@ -100,8 +106,6 @@ class Settings:
     curiosity_max_consecutive_questions: int = 1
     curiosity_threshold: float = 0.68
     unknown_word_threshold: float = 0.45
-    response_confidence_threshold: float = 0.45
-    response_plan_retry_limit: int = 2
     semantic_consultant_enabled: bool = False
     semantic_consultant_model: str = "@cf/meta/llama-3.1-8b-instruct-fast"
     semantic_consultant_account_id: str | None = None
@@ -112,9 +116,7 @@ class Settings:
     semantic_consultant_timeout_seconds: int = 45
     semantic_consultant_trigger_threshold: float = 0.72
     semantic_consultant_minimum_confidence: float = 0.58
-    arbitration_mode: str = "active"
     arbitration_minimum_score: float = 0.45
-    arbitration_max_total_candidates: int = 48
     arbitration_learning_enabled: bool = False
     arbitration_learning_rate: float = 0.03
     arbitration_minimum_feedback_observations: int = 20
@@ -159,10 +161,6 @@ class Settings:
     raw_text_retention_days: int = 30
 
     def __post_init__(self) -> None:
-        if self.character_markov_min_order > self.character_markov_max_order:
-            raise ConfigurationError("character Markov minimum order cannot exceed maximum")
-        if self.character_markov_max_order > 16:
-            raise ConfigurationError("character Markov maximum order cannot exceed 16")
         if self.conversation_idle_timeout_minutes > self.conversation_max_idle_timeout_minutes:
             raise ConfigurationError("conversation idle timeout cannot exceed maximum")
 
@@ -191,11 +189,6 @@ class Settings:
         wikipedia_language = os.getenv("DEBILGI_WIKIPEDIA_LANGUAGE", "ru").strip().lower()
         if not wikipedia_language or not wikipedia_language.replace("-", "").isalpha():
             raise ConfigurationError("DEBILGI_WIKIPEDIA_LANGUAGE must be a language code")
-        arbitration_mode = os.getenv("DEBILGI_ARBITRATION_MODE", "active").strip().lower()
-        if arbitration_mode not in {"off", "shadow", "active"}:
-            raise ConfigurationError(
-                "DEBILGI_ARBITRATION_MODE must be off, shadow or active"
-            )
         consultant_model = os.getenv(
             "DEBILGI_CLOUDFLARE_MODEL",
             "@cf/meta/llama-3.1-8b-instruct-fast",
@@ -247,6 +240,9 @@ class Settings:
             productive_only_replies=_bool_from_env(
                 "DEBILGI_PRODUCTIVE_ONLY_REPLIES"
             ),
+            response_deliberation_enabled=_bool_from_env(
+                "DEBILGI_RESPONSE_DELIBERATION_ENABLED", default=True
+            ),
             initiative_enabled=_bool_from_env("DEBILGI_INITIATIVE"),
             wikipedia_enabled=_bool_from_env("DEBILGI_WIKIPEDIA_ENABLED"),
             wikipedia_language=wikipedia_language,
@@ -280,18 +276,6 @@ class Settings:
             language_context_chars=_positive_int_from_env("DEBILGI_LANGUAGE_CONTEXT_CHARS", 600),
             discourse_context_turns=_positive_int_from_env("DEBILGI_DISCOURSE_CONTEXT_TURNS", 80),
             discourse_max_turns=_positive_int_from_env("DEBILGI_DISCOURSE_MAX_TURNS", 20_000),
-            character_markov_min_order=_positive_int_from_env(
-                "DEBILGI_CHARACTER_MARKOV_MIN_ORDER", 2
-            ),
-            character_markov_max_order=_positive_int_from_env(
-                "DEBILGI_CHARACTER_MARKOV_MAX_ORDER", 8
-            ),
-            character_markov_max_word_length=_positive_int_from_env(
-                "DEBILGI_CHARACTER_MARKOV_MAX_WORD_LENGTH", 32
-            ),
-            character_markov_generation_attempts=_positive_int_from_env(
-                "DEBILGI_CHARACTER_MARKOV_GENERATION_ATTEMPTS", 24
-            ),
             conversation_idle_timeout_minutes=_positive_int_from_env(
                 "DEBILGI_CONVERSATION_IDLE_TIMEOUT_MINUTES", 45
             ),
@@ -315,12 +299,6 @@ class Settings:
             ),
             curiosity_threshold=_unit_float_from_env("DEBILGI_CURIOSITY_THRESHOLD", 0.68),
             unknown_word_threshold=_unit_float_from_env("DEBILGI_UNKNOWN_WORD_THRESHOLD", 0.45),
-            response_confidence_threshold=_unit_float_from_env(
-                "DEBILGI_RESPONSE_CONFIDENCE_THRESHOLD", 0.45
-            ),
-            response_plan_retry_limit=_positive_int_from_env(
-                "DEBILGI_RESPONSE_PLAN_RETRY_LIMIT", 2
-            ),
             semantic_consultant_enabled=consultant_enabled,
             semantic_consultant_model=consultant_model,
             semantic_consultant_account_id=consultant_account_id,
@@ -335,12 +313,8 @@ class Settings:
             semantic_consultant_minimum_confidence=_unit_float_from_env(
                 "DEBILGI_SEMANTIC_CONSULTANT_MINIMUM_CONFIDENCE", 0.58
             ),
-            arbitration_mode=arbitration_mode,
             arbitration_minimum_score=_unit_float_from_env(
                 "DEBILGI_ARBITRATION_MIN_SCORE", 0.45
-            ),
-            arbitration_max_total_candidates=_positive_int_from_env(
-                "DEBILGI_ARBITRATION_MAX_TOTAL_CANDIDATES", 48
             ),
             arbitration_learning_enabled=_bool_from_env(
                 "DEBILGI_ARBITRATION_LEARNING_ENABLED", True

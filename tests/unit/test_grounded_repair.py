@@ -1,10 +1,8 @@
 import pytest
 
-from debilgi.discord.replies import SafeMentionReplyService
 from debilgi.language.grounded_repair import grounded_repair_thought
 from debilgi.language.productive_nlg import realize_thought
 from debilgi.language.self_state_reasoning import analyze_self_state
-from debilgi.language.semantic_repeat import repeats_proposition
 from debilgi.language.structured_utterance import analyze_structured_utterance
 
 
@@ -83,20 +81,6 @@ def test_temporal_connector_does_not_turn_negative_statement_into_question():
     assert structure.clauses[0].negated
 
 
-def test_reordering_cannot_evade_repeat_check():
-    previous = ("Да, я считаю себя тупой.",)
-    assert repeats_proposition("Да, считаю я себя тупой.", previous)
-    assert (
-        SafeMentionReplyService._surface_quality_issue(
-            "Да, считаю я себя тупой.",
-            prompt="Ты тупой?",
-            recent_self_replies=previous,
-        )
-        == "recent_semantic_repeat"
-    )
-    assert not repeats_proposition("Я не считаю себя тупой.", previous)
-    assert not repeats_proposition("Я считал себя тупой.", previous)
-    assert not repeats_proposition("Коля толкнул Петю.", ("Петя толкнул Колю.",))
 
 
 @pytest.mark.parametrize('prompt,gender', [('Ты тупой?', 'masculine'),

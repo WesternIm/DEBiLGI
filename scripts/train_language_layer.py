@@ -13,12 +13,11 @@ from debilgi.cognition.models import ActionType
 from debilgi.config import Settings
 from debilgi.events.normalizer import normalize_message_created
 from debilgi.language.archive_repository import ArchiveRepository
-from debilgi.language.character_markov import CharacterMarkovConfig, CharacterMarkovRepository
 from debilgi.language.conversation import ConversationRepository
 from debilgi.language.discourse import DiscourseMemoryRepository
+from debilgi.language.grounded_generator import GroundedConstructionGenerator
 from debilgi.language.language_layer_curriculum import SCENES, total_turns
 from debilgi.language.lexicon import LexiconService
-from debilgi.language.memory_based import MemoryPhraseGenerator
 from debilgi.language.models import ArchivedMessage
 from debilgi.language.planning import ReplyContext, StructuredThought, UtterancePlan
 from debilgi.language.semantics import SemanticMemoryRepository
@@ -147,17 +146,10 @@ async def train(*, evaluate_only: bool = False) -> None:
     database_path = settings.database_path.resolve()
     guild_id = settings.dev_guild_id or DEFAULT_GUILD_ID
     backup_path = None if evaluate_only else _backup(database_path)
-    character_config = CharacterMarkovConfig(
-        min_order=settings.character_markov_min_order,
-        max_order=settings.character_markov_max_order,
-        max_word_length=settings.character_markov_max_word_length,
-        generation_attempts=settings.character_markov_generation_attempts,
-    )
     database = Database(database_path, settings.migrations_path)
     await database.initialize()
     try:
-        archive = ArchiveRepository(database, character_markov_config=character_config)
-        character_markov = CharacterMarkovRepository(database, character_config)
+        archive = ArchiveRepository(database)
         discourse = DiscourseMemoryRepository(database)
         semantic = SemanticMemoryRepository(database)
         lexicon = LexiconService(database)
@@ -189,7 +181,6 @@ async def train(*, evaluate_only: bool = False) -> None:
         await _report(
             database,
             archive,
-            character_markov,
             discourse,
             semantic,
             lexicon,
@@ -316,7 +307,6 @@ async def _build_episodes(
 async def _report(
     database: Database,
     archive: ArchiveRepository,
-    character_markov: CharacterMarkovRepository,
     discourse: DiscourseMemoryRepository,
     semantic: SemanticMemoryRepository,
     lexicon: LexiconService,
@@ -332,11 +322,6 @@ async def _report(
     )
     personal_row = await database.fetchone(
         """SELECT COUNT(*) AS count FROM language_personal_interpretations
-           WHERE guild_id = ?""",
-        (guild_id,),
-    )
-    character_row = await database.fetchone(
-        """SELECT COUNT(*) AS count FROM language_character_transitions
            WHERE guild_id = ?""",
         (guild_id,),
     )
@@ -356,7 +341,6 @@ async def _report(
     print(f"discourse_turns={discourse_stats.turns}")
     print(f"dictionary_entries={int(dictionary_row['count']) if dictionary_row else 0}")
     print(f"personal_interpretations={int(personal_row['count']) if personal_row else 0}")
-    print(f"character_transitions={int(character_row['count']) if character_row else 0}")
     print(f"language_episodes={int(episode_row['count']) if episode_row else 0}")
 
     print("\nword analysis:")
@@ -371,8 +355,6 @@ async def _report(
             f"source={analysis.source} response_confidence={analysis.response_confidence:.2f}"
         )
 
-    model = await character_markov.model(guild_id)
-    print(f"character_plausibility[неологизм]={model.plausibility('неологизм'):.3f}")
     print("\ngenerated replies:")
     for index, probe in enumerate(PROBES):
         print(
@@ -392,7 +374,6 @@ async def _generate(
     context = ReplyContext(
         prompt=prompt,
         memory_messages=await archive.recent_texts(guild_id, CHANNEL_ID, 200),
-        memory_ngrams=await archive.common_ngrams(guild_id),
         reply_heads=await archive.matching_reply_heads(guild_id, tokens),
         knowledge_facts=(
             *(await archive.matching_replies(guild_id, tokens)),
@@ -407,8 +388,7 @@ async def _generate(
         thought=StructuredThought(ActionType.SHORT_REPLY, None, "explain", 0.82, ()),
         context=context,
     )
-    return MemoryPhraseGenerator(
-        max_output_tokens=settings.language_max_output_tokens,
+    return GroundedConstructionGenerator(
         max_output_chars=settings.language_max_output_chars,
     ).generate(plan)
 

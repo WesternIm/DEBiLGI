@@ -136,3 +136,13 @@ def test_modal_projection_requires_the_whole_action_state_and_recipient():
     ability = parse_proposition("Ты не можешь отвечать мне.")
     assert supported_alternative("Ты можешь отвечать мне?", ("да", "нет"), ability) == "нет"
     assert supported_alternative("Ты можешь отвечать Маше?", ("да", "нет"), ability) is None
+
+
+@pytest.mark.parametrize("continuation", [
+    "а ты ответь на вопрос", "преположи", "кто быстрее?", "о обоих", "медведь или муравей?",
+])
+def test_open_question_keeps_its_domain_across_controls_and_ellipsis(continuation):
+    question = "кто быстрее муравей или медведь?"
+    result = focus_request(continuation, (), open_request=question)
+    assert result.request_text == question
+    assert set(result.alternatives) == {"муравей", "медведь"}

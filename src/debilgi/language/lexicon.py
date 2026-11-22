@@ -19,16 +19,15 @@ from debilgi.language.abbreviations import (
     extract_explicit_abbreviation_definition,
     is_abbreviation_candidate,
 )
-from debilgi.language.character_markov import (
-    CharacterMarkovRepository,
-    normalize_word,
-    words_from_text,
-)
 from debilgi.language.content import content_lemmas
 from debilgi.language.definition_relations import definition_relations
 from debilgi.language.lexical_matching import fuzzy_match_allowed
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY, POS_NAMES
 from debilgi.language.ruwordnet import LexicalLink, RuWordNet
+from debilgi.language.tokenizer import (
+    normalize_word,
+    words_from_text,
+)
 from debilgi.storage.database import Database
 
 try:  # Optional at runtime; the service retains a deterministic local fallback.
@@ -197,8 +196,7 @@ class WordAnalysis:
         """
 
         return (
-            self.unknown_kind
-            in {UnknownKind.UNKNOWN_FORM, UnknownKind.UNKNOWN_MEANING}
+            self.unknown_kind in {UnknownKind.UNKNOWN_FORM, UnknownKind.UNKNOWN_MEANING}
             and not self.has_usable_meaning
         )
 
@@ -288,8 +286,11 @@ def extract_explicit_definition(content: str) -> tuple[str, str] | None:
         if concept in _INVALID_DEFINITION_SUBJECTS:
             continue
         reading = DEFAULT_MORPHOLOGY.best(concept)
-        if (reading is not None and reading.is_known
-                and reading.part_of_speech not in {"noun", "adjective", "verb"}):
+        if (
+            reading is not None
+            and reading.is_known
+            and reading.part_of_speech not in {"noun", "adjective", "verb"}
+        ):
             continue  # a connective or pronoun in a sentence is not a headword lesson
         if is_substantive_definition(concept, definition):
             return concept, definition[:1000]
@@ -317,6 +318,14 @@ class LexiconService:
         self.curiosity_max_consecutive_questions = curiosity_max_consecutive_questions
         self._morph = pymorphy3.MorphAnalyzer() if pymorphy3 is not None else None
         self._study_notifier: Callable[[], None] | None = None
+        if getattr(database, "_meaning_lexicon", None) is None:
+            database._meaning_lexicon = self
+
+    @classmethod
+    def for_meaning(cls, database: Database) -> LexiconService:
+        """Reuse the lexicon already owned by this DB, including its analyzer."""
+        existing = getattr(database, "_meaning_lexicon", None)
+        return existing if existing is not None else cls(database)
 
     def set_study_notifier(self, notifier: Callable[[], None] | None) -> None:
         """Wake the autonomous learner whenever durable study work is queued."""
@@ -400,7 +409,8 @@ class LexiconService:
                 """SELECT * FROM language_personal_interpretations
                    WHERE guild_id = ? AND explicitly_taught = 1
                      AND (normalized_form = ? OR lemma = ?)
-                   ORDER BY updated_at DESC LIMIT 1""", (guild_id, lemma, lemma),
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (guild_id, lemma, lemma),
             )
             if lesson is not None:
                 personal = lesson
@@ -419,11 +429,21 @@ class LexiconService:
             )
             if concept is not None:
                 if reference is None:
-                    reference = (normalized, None, {}, (), (), str(concept["source"]),
-                                 float(concept["confidence"]))
+                    reference = (
+                        normalized,
+                        None,
+                        {},
+                        (),
+                        (),
+                        str(concept["source"]),
+                        float(concept["confidence"]),
+                    )
                 reference = (
-                    *reference[:3], (str(concept["definition"]),), reference[4],
-                    str(concept["source"]), min(reference[6], float(concept["confidence"])),
+                    *reference[:3],
+                    (str(concept["definition"]),),
+                    reference[4],
+                    str(concept["source"]),
+                    min(reference[6], float(concept["confidence"])),
                 )
 
         if slang is not None:
@@ -456,27 +476,37 @@ class LexiconService:
                 is_neologism=neologism is not None,
             )
 
-        if (personal is not None and personal["explicitly_taught"] and personal["interpretation"]
-                and not is_abbreviation_candidate(surface)):
+        if (
+            personal is not None
+            and personal["explicitly_taught"]
+            and personal["interpretation"]
+            and not is_abbreviation_candidate(surface)
+        ):
             meaning = str(personal["interpretation"])
             lemma = reference[0] if reference else str(personal["lemma"] or normalized)
             part = reference[1] if reference else None
             features = reference[2] if reference else {}
             memory = float(personal["confidence"])
             return WordAnalysis(
-                surface, normalized, lemma, part, features,
-                reference[3] if reference else (), ("learned_in_conversation",),
-                "personal_lexicon", ConfidenceProfile(0.9, memory, 0.85, memory, memory),
-                selected_meaning=meaning, personal_interpretation=meaning,
+                surface,
+                normalized,
+                lemma,
+                part,
+                features,
+                reference[3] if reference else (),
+                ("learned_in_conversation",),
+                "personal_lexicon",
+                ConfidenceProfile(0.9, memory, 0.85, memory, memory),
+                selected_meaning=meaning,
+                personal_interpretation=meaning,
                 associations=self._associations(personal),
-                semantic_relations=tuple((edge.predicate, edge.target)
-                                         for edge in definition_relations(lemma, meaning)),
+                semantic_relations=tuple(
+                    (edge.predicate, edge.target) for edge in definition_relations(lemma, meaning)
+                ),
             )
 
         if personal is not None and is_abbreviation_candidate(surface):
-            interpretation = (
-                str(personal["interpretation"]) if personal["interpretation"] else None
-            )
+            interpretation = str(personal["interpretation"]) if personal["interpretation"] else None
             memory = float(personal["confidence"])
             return WordAnalysis(
                 surface,
@@ -491,17 +521,13 @@ class LexiconService:
                 selected_meaning=interpretation,
                 personal_interpretation=interpretation,
                 associations=self._associations(personal),
-                unknown_kind=(
-                    UnknownKind.UNKNOWN_MEANING if interpretation is None else None
-                ),
+                unknown_kind=(UnknownKind.UNKNOWN_MEANING if interpretation is None else None),
                 is_neologism=neologism is not None,
             )
 
         dotted_expansions = abbreviation_meanings(surface) if "." in surface else ()
         if dotted_expansions:
-            meanings = tuple(
-                f"сокращение от «{expansion}»" for expansion in dotted_expansions
-            )
+            meanings = tuple(f"сокращение от «{expansion}»" for expansion in dotted_expansions)
             return WordAnalysis(
                 surface,
                 normalized,
@@ -518,35 +544,71 @@ class LexiconService:
         if reference is not None:
             lemma, part, features, meanings, labels, source, form_confidence = reference
             senses = await self._senses_for_lemma(lemma)
-            if (self._ruwordnet is not None and not senses and part
-                    and (not meanings or source in {
-                        "builtin", "opencorpora", "opencorpora_spelling",
-                    })):
+            if (
+                self._ruwordnet is not None
+                and not senses
+                and part
+                and (
+                    not meanings
+                    or source
+                    in {
+                        "builtin",
+                        "opencorpora",
+                        "opencorpora_spelling",
+                    }
+                )
+            ):
                 selection = await asyncio.to_thread(
-                    self._ruwordnet.lookup, lemma, part, context or "",
+                    self._ruwordnet.lookup,
+                    lemma,
+                    part,
+                    context or "",
                 )
                 if selection.senses:
                     chosen = selection.selected
                     links = ()
                     if chosen is not None:
-                        links = (*chosen.links, *(
-                            LexicalLink("synonym", chosen.synset_id, word, (word,))
-                            for word in chosen.synonyms if word != lemma
-                        ))
-                    semantic_links = tuple(dict.fromkeys((
-                        *((link.relation, link.target) for link in links),
-                        *((("synonym", word) for word in chosen.synonyms if word != lemma)
-                          if chosen is not None else ()),
-                    )))
+                        links = (
+                            *chosen.links,
+                            *(
+                                LexicalLink("synonym", chosen.synset_id, word, (word,))
+                                for word in chosen.synonyms
+                                if word != lemma
+                            ),
+                        )
+                    semantic_links = tuple(
+                        dict.fromkeys(
+                            (
+                                *((link.relation, link.target) for link in links),
+                                *(
+                                    (("synonym", word) for word in chosen.synonyms if word != lemma)
+                                    if chosen is not None
+                                    else ()
+                                ),
+                            )
+                        )
+                    )
                     return WordAnalysis(
-                        surface, normalized, lemma, part, features,
-                        (chosen.meaning,) if chosen else (), labels, "ruwordnet",
-                        ConfidenceProfile(form_confidence, 0.86, 0.86 if chosen else 0.4,
-                                          0.8, min(form_confidence, 0.86 if chosen else 0.4)),
+                        surface,
+                        normalized,
+                        lemma,
+                        part,
+                        features,
+                        (chosen.meaning,) if chosen else (),
+                        labels,
+                        "ruwordnet",
+                        ConfidenceProfile(
+                            form_confidence,
+                            0.86,
+                            0.86 if chosen else 0.4,
+                            0.8,
+                            min(form_confidence, 0.86 if chosen else 0.4),
+                        ),
                         selected_meaning=chosen.meaning if chosen else None,
                         personal_interpretation=(
                             str(personal["interpretation"])
-                            if personal and personal["interpretation"] else None
+                            if personal and personal["interpretation"]
+                            else None
                         ),
                         associations=self._associations(personal),
                         is_neologism=neologism is not None,
@@ -556,14 +618,18 @@ class LexiconService:
                         sense_candidates=tuple(s.synset_id for s in selection.senses),
                         sense_options=tuple((s.synset_id, s.title) for s in selection.senses),
                         typed_relations=links,
-                        relation_evidence=(*selection.evidence, *(
-                            f"ruwordnet:{chosen.synset_id}:{link.relation}:{link.target_id}"
-                            for link in links
-                        )),
+                        relation_evidence=(
+                            *selection.evidence,
+                            *(
+                                f"ruwordnet:{chosen.synset_id}:{link.relation}:{link.target_id}"
+                                for link in links
+                            ),
+                        ),
                     )
             if part:
                 senses = tuple(
-                    sense for sense in senses
+                    sense
+                    for sense in senses
                     if not sense.part_of_speech
                     or POS_NAMES.get(sense.part_of_speech, sense.part_of_speech)
                     == POS_NAMES.get(part, part)
@@ -598,9 +664,10 @@ class LexiconService:
                 unknown_kind=(UnknownKind.AMBIGUOUS_CONTEXT if ambiguous else None),
                 is_neologism=neologism is not None,
                 semantic_relations=tuple(
-                    (edge.predicate, edge.target)
-                    for edge in definition_relations(lemma, selected)
-                ) if selected is not None else (),
+                    (edge.predicate, edge.target) for edge in definition_relations(lemma, selected)
+                )
+                if selected is not None
+                else (),
             )
 
         if personal is not None:
@@ -735,6 +802,11 @@ class LexiconService:
     ) -> DictionarySense:
         """Install one context-addressable meaning and its symmetric synonym links."""
 
+        guild_rows = await self._database.fetchall(
+            "SELECT DISTINCT guild_id FROM meaning_claims UNION "
+            "SELECT DISTINCT guild_id FROM language_synonym_links WHERE guild_id!=0")
+        guilds = {guild_id, *(r[0] for r in guild_rows)}
+        previous_maps = {g: dict(await self.canonical_lemmas(g)) for g in sorted(guilds)}
         normalized_lemma = normalize_word(lemma)
         normalized_terms = tuple(
             dict.fromkeys(normalize_word(term) for term in context_terms if normalize_word(term))
@@ -833,6 +905,18 @@ class LexiconService:
                         (guild_id, synonym, normalized_lemma, sense_id, score, source, now),
                     ),
                 )
+        self._database._meaning_canon = {}
+        from debilgi.language.proposition_memory import PropositionMemory
+
+        memory = PropositionMemory.for_meaning(self._database)
+        for guild in sorted(guilds):
+            current = await self.canonical_lemmas(guild)
+            previous = previous_maps[guild]
+            terms = {w for w in previous.keys() | current.keys()
+                     if previous.get(w, w) != current.get(w, w)}
+            if terms:
+                await memory.rebuild_synonym_claims(guild, terms)
+                await memory.reindex_evidence(guild)
         return DictionarySense(
             sense_id,
             normalized_lemma,
@@ -855,6 +939,317 @@ class LexiconService:
 
     async def resolve_sense(self, word: str, context: str) -> DictionarySense | None:
         return self._resolve_sense_from_context(await self.lookup_senses(word), context)
+
+    async def canonical_lemmas(self, guild_id: int, *, for_hypothesis=False) -> dict[str, str]:
+        """Only confirmed, unambiguous sense classes may identify lemmas."""
+        if for_hypothesis:
+            from debilgi.language.lexical_matching import fuzzy_match_allowed, predicate_family
+
+            result = dict(await self.canonical_lemmas(guild_id))
+            proposals = await self._database.fetchall(
+                "SELECT roles_json FROM continuous_cognition_hypotheses WHERE guild_id=? "
+                "AND predicate_key='synonym' AND status!='rejected' AND negative_evidence=0",
+                (guild_id,))
+            pairs = [json.loads(r[0]) for r in proposals]
+            words = {w for pair in pairs for w in pair}
+            if not words:
+                return result
+            senses = await self._database.fetchall(
+                "SELECT lemma,sense_id FROM language_dictionary_senses WHERE lemma IN (" +
+                ",".join("?" for _ in words) + ") UNION SELECT lemma,sense_id "
+                "FROM language_synonym_links WHERE guild_id IN (0,?) AND lemma IN (" +
+                ",".join("?" for _ in words) + ")", (*words, guild_id, *words))
+            assigned = {w: {r[1] for r in senses if r[0] == w} for w in words}
+            # A hypothesis is used only by the night analogy. Never publish it
+            # into the confirmed canon, and never bridge competing senses.
+            neighbours = {w: {v for pair in pairs if w in pair for v in pair} for w in words}
+            for left, right in pairs:
+                if (not fuzzy_match_allowed(left, right) or predicate_family(left, right)
+                        or any(len(assigned[w]) > 1 or len(neighbours[w]) > 2
+                               for w in (left, right))
+                        or assigned[left] and assigned[right]
+                        and assigned[left] != assigned[right]):
+                    continue
+                root = min(result.get(left, left), result.get(right, right))
+                result[left] = result[right] = root
+            return result
+        cache = getattr(self._database, "_meaning_canon", {})
+        if guild_id in cache:
+            return cache[guild_id]
+        rows = await self._database.fetchall(
+            "SELECT lemma,synonym_lemma,sense_id FROM language_synonym_links "
+            "WHERE guild_id=? AND weight>=0.8 AND sense_id!=''",
+            (guild_id,),
+        )
+        senses, groups = {}, {}
+        for row in rows:
+            sense = row["sense_id"]
+            for lemma in (row["lemma"], row["synonym_lemma"]):
+                senses.setdefault(lemma, set()).add(sense)
+                groups.setdefault(sense, set()).add(lemma)
+        if senses:
+            known = await self._database.fetchall(
+                "SELECT lemma,sense_id FROM language_dictionary_senses WHERE lemma IN ("
+                + ",".join("?" for _ in senses)
+                + ")",
+                tuple(senses),
+            )
+            for row in known:
+                senses[row["lemma"]].add(row["sense_id"])
+        result = {}
+        from debilgi.language.lexical_matching import fuzzy_match_allowed, predicate_family
+
+        for words in groups.values():
+            if any(len(senses[w]) != 1 for w in words):
+                continue
+            if any(
+                not fuzzy_match_allowed(a, b) or a != b and predicate_family(a, b)
+                for a in words
+                for b in words
+            ):
+                continue
+            result.update((w, min(words)) for w in words)
+        cache[guild_id] = result
+        self._database._meaning_canon = cache
+        return result
+
+    async def observe_synonym(
+        self,
+        event,
+        left: str,
+        right: str,
+        *,
+        explicit=False,
+        contradicts=False,
+        distributional=False,
+    ) -> bool:
+        """Keep proposals in the existing hypothesis store until humans confirm."""
+        from debilgi.language.lexical_matching import fuzzy_match_allowed, predicate_family
+        from debilgi.language.proposition_memory import count_meaning_evidence
+
+        left, right = sorted((normalize_word(left), normalize_word(right)))
+        if (
+            not event.guild_id
+            or not left
+            or not right
+            or left == right
+            or not fuzzy_match_allowed(left, right)
+            or predicate_family(left, right)
+            or event.actor_id is None
+            or event.payload.get("author_is_bot")
+            or "corpus" in event.source
+            or event.source.startswith("seed:")
+        ):
+            return False
+        senses = await self._database.fetchall(
+            "SELECT lemma,sense_id FROM language_dictionary_senses WHERE lemma IN (?,?) "
+            "UNION SELECT lemma,sense_id FROM language_synonym_links "
+            "WHERE guild_id IN (0,?) AND lemma IN (?,?)",
+            (left, right, event.guild_id, left, right),
+        )
+        assigned = {
+            word: {r["sense_id"] for r in senses if r["lemma"] == word} for word in (left, right)
+        }
+        if (
+            len(assigned[left]) > 1
+            or len(assigned[right]) > 1
+            or assigned[left]
+            and assigned[right]
+            and assigned[left] != assigned[right]
+        ):
+            return False
+        signature = "synonym:" + left + ":" + right
+        identifier = f"synonym:{event.guild_id}:{left}:{right}"
+        now = event.utc_timestamp.isoformat()
+        await self._database.execute(
+            "INSERT OR IGNORE INTO continuous_cognition_hypotheses "
+            "(hypothesis_id,guild_id,signature,predicate_key,roles_json,epistemic_status,"
+            "confidence,status,first_seen_at,last_reviewed_at) "
+            "VALUES (?,?,?,?,?,'hypothesis',0.5,'working',?,?)",
+            (identifier, event.guild_id, signature, "synonym", json.dumps([left, right]), now, now),
+        )
+        # Distributional similarity only proposes a question; it supplies no human vote.
+        if distributional:
+            return False
+        if not distributional:
+            await self._database.execute(
+                "INSERT OR IGNORE INTO continuous_cognition_evidence "
+                "(evidence_id,hypothesis_id,source_event_id,relation,confidence,details_json,"
+                "observed_at) "
+                "VALUES (?,?,?,?,1.0,?,?)",
+                (
+                    identifier + ":" + event.event_id,
+                    identifier,
+                    event.event_id,
+                    "contradicts" if contradicts else "supports",
+                    json.dumps({"explicit_confirmation": explicit}),
+                    now,
+                ),
+            )
+        rows = await self._database.fetchall(
+            "SELECT e.actor_id,e.source,e.payload_json,x.* FROM continuous_cognition_evidence x "
+            "JOIN events e ON e.event_id=x.source_event_id WHERE x.hypothesis_id=? "
+            "AND e.guild_id=?",
+            (identifier, event.guild_id),
+        )
+        support = count_meaning_evidence(
+            [
+                {
+                    **dict(r),
+                    "polarity": -1 if r["relation"] == "contradicts" else 1,
+                    "author_is_bot": json.loads(r["payload_json"]).get("author_is_bot"),
+                    "explicit_confirmation": json.loads(r["details_json"]).get(
+                        "explicit_confirmation"
+                    ),
+                }
+                for r in rows
+            ]
+        )
+        retained = support.hypothesis_confirmed
+        await self._database.execute(
+            "UPDATE continuous_cognition_hypotheses SET positive_evidence=?,negative_evidence=?,"
+            "status=?,last_reviewed_at=? WHERE hypothesis_id=?",
+            (
+                support.supports,
+                support.contradicts,
+                "rejected" if support.opposition_events else "retained" if retained else "working",
+                now,
+                identifier,
+            ),
+        )
+        previous_canon = await self.canonical_lemmas(event.guild_id)
+        if support.opposition_events:
+            await self._database.execute(
+                "DELETE FROM language_synonym_links WHERE guild_id=? AND source=?",
+                (event.guild_id, identifier),
+            )
+        if retained:
+            sense = next(iter(assigned[left] or assigned[right]), identifier)
+            async with self._database.transaction() as connection:
+                await connection.executemany(
+                    "INSERT OR REPLACE INTO language_synonym_links "
+                    "(guild_id,lemma,synonym_lemma,sense_id,weight,source) VALUES (?,?,?,?,0.8,?)",
+                    [
+                        (event.guild_id, a, b, sense, identifier)
+                        for a, b in ((left, right), (right, left))
+                    ],
+                )
+        if retained or support.opposition_events:
+            self._database._meaning_canon = {}
+            from debilgi.language.proposition_memory import PropositionMemory
+
+            current_canon = await self.canonical_lemmas(event.guild_id)
+            if current_canon != previous_canon:
+                roots_before = {previous_canon.get(w, w) for w in (left, right)}
+                roots_after = {current_canon.get(w, w) for w in (left, right)}
+                terms = {left, right} | {w for w, c in previous_canon.items() if c in roots_before}
+                terms |= {w for w, c in current_canon.items() if c in roots_after}
+                memory = PropositionMemory.for_meaning(self._database)
+                await memory.rebuild_synonym_claims(event.guild_id, terms)
+                await memory.reindex_evidence(event.guild_id)
+        return retained
+
+    async def observe_synonym_text(self, event, text: str) -> None:
+        import re
+
+        from debilgi.language.morphology import DEFAULT_MORPHOLOGY
+
+        reply = event.payload.get("reply_to_message_id")
+        if reply and text.strip().casefold().strip(".! ") in {"да", "нет"}:
+            rows = await self._database.fetchall(
+                "SELECT DISTINCT h.roles_json FROM continuous_cognition_hypotheses h "
+                "JOIN continuous_cognition_evidence x ON x.hypothesis_id=h.hypothesis_id "
+                "JOIN events e ON e.event_id=x.source_event_id "
+                "WHERE h.guild_id=? AND h.signature LIKE 'synonym:%' AND e.channel_id=? "
+                "AND json_extract(e.payload_json,'$.message_id')=?",
+                (event.guild_id, event.channel_id, reply),
+            )
+            for row in rows:
+                left, right = json.loads(row[0])
+                await self.observe_synonym(
+                    event,
+                    left,
+                    right,
+                    explicit=text.strip().casefold().strip(".! ") == "да",
+                    contradicts=text.strip().casefold().strip(".! ") == "нет",
+                )
+            return
+        match = re.fullmatch(
+            r"\s*([а-яё-]+)\s+(?:это|то же (?:самое )?что)\s+([а-яё-]+)[.!]?\s*", text.casefold()
+        )
+        if match:
+            words = [DEFAULT_MORPHOLOGY.best(w) for w in match.groups()]
+            await self.observe_synonym(
+                event, *(r.lemma if r else w for r, w in zip(words, match.groups(), strict=True))
+            )
+        elif (event.actor_id is not None and not event.payload.get("author_is_bot")
+              and "corpus" not in event.source and not event.source.startswith("seed:")):
+            pending = getattr(self, "_synonym_pending", {})
+            pending[event.guild_id] = event
+            self._synonym_pending = pending
+            task = getattr(self, "_synonym_task", None)
+            if task is None or task.done():
+                import asyncio
+                self._synonym_task = asyncio.create_task(self._deferred_synonym_candidates())
+                self._database._maintenance_tasks.add(self._synonym_task)
+                self._synonym_task.add_done_callback(self._database._maintenance_tasks.discard)
+
+    async def _deferred_synonym_candidates(self):
+        import asyncio
+        await asyncio.sleep(0.05)
+        await self.discover_synonym_candidates()
+
+    async def stop_synonym_candidates(self):
+        import asyncio
+        task = getattr(self, "_synonym_task", None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def discover_synonym_candidates(self, *, limit=64):
+        """Rank shared-government hypotheses deterministically, outside reply preparation.
+
+        Maintenance/sleep may invoke this entry point; no distributional vote can
+        promote a synonym. A retained source event supplies provenance only.
+        """
+        pending = getattr(self, "_synonym_pending", {})
+        self._synonym_pending = {}
+        if not pending:
+            # Recover deferred ranking after restart from original local human
+            # observations, never from a synthetic sleep/agent event.
+            from debilgi.events.repository import EventRepository
+            rows = await self._database.fetchall(
+                "SELECT guild_id,MAX(occurred_at) stamp FROM events "
+                "WHERE actor_id IS NOT NULL AND source NOT LIKE '%corpus%' "
+                "AND source NOT LIKE 'seed:%' "
+                "AND event_type IN ('MESSAGE_CREATED','MESSAGE_REPLIED') "
+                "AND COALESCE(json_extract(payload_json,'$.author_is_bot'),0)=0 "
+                "GROUP BY guild_id ORDER BY stamp DESC LIMIT 8")
+            for row in rows:
+                source = await self._database.fetchone(
+                    "SELECT event_id FROM events WHERE guild_id=? AND occurred_at=? "
+                    "AND actor_id IS NOT NULL AND source NOT LIKE '%corpus%' "
+                    "AND source NOT LIKE 'seed:%' "
+                    "AND COALESCE(json_extract(payload_json,'$.author_is_bot'),0)=0 "
+                    "ORDER BY event_id DESC LIMIT 1", (row[0], row[1]))
+                if source:
+                    pending[row[0]] = await EventRepository(self._database).get(source[0])
+        proposed = []
+        for guild, event in sorted(pending.items()):
+            rows = await self._database.fetchall(
+                "SELECT a.dependent,b.dependent,COUNT(DISTINCT a.governor) strength "
+                "FROM language_generation_word_relations a "
+                "JOIN language_generation_word_relations b ON a.guild_id=b.guild_id "
+                "AND a.governor=b.governor AND a.relation=b.relation "
+                "AND a.grammatical_case=b.grammatical_case AND a.dependent_pos=b.dependent_pos "
+                "WHERE a.guild_id=? AND a.dependent<b.dependent "
+                "GROUP BY a.dependent,b.dependent "
+                "ORDER BY strength DESC,a.dependent,b.dependent LIMIT ?",
+                (guild, max(1, min(limit, 256))))
+            for row in rows:
+                await self.observe_synonym(event, row[0], row[1], distributional=True)
+                proposed.append((guild, row[0], row[1], row[2]))
+        return tuple(proposed)
 
     async def lookup_synonyms(
         self, word: str, *, guild_id: int = 0, limit: int = 16
@@ -943,9 +1338,7 @@ class LexiconService:
         rows = await self._database.fetchall(
             "SELECT lemma FROM language_dictionary_entries ORDER BY lemma LIMIT 20000"
         )
-        choices = set(_BUILTIN) | set(common_abbreviations()) | {
-            str(row["lemma"]) for row in rows
-        }
+        choices = set(_BUILTIN) | set(common_abbreviations()) | {str(row["lemma"]) for row in rows}
         corrected = DEFAULT_MORPHOLOGY.best(normalized)
         standard_candidate = corrected.corrected_form if corrected is not None else None
         matches = get_close_matches(
@@ -1079,6 +1472,10 @@ class LexiconService:
     async def next_curiosity_question(
         self, guild_id: int, channel_id: int, *, now: datetime | None = None
     ) -> str | None:
+        from debilgi.config import thought_content_enabled
+
+        if thought_content_enabled():
+            return None  # 4.38: a question is a plan (``curiosity_plans``), never a stored phrase
         moment = now or datetime.now(UTC)
         if await self._consecutive_question_limit_reached(guild_id, channel_id):
             return None
@@ -1501,9 +1898,9 @@ class LexiconService:
             features = reading.features()
         return (
             str(row["lemma"]),
-            str(row["part_of_speech"]) if row["part_of_speech"] else (
-                reading.part_of_speech if contextual else None
-            ),
+            str(row["part_of_speech"])
+            if row["part_of_speech"]
+            else (reading.part_of_speech if contextual else None),
             features,
             tuple(str(item) for item in json.loads(str(row["meanings_json"]))),
             tuple(str(item) for item in json.loads(str(row["style_labels_json"]))),
@@ -1813,82 +2210,6 @@ class NeologismRepository:
             ((now or datetime.now(UTC)).isoformat(),),
         )
         return cursor.rowcount
-
-
-class NeologismService:
-    """Make a rare proposal only when a semantic reason precedes word generation."""
-
-    def __init__(
-        self,
-        lexicon: LexiconService,
-        character_markov: CharacterMarkovRepository,
-        candidates: NeologismRepository,
-    ) -> None:
-        self._lexicon = lexicon
-        self._character_markov = character_markov
-        self._candidates = candidates
-
-    async def propose(
-        self,
-        *,
-        guild_id: int,
-        channel_id: int | None,
-        creator_context: str,
-        source_components: tuple[str, ...],
-        intended_meaning: str,
-        response_number: int,
-        global_response_number: int | None = None,
-        missing_known_word: bool = False,
-        recurring_situation: bool = False,
-        creative_context: bool = False,
-        positive_history: bool = False,
-        seed: str = "",
-    ) -> NeologismCandidate | None:
-        semantic_reason = any(
-            (
-                missing_known_word,
-                recurring_situation,
-                creative_context,
-                len(source_components) >= 2,
-                positive_history,
-            )
-        )
-        if not semantic_reason:
-            return None
-        if not await self._candidates.cooldown_allows(
-            guild_id,
-            response_number=response_number,
-            global_response_number=global_response_number,
-        ):
-            return None
-        existing = await self._lexicon.personal_words(guild_id)
-        model = await self._character_markov.model(guild_id)
-        word = model.generate(seed=seed, existing_words=existing)
-        if word is None:
-            return None
-        if await self._lexicon.is_rejected_word(guild_id, word):
-            return None
-        analysis = await self._lexicon.analyze_word(
-            word,
-            guild_id=guild_id,
-            channel_id=channel_id,
-            context=creator_context,
-        )
-        if analysis.is_dictionary_word:
-            return None
-        similar = await self._lexicon.find_similar_words(word)
-        return await self._candidates.create_candidate(
-            guild_id=guild_id,
-            channel_id=channel_id,
-            word=word,
-            creator_context=creator_context,
-            source_components=source_components,
-            intended_meaning=intended_meaning,
-            example_usage=f"{word} — {intended_meaning}",
-            similar_words=similar,
-            response_number=response_number,
-            global_response_number=global_response_number,
-        )
 
 
 def _select_meaning(

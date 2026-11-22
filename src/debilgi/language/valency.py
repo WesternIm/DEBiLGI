@@ -96,6 +96,8 @@ def _profile(
 _PROFILES = {
     item.lemma: item
     for item in (
+        _profile("заниматься", _SUBJECT,
+                 ValencySlot("direct_object", grammatical_case="instrumental")),
         _profile(
             "брать", _SUBJECT, _DIRECT, _SOURCE, complement_roles={"с": "source", "со": "source"}
         ),
@@ -120,10 +122,20 @@ _PROFILES = {
         _profile("наносить", _SUBJECT, _DIRECT, _INDIRECT),
         _profile("любить", _SUBJECT, _DIRECT),
         _profile("иметь", _SUBJECT, _DIRECT),
+        _profile(
+            "называться", _SUBJECT,
+            ValencySlot("direct_object"), ValencySlot("predicate_complement"),
+        ),
         _profile("мочь", _SUBJECT, _ACTION_COMPLEMENT),
         _profile("уметь", _SUBJECT, _ACTION_COMPLEMENT),
         _profile("мешать", _SUBJECT, _INDIRECT, _ACTION_COMPLEMENT),
-        _profile("нравиться", _SUBJECT, _INDIRECT),
+        _profile(
+            "нравиться",
+            _SUBJECT,
+            _INDIRECT,
+            _OPTIONAL_ACTION_COMPLEMENT,
+            complement_roles={"dative": "experiencer"},
+        ),
         _profile("хотеть", _SUBJECT, _DIRECT, _OPTIONAL_ACTION_COMPLEMENT),
         _profile("понять", _SUBJECT, _DIRECT),
         _profile(
@@ -144,7 +156,8 @@ _PROFILES = {
         _profile("управлять", _SUBJECT, _INSTRUMENTAL_OBJECT),
         _profile("пользоваться", _SUBJECT, _INSTRUMENTAL_OBJECT),
         _profile(
-            "являться", _SUBJECT,
+            "являться",
+            _SUBJECT,
             ValencySlot("direct_object", grammatical_case="instrumental"),
             ValencySlot("predicate_complement", grammatical_case="instrumental"),
         ),
@@ -270,17 +283,11 @@ def assess_predicate_valency(
         for slot in profile.slots
         if slot.required_in_isolated_fact and slot.role not in available
     )
-    if (
-        normalized == "хотеть"
-        and "action_complement" in available
-        and "direct_object" in missing
-    ):
+    if normalized == "хотеть" and "action_complement" in available and "direct_object" in missing:
         # ``Хотеть`` selects either a nominal object (``хочу чай``) or an
         # infinitival action (``хочу побегать``). The infinitive fills the
         # semantic object slot instead of requiring a second accusative noun.
-        missing = tuple(
-            role for role in missing if role != "direct_object"
-        )
+        missing = tuple(role for role in missing if role != "direct_object")
     # Complements outside a lexical profile are still legal adjuncts.  Only
     # core object roles are useful as an anomaly signal here.
     unexpected = tuple(

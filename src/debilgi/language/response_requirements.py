@@ -22,8 +22,15 @@ def response_requirement(prompt: str) -> str | None:
     return None
 
 
-def requirement_rejection(prompt: str, metadata: Mapping[str, object]) -> str | None:
+def requirement_rejection(
+    prompt: str, metadata: Mapping[str, object], *, text: str = "",
+) -> str | None:
     requirement = response_requirement(prompt)
+    if requirement and metadata.get("reaction_meaning") == "express_limit":
+        from debilgi.language.dialogue_learning import observed_reaction_binding
+
+        if observed_reaction_binding(prompt, text, metadata):
+            return None
     if requirement == "explain_reason":
         if metadata.get("answer_slot") == "почему" and metadata.get("reasoning_evidence"):
             return None

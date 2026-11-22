@@ -115,7 +115,6 @@ class Diagnostics(
             f"resolved: {stats.resolved}\n"
             f"expired: {stats.expired}\n"
             f"average reward: {average}\n"
-            f"learned transitions: {stats.learned_transitions}\n"
             f"self efficacy: {self_model.efficacy:.3f}\n"
             f"initiative success: {self_model.initiative_successes}/"
             f"{self_model.initiative_attempts}",

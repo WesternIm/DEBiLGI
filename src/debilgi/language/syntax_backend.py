@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -58,20 +60,43 @@ class SlovnetParser:
 
 
 _parser: SlovnetParser | None = None
+_analysis_identity = "local"
 
 
 def configure_syntax_backend(model_dir: Path | None) -> bool:
     global _parser
     _parser = None
     if model_dir is None:
+        _configure_analysis_identity("local")
         return False
     try:
         _parser = SlovnetParser(model_dir)
     except Exception:
         logger.exception("Slovnet unavailable; using local grammar")
+        _configure_analysis_identity("local")
         return False
+    digest = hashlib.sha256()
+    for path in sorted(model_dir.iterdir()):
+        if path.is_file():
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    _configure_analysis_identity(digest.hexdigest())
     logger.info("Local Slovnet syntax enabled: %s", model_dir)
     return True
+
+
+def _configure_analysis_identity(key):
+    global _analysis_identity
+    if key == _analysis_identity:
+        return
+    _analysis_identity = key
+    module = sys.modules.get("debilgi.language.dialogue_learning")
+    if module is not None:
+        module.configure_analysis_cache(key)
+    structure = sys.modules.get("debilgi.language.structured_utterance")
+    if structure is not None:
+        structure._cached_structure.cache_clear()
 
 
 def syntax_edges(tokens: tuple[str, ...]) -> tuple[SyntaxEdge, ...]:

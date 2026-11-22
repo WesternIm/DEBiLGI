@@ -12,7 +12,6 @@ from pathlib import Path
 from debilgi.config import Settings
 from debilgi.events.normalizer import normalize_message_created
 from debilgi.language.archive_repository import ArchiveRepository
-from debilgi.language.character_markov import CharacterMarkovConfig
 from debilgi.language.discourse import DiscourseMemoryRepository
 from debilgi.language.grammar_semantics_curriculum import SCENES, covered_skills, total_turns
 from debilgi.language.lexicon import LexiconService
@@ -82,16 +81,10 @@ async def train(*, evaluate_only: bool = False) -> None:
     database_path = settings.database_path.resolve()
     guild_id = settings.dev_guild_id or DEFAULT_GUILD_ID
     backup = None if evaluate_only else _backup(database_path)
-    config = CharacterMarkovConfig(
-        min_order=settings.character_markov_min_order,
-        max_order=settings.character_markov_max_order,
-        max_word_length=settings.character_markov_max_word_length,
-        generation_attempts=settings.character_markov_generation_attempts,
-    )
     database = Database(database_path, settings.migrations_path)
     await database.initialize()
     try:
-        archive = ArchiveRepository(database, character_markov_config=config)
+        archive = ArchiveRepository(database)
         lexicon = LexiconService(database)
         morphology = MorphologyRepository(database)
         semantic = SemanticMemoryRepository(database)

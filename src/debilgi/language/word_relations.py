@@ -9,11 +9,8 @@ from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 
-from debilgi.language.morphology import DEFAULT_MORPHOLOGY
-from debilgi.language.structured_utterance import analyze_structured_utterance
-
-_PERSON_LEMMAS = {"я": "ты", "ты": "я", "мы": "вы", "вы": "мы"}
-_POSSESSIVE_LEMMAS = {"мой": "твой", "твой": "мой", "наш": "ваш", "ваш": "наш"}
+from debilgi.language.morphology import DEFAULT_MORPHOLOGY, deictic_counterpart
+from debilgi.language.structured_utterance import StructuredUtterance, analyze_structured_utterance
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,8 +42,33 @@ class RelationCoherence:
 
 
 @lru_cache(maxsize=2048)
-def observe_word_relations(text: str) -> tuple[WordRelation, ...]:
-    structure = analyze_structured_utterance(text)
+def observe_word_relations(
+    text: str | StructuredUtterance,
+    *,
+    human_perspective: bool = False,
+) -> tuple[WordRelation, ...]:
+    structure = (
+        text if isinstance(text, StructuredUtterance) else analyze_structured_utterance(text)
+    )
+    quoted = _quoted_indices(structure.tokens)
+    reported = {
+        link.child_clause_index
+        for link in structure.clause_links
+        if link.relation.startswith("ccomp")
+    }
+
+    def lemma(token):
+        if (
+            human_perspective
+            and token.index not in quoted
+            and token.clause_index not in reported
+            and structure.clauses[token.clause_index].clause_kind != "command"
+        ):
+            return (
+                deictic_counterpart(token.lemma) or token.lemma
+            )
+        return token.lemma
+
     result = []
     for arc in structure.dependencies:
         head, child = structure.tokens[arc.head_index], structure.tokens[arc.dependent_index]
@@ -64,8 +86,8 @@ def observe_word_relations(text: str) -> tuple[WordRelation, ...]:
             continue
         result.append(
             WordRelation(
-                head.lemma,
-                child.lemma,
+                lemma(head),
+                lemma(child),
                 arc.relation,
                 child.part_of_speech,
                 features.get("case", ""),
@@ -87,13 +109,15 @@ def _quoted_indices(tokens) -> set[int]:
 
 @lru_cache(maxsize=2048)
 def grammatical_tokens(
-    text: str,
+    text: str | StructuredUtterance,
     *,
     human_perspective: bool = False,
     prune_unbound: bool = False,
 ) -> tuple[str, ...]:
     """Revoice participants and agree forms without changing lexical concepts."""
-    structure = analyze_structured_utterance(text)
+    structure = (
+        text if isinstance(text, StructuredUtterance) else analyze_structured_utterance(text)
+    )
     output = [token.corrected_form or token.surface.casefold() for token in structure.tokens]
     quoted = _quoted_indices(structure.tokens)
     omitted = set()
@@ -125,7 +149,7 @@ def grammatical_tokens(
         for token in structure.tokens[clause.token_start : clause.token_end]:
             if not human_perspective or token.index in quoted:
                 continue
-            mapped = _PERSON_LEMMAS.get(token.lemma) or _POSSESSIVE_LEMMAS.get(token.lemma)
+            mapped = deictic_counterpart(token.lemma)
             if mapped:
                 features = {
                     name: value
@@ -153,7 +177,7 @@ def grammatical_tokens(
                 token
                 for token in structure.tokens[clause.token_start : clause.token_end]
                 if token.index not in quoted
-                and token.lemma in _PERSON_LEMMAS
+                and deictic_counterpart(token.lemma, possessives=False) is not None
                 and dict(token.grammatical_features).get("case") == "nominative"
             ),
             None,
@@ -251,9 +275,7 @@ def relation_coherence(text: str, learned: tuple[WordRelation, ...]) -> Relation
         if not governor_links:
             unsupported += 1
             continue
-        role_links = tuple(
-            link for link in governor_links if link.relation == actual.relation
-        )
+        role_links = tuple(link for link in governor_links if link.relation == actual.relation)
         if not role_links:
             conflicts += 1
             continue
@@ -262,11 +284,7 @@ def relation_coherence(text: str, learned: tuple[WordRelation, ...]) -> Relation
             continue
         compatible = any(
             link.dependent_pos == actual.dependent_pos
-            and (
-                not link.case
-                or not actual.case
-                or link.case == actual.case
-            )
+            and (not link.case or not actual.case or link.case == actual.case)
             for link in role_links
         )
         if compatible:

@@ -17,6 +17,219 @@ MIGRATIONS = PROJECT_ROOT / "migrations"
 NOW = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 
 
+async def _response_proposal(database, *, confirmation="polar"):
+    import json
+    from dataclasses import asdict
+
+    from debilgi.language.productive_nlg import (
+        ClauseThought,
+        ConceptArgument,
+        ConceptLexeme,
+        SemanticDependency,
+    )
+
+    prompt = _event(0)
+    await EventRepository(database).append(prompt)
+    thought = ClauseThought(
+        ConceptLexeme("отдыхать", "отдыхать", "verb", (("tense", "past"),)),
+        (
+            SemanticDependency(
+                "subject",
+                ConceptArgument(
+                    ConceptLexeme("ты", "ты", "pronoun", participant_ref="discord:user:20")
+                ),
+            ),
+        ),
+    )
+    service = ContinuousCognitionService(database)
+    identifier = await service.record_response_hypothesis(
+        prompt,
+        {
+            "predicate": "отдыхать",
+            "proposition": json.dumps(asdict(thought)),
+            "confirmation": confirmation,
+        },
+        0.95,
+        700,
+    )
+    return service, identifier
+
+
+@pytest.mark.parametrize("confirmation", ["polar", "none"])
+async def test_response_weight_and_bot_repetitions_are_not_facts(database, confirmation):
+    from dataclasses import replace
+
+    from debilgi.language.proposition_memory import PropositionMemory
+
+    service, identifier = await _response_proposal(database, confirmation=confirmation)
+    for i in range(1, 5):
+        repeated = replace(
+            _event(i),
+            payload={
+                "content": "да",
+                "author_is_bot": True,
+                "reply_to_message_id": 700,
+            },
+        )
+        await EventRepository(database).append(repeated)
+        assert await service.observe_response_hypotheses(repeated) == 0
+    assert not await PropositionMemory(database).review_response_hypothesis(
+        identifier, _event(5), promote=True
+    )
+    row = await database.fetchone(
+        "SELECT * FROM continuous_cognition_hypotheses WHERE hypothesis_id=?", (identifier,)
+    )
+    assert row["epistemic_status"] == "hypothesis" and row["status"] == "working"
+    assert row["positive_evidence"] == row["negative_evidence"] == 0
+    assert not await database.fetchone("SELECT 1 FROM meaning_claims")
+
+
+@pytest.mark.parametrize(
+    "text,confirmation,promoted",
+    [
+        ("да", "polar", True),
+        ("да", "none", False),
+        ("не, ты чё", "polar", False),
+    ],
+)
+async def test_only_explicit_polar_confirmation_promotes_response_proposal(
+    database,
+    text,
+    confirmation,
+    promoted,
+):
+    from dataclasses import replace
+
+    service, identifier = await _response_proposal(database, confirmation=confirmation)
+    feedback = replace(
+        _event(1),
+        payload={
+            "content": text,
+            "author_is_bot": False,
+            "reply_to_message_id": 700,
+        },
+    )
+    await EventRepository(database).append(feedback)
+    await service.observe_response_hypotheses(feedback)
+    await service.observe_response_hypotheses(feedback)  # event identity is idempotent
+    claims = await database.fetchall("SELECT * FROM meaning_claims WHERE resolved=1")
+    assert bool(claims) == promoted
+    if promoted:
+        assert claims[0]["predicate"] == "отдыхать"
+        sources = await database.fetchall("SELECT source_event_id FROM meaning_evidence")
+        assert [r[0] for r in sources] == [feedback.event_id]
+        again = replace(
+            _event(3),
+            payload={
+                "content": "да",
+                "author_is_bot": False,
+                "reply_to_message_id": 700,
+            },
+        )
+        await EventRepository(database).append(again)
+        await service.observe_response_hypotheses(again)
+        assert (await database.fetchone("SELECT COUNT(*) FROM meaning_claims"))[0] == 1
+        rejection = replace(
+            _event(4),
+            payload={
+                "content": "не, ты чё",
+                "author_is_bot": False,
+                "reply_to_message_id": 700,
+            },
+        )
+        await EventRepository(database).append(rejection)
+        await service.observe_response_hypotheses(rejection)
+        assert not await database.fetchone("SELECT 1 FROM meaning_claims WHERE resolved=1")
+    state = await database.fetchone(
+        "SELECT positive_evidence,negative_evidence FROM continuous_cognition_hypotheses "
+        "WHERE hypothesis_id=?",
+        (identifier,),
+    )
+    assert max(state) <= 1
+
+
+@pytest.mark.parametrize(
+    "actors,matching_time,expected",
+    [
+        ((20, 20, 20), True, False),
+        ((20, 21, 20), True, True),
+        ((20, 21, 20), False, False),
+    ],
+)
+async def test_independent_confirmation_requires_people_events_and_same_time(
+    database,
+    actors,
+    matching_time,
+    expected,
+):
+    import json
+    from dataclasses import replace
+
+    from debilgi.language.proposition_memory import PropositionMemory
+
+    _, identifier = await _response_proposal(database)
+    row = await database.fetchone(
+        "SELECT roles_json FROM continuous_cognition_hypotheses WHERE hypothesis_id=?",
+        (identifier,),
+    )
+    thought = json.loads(json.loads(row[0])["descriptor"]["proposition"])
+    if not matching_time:
+        thought["semantic_time"]["tense"] = "future"
+    for i, actor in enumerate(actors, 1):
+        observation = replace(_event(i), actor_id=actor)
+        await EventRepository(database).append(observation)
+        # Canonical observations stand for different human reports about this
+        # resolved participant; evidence must be checked against their claims.
+        await database.execute(
+            "INSERT INTO meaning_claims "
+            "(claim_id,source_event_id,guild_id,channel_id,speaker_id,subject_ref,predicate,polarity,"
+            "modality_json,source_kind,source_time,valid_from,valid_to,"
+            "confidence,resolved,parser_version,thought_json,correction_target,is_correction) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                f"observation:{i}",
+                observation.event_id,
+                1,
+                10,
+                actor,
+                "discord:user:20",
+                "отдыхать",
+                1,
+                "[]",
+                "other_report",
+                observation.utc_timestamp.isoformat(),
+                None,
+                None,
+                0.9,
+                1,
+                "meaning-ir/1",
+                json.dumps(thought),
+                None,
+                0,
+            ),
+        )
+        await database.execute(
+            "INSERT INTO continuous_cognition_evidence VALUES (?,?,?,?,?,?,?)",
+            (
+                f"proof:{i}",
+                identifier,
+                observation.event_id,
+                "supports",
+                1.0,
+                json.dumps({"canonical_claim": f"observation:{i}"}),
+                observation.utc_timestamp.isoformat(),
+            ),
+        )
+        promoted = await PropositionMemory(database).review_response_hypothesis(
+            identifier, observation, promote=True
+        )
+        assert promoted == (expected and i == 3)
+    proof = await database.fetchall(
+        "SELECT * FROM meaning_evidence WHERE source_key=?", ("confirmed_hypothesis:" + identifier,)
+    )
+    assert len(proof) == (3 if expected else 0)
+
+
 @pytest.fixture
 async def database(tmp_path: Path):
     db = Database(tmp_path / "continuous.sqlite3", MIGRATIONS)
@@ -138,7 +351,7 @@ async def test_pulse_turns_completed_trace_into_revisable_memory(
     assert any("убегать" in fact and "[hypothesis;" in fact for fact in facts)
 
 
-async def test_repeated_independent_evidence_retains_but_does_not_certify_hypothesis(
+async def test_one_author_cannot_retain_by_repeating_conclusions(
     database: Database,
 ) -> None:
     service = ContinuousCognitionService(database, clock=lambda: NOW)
@@ -152,8 +365,8 @@ async def test_repeated_independent_evidence_retains_but_does_not_certify_hypoth
            ORDER BY predicate_key"""
     )
     assert len(rows) == 2
-    assert all(int(row["positive_evidence"]) == 3 for row in rows)
-    assert all(str(row["status"]) == "retained" for row in rows)
+    assert all(int(row["positive_evidence"]) == 1 for row in rows)
+    assert all(str(row["status"]) == "working" for row in rows)
     assert {str(row["epistemic_status"]) for row in rows} == {"inference", "hypothesis"}
     assert all(float(row["confidence"]) < 1.0 for row in rows)
 

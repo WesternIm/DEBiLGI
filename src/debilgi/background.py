@@ -24,7 +24,6 @@ from debilgi.knowledge.policy import media_article_reasons
 from debilgi.knowledge.wikipedia import WikipediaClient
 from debilgi.language.abstract_reasoning import AbstractReasoningService
 from debilgi.language.causal_reasoning import CausalReasoningRepository
-from debilgi.language.character_markov import normalize_word
 from debilgi.language.content import content_lemmas
 from debilgi.language.context_gate import ContextGateDeferred
 from debilgi.language.lexical_matching import fuzzy_match_allowed
@@ -35,6 +34,7 @@ from debilgi.language.semantic_consultant import (
     SemanticConsultationService,
 )
 from debilgi.language.structured_utterance import analyze_structured_utterance
+from debilgi.language.tokenizer import normalize_word
 from debilgi.language.usage_learning import (
     LexicalStudyMaterial,
     LexicalUsageLearningService,
@@ -104,6 +104,7 @@ class BackgroundLearningService:
         autonomy: AutonomyRepository,
         *,
         sender: BackgroundSender | None = None,
+        awake: Callable[[], bool] | None = None,
         usage_learning: LexicalUsageLearningService | None = None,
         enabled: bool = False,
         interval: timedelta = timedelta(minutes=10),
@@ -142,6 +143,7 @@ class BackgroundLearningService:
         self._long_term_memory = long_term_memory
         self._autonomy = autonomy
         self._sender = sender
+        self._awake = awake or (lambda: True)
         self._usage_learning = usage_learning or LexicalUsageLearningService(database, dataset)
         self.enabled = enabled
         self.interval = interval
@@ -277,7 +279,8 @@ class BackgroundLearningService:
         while True:
             self._study_wake.clear()
             try:
-                await self.run_once()
+                if self._awake():
+                    await self.run_once()
             except asyncio.CancelledError:
                 raise
             except Exception:

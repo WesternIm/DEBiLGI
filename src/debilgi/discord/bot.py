@@ -50,12 +50,10 @@ from debilgi.language.archive_importer import ArchiveImporter, ArchiveImportMana
 from debilgi.language.archive_repository import ArchiveRepository
 from debilgi.language.assertion_experience import AssertionExperienceRepository
 from debilgi.language.causal_reasoning import CausalReasoningRepository
-from debilgi.language.character_markov import CharacterMarkovConfig, CharacterMarkovRepository
 from debilgi.language.context_gate import ContextGateDeferred, WorkingMemoryContextGate
 from debilgi.language.conversation import ConversationRepository, ResponsePlanRepository
 from debilgi.language.discourse import DiscourseMemoryRepository
-from debilgi.language.grounded_generator import GroundedConstructionGenerator
-from debilgi.language.lexicon import LexiconService, NeologismRepository, NeologismService
+from debilgi.language.lexicon import LexiconService, NeologismRepository
 from debilgi.language.morphology import MorphologyRepository
 from debilgi.language.open_questions import OpenLanguageQuestionService
 from debilgi.language.position_reasoning import PositionReasoningService, PositionRepository
@@ -143,16 +141,7 @@ class DebilgiBot(commands.Bot):
                 consolidation_batch_size=settings.cognitive_consolidation_batch_size,
             ),
         )
-        character_markov_config = CharacterMarkovConfig(
-            min_order=settings.character_markov_min_order,
-            max_order=settings.character_markov_max_order,
-            max_word_length=settings.character_markov_max_word_length,
-            generation_attempts=settings.character_markov_generation_attempts,
-        )
-        self.archive_repository = ArchiveRepository(
-            database,
-            character_markov_config=character_markov_config,
-        )
+        self.archive_repository = ArchiveRepository(database)
         self.discourse_memory = DiscourseMemoryRepository(
             database,
             max_turns_per_guild=settings.discourse_max_turns,
@@ -162,10 +151,6 @@ class DebilgiBot(commands.Bot):
         self.semantic_memory = SemanticMemoryRepository(database)
         self.proposition_memory = PropositionMemory(database)
         self.causal_reasoning = CausalReasoningRepository(database)
-        self.character_markov = CharacterMarkovRepository(
-            database,
-            character_markov_config,
-        )
         self.lexicon = LexiconService(
             database,
             ruwordnet=(
@@ -194,11 +179,6 @@ class DebilgiBot(commands.Bot):
             database,
             expiration_days=settings.neologism_expiration_days,
             min_response_interval=settings.neologism_min_response_interval,
-        )
-        self.neologism_service = NeologismService(
-            self.lexicon,
-            self.character_markov,
-            self.neologisms,
         )
         self.conversation_memory = ConversationRepository(
             database,
@@ -329,6 +309,7 @@ class DebilgiBot(commands.Bot):
             self.long_term_memory,
             self.autonomy_repository,
             sender=self._send_background_message,
+            awake=lambda: not self.continuous_cognition.sleeping,
             usage_learning=self.lexical_usage_learning,
             enabled=settings.background_enabled,
             interval=timedelta(seconds=settings.background_interval_seconds),
@@ -358,51 +339,41 @@ class DebilgiBot(commands.Bot):
             self.personality_expression,
             self.experience_consolidator,
             self.initiative_policy,
-            GroundedConstructionGenerator(
-                max_output_chars=settings.language_max_output_chars,
-            ),
             social_reactions=self.social_reaction_repository,
             reflection=self.reflection_engine,
             literacy=self.literacy_engine,
             discourse_memory=self.discourse_memory,
             semantic_memory=self.semantic_memory,
-            causal_reasoning=self.causal_reasoning,
             knowledge_service=self.knowledge_service,
             lexicon=self.lexicon,
             conversation_memory=self.conversation_memory,
-            response_plans=self.response_plans,
             long_term_memory=self.long_term_memory,
             self_dataset=self.self_dataset,
-            russian_reference=self.russian_reference,
             open_questions=self.open_language_questions,
-            short_speech_acts=self.short_speech_acts,
             usage_learning=self.lexical_usage_learning,
-            understanding_repository=self.utterance_understandings,
             arbitration_repository=self.arbitration_repository,
             context_gate=self.context_gate,
-            # Kept for compatible routes; meaning-first generation never calls it.
-            semantic_consultant=self.semantic_consultant,
             semantic_assimilation=self.semantic_assimilation,
-            position_reasoning=self.position_reasoning,
-            abstract_reasoning=self.abstract_reasoning,
             processing_outcomes=self.processing_outcomes,
             response_traces=self.response_traces,
-            continuous_cognition=self.continuous_cognition,
             assertion_experiences=self.assertion_experiences,
-            arbitration_mode=settings.arbitration_mode,
             arbitration_minimum_score=settings.arbitration_minimum_score,
-            arbitration_max_total_candidates=(settings.arbitration_max_total_candidates),
-            response_confidence_threshold=settings.response_confidence_threshold,
-            response_plan_retry_limit=settings.response_plan_retry_limit,
             context_character_limit=settings.language_context_chars,
             productive_only_replies=settings.productive_only_replies,
-            meaning_first_replies=True,
+            response_deliberation_enabled=settings.response_deliberation_enabled,
             proposition_memory=self.proposition_memory,
             meaning_intents=self.meaning_intents,
             affect=self.affect_repository,
             dialogue_tasks=self.dialogue_tasks,
             enabled=settings.test_replies_enabled,
         )
+        self.reply_service.sleep_cognition = self.continuous_cognition
+        self.continuous_cognition._replay = self.reply_service.replay_sleep_episode
+        self.continuous_cognition._maintenance = (
+            self._sleep_maintenance
+        )
+        self.continuous_cognition._presence = self._sleep_presence
+        self.continuous_cognition._activity_filter = self._sleep_activity
         self.pipeline = EventPipeline(
             repository,
             [
@@ -413,28 +384,30 @@ class DebilgiBot(commands.Bot):
                 self.meaning_intents.observe,
                 self.memory.observe,
                 self.context_gate.observe,
-                self.long_term_memory.observe,
                 self.discourse_memory.observe,
-                self.semantic_memory.observe,
+                self.semantic_assimilation.dialogue_learning.observe,
                 self.proposition_memory.observe,
-                self.causal_reasoning.observe,
-                self.character_markov.observe,
                 self.lexicon.observe,
-                self.open_language_questions.observe,
-                self.russian_reference.observe,
-                self.morphology.observe,
                 self.conversation_memory.observe,
-                self.literacy_engine.observe,
-                self.learning_engine.observe,
                 self.cognitive_core.observe,
                 self.continuous_cognition.observe,
                 self.social_reaction_engine.observe,
                 self.affect_engine.observe,
+                self.knowledge_service.observe,
+            ],
+            post_handlers=[
+                self.long_term_memory.observe,
+                self.semantic_memory.observe,
+                self.causal_reasoning.observe,
+                self.open_language_questions.observe,
+                self.russian_reference.observe,
+                self.morphology.observe,
+                self.literacy_engine.observe,
+                self.learning_engine.observe,
                 self.experience_consolidator.observe,
                 self.self_dataset.observe,
                 self.learning_quality.observe_feedback,
                 self.autonomy_repository.observe,
-                self.knowledge_service.observe,
             ],
         )
         self.archive_importer = ArchiveImporter(self.archive_repository)
@@ -454,6 +427,7 @@ class DebilgiBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.database.initialize()
+        self.semantic_assimilation.dialogue_learning.start_analysis_warmup()
         await self.proposition_memory.restore_from_events()
         reflected = await self.reflection_engine.backfill()
         if reflected:
@@ -532,9 +506,33 @@ class DebilgiBot(commands.Bot):
                 synced = await self.tree.sync()
                 logger.info("Synced %d global commands", len(synced))
 
+    async def _sleep_maintenance(self):
+        return await self.semantic_assimilation.dialogue_learning.warm_analysis_cache(
+            max_exchanges=8)
+
+    async def _sleep_activity(self, event) -> bool:
+        # Gateway membership is the existing server permission boundary. Imports
+        # do not count as activity. A known bot channel also counts without a tag.
+        if self.is_ready() and self.get_guild(event.guild_id) is None:
+            return False
+        if event.turn_form.addressed or await self.context_gate.last_bot_turn(
+            event.guild_id, event.channel_id
+        ):
+            return True
+        # Channel participation survives eviction from the short context window
+        # and restarts through the existing delivered intention history.
+        return bool(await self.database.fetchone(
+            "SELECT 1 FROM language_meaning_intentions WHERE guild_id=? AND channel_id=? "
+            "AND response_message_id IS NOT NULL LIMIT 1", (event.guild_id, event.channel_id)))
+
+    async def _sleep_presence(self, status: str) -> None:
+        if self.is_ready():
+            await self.change_presence(status=getattr(discord.Status, status))
+
     async def on_ready(self) -> None:
         user_id = self.user.id if self.user else "?"
         logger.info("Connected to Discord as %s (%s)", self.user, user_id)
+        await self.continuous_cognition.sync_presence()
         await self.reply_delivery.start()
         try:
             await self.archive_manager.start()
@@ -548,6 +546,8 @@ class DebilgiBot(commands.Bot):
     async def _send_background_message(
         self, guild_id: int, channel_id: int, text: str
     ) -> int | None:
+        if self.continuous_cognition.sleeping:
+            raise ContextGateDeferred("sleeping")
         decision = await self.context_gate.evaluate(
             guild_id=guild_id,
             channel_id=channel_id,
@@ -605,6 +605,9 @@ class DebilgiBot(commands.Bot):
             cleanup.push_async_callback(self.reply_delivery.stop)
             cleanup.push_async_callback(self.continuous_cognition.stop)
             cleanup.push_async_callback(self.background_learning.stop)
+            cleanup.push_async_callback(self.lexicon.stop_synonym_candidates)
+            cleanup.push_async_callback(
+                self.semantic_assimilation.dialogue_learning.stop_analysis_warmup)
 
 
 def create_bot(settings: Settings, database: Database, repository: EventRepository) -> DebilgiBot:

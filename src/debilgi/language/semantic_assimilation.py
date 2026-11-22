@@ -13,6 +13,7 @@ from uuid import uuid4
 from debilgi.dataset.self_dataset import SelfDatasetRepository
 from debilgi.language.construction_nlg import ConstructionSpec
 from debilgi.language.content import content_lemmas
+from debilgi.language.dialogue_learning import DialogueStructureLearning, exchange_analysis
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY, MorphologicalReading
 from debilgi.language.productive_nlg import (
     DependencyPattern,
@@ -180,6 +181,14 @@ class SemanticLessonRepository:
         response_acts: list[str] = []
         registers: list[str] = []
         social_policies: list[SocialPolicy] = []
+        _, prompt_act, _ = exchange_analysis(prompt)
+        act_rows = await self._database.fetchall(
+            """SELECT response_act FROM language_dialogue_act_patterns
+               WHERE guild_id = ? AND prompt_act = ? AND source = 'local_exchange'
+               ORDER BY evidence_count DESC, confidence DESC, response_act LIMIT 8""",
+            (guild_id, prompt_act),
+        )
+        response_acts.extend(str(row["response_act"]) for row in act_rows)
         for row in rows:
             try:
                 payload = json.loads(str(row["payload_json"]))
@@ -242,6 +251,7 @@ class SemanticLessonRepository:
         productive_rows = await self._database.fetchall(
             """SELECT * FROM language_productive_constructions
                WHERE guild_id = ? AND confidence >= 0.40 AND utility > -0.75
+                 AND predicate_class != 'dialogue_act'
                ORDER BY utility DESC, confidence DESC, observation_count DESC
                LIMIT 32""",
             (guild_id,),
@@ -289,6 +299,7 @@ class SemanticAssimilationService:
     """Persist structured lessons and apply corroborated ones to language memory."""
 
     def __init__(self, database: Database, dataset: SelfDatasetRepository) -> None:
+        self.dialogue_learning = DialogueStructureLearning(database, self)
         self._database = database
         self._dataset = dataset
         self._lessons = SemanticLessonRepository(database)
@@ -339,6 +350,7 @@ class SemanticAssimilationService:
         guild_id: int,
         structure: StructuredUtterance,
         observed_at: datetime | None = None,
+        source_event_id: str | None = None,
     ) -> int:
         """Learn grammar from local parsing without calling an external model."""
 
@@ -372,7 +384,7 @@ class SemanticAssimilationService:
                 True,
             )
             input_hash = hashlib.sha256(
-                f"local|{structure.text}|{'|'.join(pattern.roles)}".encode()
+                f"local|{source_event_id or structure.text}|{'|'.join(pattern.roles)}".encode()
             ).hexdigest()
             update = await self._lessons.observe(
                 guild_id=guild_id,
@@ -380,6 +392,13 @@ class SemanticAssimilationService:
                 lesson=lesson,
                 observed_at=now,
             )
+            if source_event_id:
+                await self._database.execute(
+                    """UPDATE language_semantic_lesson_evidence SET source_event_id = ?
+                       WHERE input_hash = ? AND lesson_id = ? AND EXISTS
+                       (SELECT 1 FROM events WHERE event_id = ?)""",
+                    (source_event_id, input_hash, update.lesson_id, source_event_id),
+                )
             if update.status == "active" and update.evidence_added:
                 await self._apply_active(guild_id, lesson, now)
                 observed += 1

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from functools import lru_cache
 
 from debilgi.events.models import Event, EventType
 from debilgi.social.models import PrimitiveVector
@@ -59,6 +61,44 @@ _POINTS = {
     "интерес": (0.48, 0.68),
     "нейтральность": (0.0, 0.0),
 }
+
+
+@lru_cache(maxsize=16384)
+def lexical_valence(text: str) -> float | None:
+    """Valence of the heard event, not the agent's accumulated mood.
+
+    Reuse existing social evidence and emotion coordinates. Unknown vocabulary
+    stays unknown; no event names or response phrases are bootstrapped here.
+    """
+    from debilgi.language.lexical_matching import expressive_family, same_lexical_family
+    from debilgi.language.morphology import DEFAULT_MORPHOLOGY
+    from debilgi.language.structured_utterance import analyze_structured_utterance
+    from debilgi.social.signals import APPROVAL, AVERSION, DISAPPROVAL, evidence_counts
+
+    structure = analyze_structured_utterance(text)
+    values = []
+    for clause in structure.clauses:
+        tokens = structure.tokens[clause.token_start:clause.token_end]
+        counts = evidence_counts(tuple(t.surface for t in tokens))
+        score = counts["approval"] - counts["disapproval"] - counts["aversion"]
+        for token in tokens:
+            for words, direction in ((APPROVAL, 1), (DISAPPROVAL | AVERSION, -1)):
+                if token.surface not in words and any(
+                    same_lexical_family(token.lemma, word) for word in words
+                ):
+                    score += direction
+            short = DEFAULT_MORPHOLOGY.inflect(
+                token.lemma, form="short_adjective", gender="neuter", number="singular",
+            ) if token.part_of_speech == "adjective" else None
+            if short:
+                evidence = evidence_counts((short,))
+                score += evidence["approval"] - evidence["disapproval"] - evidence["aversion"]
+            for label, (valence, _) in _POINTS.items():
+                if abs(valence) >= 0.3 and expressive_family(token.lemma, label):
+                    score += valence
+        if score:
+            values.append(max(-1.0, min(1.0, -score if clause.negated else score)))
+    return sum(values) / len(values) if values else None
 
 
 def nearest_affect(vector: AffectVector) -> str:
@@ -231,3 +271,220 @@ def _json(value) -> str:
 
 def _signed(value: float) -> float:
     return max(-1.0, min(1.0, value if math.isfinite(value) else 0.0))
+
+
+# --- Irritation R (4.34, flag DEBILGI_THOUGHT_CONTENT only) -------------------------------------
+# R is a function of the journal and the clock, like boredom B, but it is a separate scale: it
+# reads what a person did to the agent (hostile address, pressure by repeating, a repeated
+# question after an answer), never what the agent said. Nothing is stored.
+#   R = 1 - exp(-g * sum_i w_i * s_i),  w_i = 2^(-age_i / T_R),  g = 1 - patience (genome),
+#   T_R = the per-person emotion half-life already used by AffectRepository.state (720 s).
+IRRITATION_HALF_LIFE = 720.0
+_ABUSE_PARTS = frozenset({"noun", "adverb", "interjection", "particle"})
+_SECOND_PERSON = frozenset({"ты", "твой", "вы", "ваш"})
+_OTHER_SUBJECTS = frozenset({"я", "мы", "он", "она", "оно", "они"})
+_MENTION = None
+
+
+def strip_mentions(text: str) -> str:
+    import re
+
+    global _MENTION
+    if _MENTION is None:
+        _MENTION = re.compile(r"<@[!&]?\d+>")
+    return " ".join(_MENTION.sub(" ", text or "").split())
+
+
+_OTHER_PERSON = frozenset({"я", "мы", "он", "она", "оно", "они"})
+_NAMELIKE = frozenset({"Name", "Surn", "Patr", "Geox", "Orgn", "Abbr"})
+
+
+@lru_cache(maxsize=16384)
+def hostility_cues(text: str, aggravated: bool = False) -> tuple[str, ...]:
+    """Evidence that an utterance addressed to the agent is an attack on it.
+
+    No word list. Evidence kinds (the prefix is the kind, the rest the lemma):
+    * ``register:`` — the morphology dictionary marks the word as slang (``Slng``, also when the
+      suffix predictor inherits it: ``похуй`` from ``хуй``), and the structure puts it on the
+      addressee: ``ты``/``твой`` present, a bare predicate («пошёл …») in the same clause, or an
+      animate known noun standing alone as an address («але пидарас»). A guessed register word with
+      no addressee («да и похуй»), and a
+      sentence about «я/он/она/мы/они» without ``ты``, are not an attack.
+    * ``unplaced:`` — «ты + noun» where the noun is one the dictionary does not know and that is
+      not written with a capital (a guessed ``Name``/``Orgn`` grammeme is a guess) and not a
+      keystroke away from a known word (a typo of ``занимаешься`` is a verb, not a word): the
+      speaker characterises the addressee with a word the agent cannot place.
+    * ``escalation:`` — the person has been hostile a moment ago (``aggravated``) and now
+      predicates a noun of unknown sign of the addressee («ты дурак», «быть петушком?»).
+      Its strength is the irritation already in force (see ``irritation_reading``).
+    * ``negative_valence_at_addressee`` — «ты + оценка < 0» in a nominal statement.
+    A positively valenced word never counts as an attack.
+    """
+    from debilgi.language.dialogue_learning import exchange_analysis
+    from debilgi.language.morphology import DEFAULT_MORPHOLOGY
+
+    text = strip_mentions(text)
+    if not text:
+        return ()
+    structure = exchange_analysis(text)[0]  # the parse every other reader already holds
+    alpha = [t for t in structure.tokens if t.surface[:1].isalpha()]
+    second = any(t.lemma in _SECOND_PERSON for t in alpha)
+    subjects = {structure.tokens[i].lemma for c in structure.clauses for i in c.subject_indices}
+    if (subjects & _OTHER_SUBJECTS or any(t.lemma in _OTHER_PERSON for t in alpha)) and not second:
+        return ()
+    bare_clauses = {c.clause_index for c in structure.clauses if (
+        c.predicate_index is not None and not c.subject_indices) or c.clause_kind == "command"}
+    questioned = any(c.clause_kind == "question" for c in structure.clauses)
+    negated = any(c.negated for c in structure.clauses)
+    capitalised = {w.casefold() for w in re.findall(r"\w+", text)[1:] if w[:1].isupper()}
+    cues = []
+    for token in alpha:
+        readings = DEFAULT_MORPHOLOGY.parse_word(token.surface)
+        register = any("Slng" in r.grammemes for r in readings)
+        if not register and token.part_of_speech != "noun":
+            continue
+        if (lexical_valence(token.surface) or 0.0) > 0:
+            continue
+        bare_predicate = token.clause_index in bare_clauses
+        if register and token.part_of_speech in _ABUSE_PARTS:
+            if token.surface.casefold() in capitalised:
+                continue  # a name written with a capital letter is not a word of abuse
+            if token.semantic_role == "pragmatic_marker":
+                directed = second or bare_predicate
+            elif token.part_of_speech == "noun" and token.semantic_role in {
+                "predicate_complement", "vocative", "direct_object", "subject",
+            }:
+                alone = all(t is token or t.semantic_role in {
+                    "subject", "vocative", "predicate_complement"} and t.part_of_speech == "noun"
+                    or t.part_of_speech != "verb" and t.part_of_speech != "noun" for t in alpha)
+                directed = second or bare_predicate or (
+                    alone and token.morphology_known and "anim" in token.grammemes)
+            else:
+                directed = False
+            if directed:
+                cues.append("register:" + token.lemma)
+            continue
+        if token.part_of_speech != "noun" or not second or negated:
+            continue
+        # «ты + noun»: the noun is a predicate complement of ты (or of an implicit addressee)
+        clause = structure.clauses[token.clause_index] if token.clause_index < len(
+            structure.clauses) else None
+        if clause is None or token.index not in clause.predicate_complement_indices or not any(
+                structure.tokens[i].lemma in _SECOND_PERSON for i in clause.subject_indices):
+            continue
+        if (not token.morphology_known and token.surface.casefold() not in capitalised
+                and not DEFAULT_MORPHOLOGY.has_known_neighbour(token.surface)):
+            cues.append("unplaced:" + token.lemma)
+        elif aggravated and lexical_valence(token.surface) is None:
+            cues.append("escalation:" + token.lemma)
+    if aggravated and not cues and not second:
+        # «нравится быть петушком?»: a question with no subject whose complement of «быть» is an
+        # instrumental noun; the implicit subject of a bare question is the addressee
+        for clause in structure.clauses:
+            if clause.clause_kind != "question" and not questioned:
+                continue
+            for index in clause.action_complement_indices:
+                if structure.tokens[index].lemma != "быть":
+                    continue
+                for token in structure.tokens[index + 1:clause.token_end]:
+                    if lexical_valence(token.surface) is not None:
+                        continue
+                    if any(r.part_of_speech == "noun" and r.case == "instrumental"
+                           and not (r.grammemes & _NAMELIKE)
+                           for r in DEFAULT_MORPHOLOGY.parse_word(token.surface)):
+                        cues.append("escalation:" + token.lemma)
+    if (not cues and (lexical_valence(text) or 0.0) < 0 and second and any(
+            c.clause_kind == "nominal_statement" and any(
+                structure.tokens[i].lemma in _SECOND_PERSON for i in c.subject_indices)
+            for c in structure.clauses) and not questioned and not negated):
+        cues.append("negative_valence_at_addressee")
+    return tuple(cues)
+
+
+@dataclass(frozen=True, slots=True)
+class IrritationReading:
+    value: float
+    hostile: tuple[str, ...]
+    impulses: tuple[dict, ...]
+    sensitivity: float
+    half_life: float
+
+    def as_dict(self) -> dict:
+        return {"value": round(self.value, 4), "hostile_now": list(self.hostile),
+                "sensitivity": self.sensitivity, "half_life_seconds": self.half_life,
+                "impulses": list(self.impulses)}
+
+
+async def irritation_reading(
+    database: Database, event: Event, text: str
+) -> IrritationReading | None:
+    from datetime import timedelta
+
+    from debilgi.config import thought_content_enabled
+    from debilgi.personality.genome import DEBILGI_GENOME
+
+    if not thought_content_enabled() or event.actor_id is None:
+        return None
+    patience = DEBILGI_GENOME.traits()["patience"]
+    gain = max(1e-3, 1.0 - patience)
+    now = event.utc_timestamp
+    rows = await database.fetchall(
+        """SELECT t.source_event_id, COALESCE(json_extract(e.payload_json, '$.content'), t.prompt)
+                  AS prompt, t.status, t.started_at, m.operation
+           FROM language_response_traces t
+           LEFT JOIN events e ON e.event_id = t.source_event_id
+           LEFT JOIN language_meaning_intentions m
+             ON m.guild_id = t.guild_id AND m.response_message_id = t.response_message_id
+           WHERE t.guild_id=? AND t.user_id=? AND t.started_at < ? AND t.started_at >= ?
+           ORDER BY t.started_at DESC LIMIT 48""",
+        (event.guild_id, event.actor_id, now.isoformat(),
+         (now - timedelta(seconds=6 * IRRITATION_HALF_LIFE)).isoformat()))
+    turns = [(r["source_event_id"], strip_mentions(r["prompt"]), r["status"], r["operation"],
+              (now - datetime.fromisoformat(r["started_at"])).total_seconds())
+             for r in reversed(rows)]
+    # what the person wrote, not the prompt the agent resolved (an ellipsis resolves to the
+    # previous question and would look like a repeat)
+    turns.append((event.event_id, strip_mentions(event.payload.get("content") or text),
+                  None, None, 0.0))
+    seen: dict[str, tuple[str | None, str | None]] = {}
+    impulses, total, past, current = [], 0.0, [], ()
+    for event_id, prompt, status, operation, age in turns:
+        if not prompt:
+            continue
+        key = " ".join("".join(ch for ch in prompt.casefold() if ch.isalnum() or ch == " ").split())
+        kinds = {}
+        # the irritation this person had already caused at that moment (the evidence for an
+        # escalation: someone who was hostile a moment ago, calling the addressee by a word of
+        # unknown sign)
+        in_force = sum(value * 2.0 ** (-(earlier_age - age) / IRRITATION_HALF_LIFE)
+                       for earlier_age, value in past)
+        carried = 1.0 - math.exp(-gain * in_force)
+        # "still in force": earlier attacks weigh at least as much as one attack a half-life ago
+        cues = hostility_cues(prompt, in_force >= 0.5)
+        if event_id == event.event_id:
+            current = cues
+        direct = [c for c in cues if not c.startswith("escalation:")]
+        if direct:
+            kinds["hostile_address"] = 1.0
+        elif cues:
+            kinds["hostile_escalation"] = carried  # the irritation already in force
+        if key in seen:
+            earlier_status, earlier_operation = seen[key]
+            answered = earlier_status == "sent" and not (earlier_operation or "").startswith(
+                "express_")
+            kinds["repeated_after_answer" if answered else "pressure_after_no_answer"] = (
+                1.0 if answered else 0.25)
+        seen[key] = (status, operation)
+        if not kinds:
+            continue
+        strength = 1.0
+        for value in kinds.values():
+            strength *= 1.0 - value
+        strength = 1.0 - strength
+        weight = 2.0 ** (-age / IRRITATION_HALF_LIFE)
+        total += weight * strength
+        past.append((age, strength))
+        impulses.append({"event_id": event_id, "kinds": sorted(kinds), "weight": round(weight, 4),
+                         "strength": round(strength, 4)})
+    value = 1.0 - math.exp(-gain * total)
+    return IrritationReading(value, current, tuple(impulses[-8:]), gain, IRRITATION_HALF_LIFE)

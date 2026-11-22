@@ -63,7 +63,7 @@ def prepared(*, initiative: bool = False) -> PreparedReply:
     )
 
 
-async def test_plain_direct_reply_is_neutral_for_language_transitions(database: Database) -> None:
+async def test_plain_direct_reply_records_neutral_experience(database: Database) -> None:
     repository = ExperienceRepository(database)
     consolidator = ExperienceConsolidator(repository)
     prompt = event("message:1", at=NOW)
@@ -77,14 +77,15 @@ async def test_plain_direct_reply_is_neutral_for_language_transitions(database: 
     await consolidator.observe(event("message:2", at=NOW + timedelta(seconds=5), reply_to=999))
 
     stats = await repository.stats(1)
-    adjustments = dict(await repository.transition_adjustments(1))
     assert stats.resolved == 1
     assert stats.average_reward == pytest.approx(0.0)
-    assert stats.learned_transitions == 3
-    assert adjustments == {}
+    transitions = await database.fetchone(
+        "SELECT COUNT(*) AS c FROM sqlite_master WHERE name='language_experience_transitions'"
+    )
+    assert transitions["c"] == 0
 
 
-async def test_ignored_reply_expires_and_weakens_transitions(database: Database) -> None:
+async def test_ignored_reply_expires_with_negative_reward(database: Database) -> None:
     repository = ExperienceRepository(database)
     consolidator = ExperienceConsolidator(repository)
     prompt = event("message:3", at=NOW)
@@ -98,13 +99,12 @@ async def test_ignored_reply_expires_and_weakens_transitions(database: Database)
     await consolidator.observe(event("message:4", at=NOW + timedelta(minutes=11), actor_id=200))
 
     stats = await repository.stats(1)
-    adjustments = dict(await repository.transition_adjustments(1))
     assert stats.expired == 1
     assert stats.average_reward == pytest.approx(-0.18)
-    assert adjustments[("server", "again")] < 0.0
+    assert (await repository.self_model(1)).negative_outcomes == 1
 
 
-async def test_negative_reaction_weakens_the_generated_transitions(database: Database) -> None:
+async def test_negative_reaction_updates_reward_and_self_model(database: Database) -> None:
     repository = ExperienceRepository(database)
     consolidator = ExperienceConsolidator(repository)
     prompt = event("message:5", at=NOW)
@@ -129,10 +129,9 @@ async def test_negative_reaction_weakens_the_generated_transitions(database: Dat
     await consolidator.observe(reaction)
 
     stats = await repository.stats(1)
-    adjustments = dict(await repository.transition_adjustments(1))
     assert stats.resolved == 1
     assert stats.average_reward == pytest.approx(-0.8)
-    assert adjustments[("server", "again")] < 0.0
+    assert (await repository.self_model(1)).negative_outcomes == 1
 
 
 async def test_neutral_reply_does_not_claim_initiative_success(database: Database) -> None:

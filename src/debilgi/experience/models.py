@@ -34,6 +34,7 @@ class PreparedReply:
     meaning_intention_id: str | None = None
     dialogue_task_id: str | None = None
     dialogue_task_progress: float | None = None
+    deliberation_steps: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,3 +70,5 @@ class SelfModel:
     initiative_successes: int
     efficacy: float
     updated_at: datetime | None
+    # Canonical evidence adapter; efficacy remains an autonomy statistic.
+    claim_ids: tuple[str, ...] = ()

@@ -132,3 +132,113 @@ def test_failed_verbalization_does_not_silently_drop_the_reason(monkeypatch):
     monkeypatch.setattr(communication, "realize_thought",
                         lambda t, *a, **k: () if t is reason else nlg(t, *a, **k))
     assert composer.compose(MessagePlan(composer.goal, thought(), reason=reason)) == ()
+
+
+def test_same_unknown_words_keep_their_independent_query_metadata():
+    from debilgi.language.canonical_claims import ClaimQuery
+    from debilgi.language.communication import KnowledgeLimit
+    from debilgi.language.productive_nlg import unresolved_answer_thought
+
+    structure = analyze_structured_utterance("Кто бежит?")
+    composer = ResponseComposer(structure)
+    query = ClaimQuery(1, 2, 3, "2026-11-16", "question", predicate="бежать",
+                       arguments=(("subject", "concept:медведь"),))
+    first = MessagePlan(reader_goal(structure), unresolved_answer_thought(),
+                        knowledge_limit=KnowledgeLimit(query, None, "кто"))
+    second = replace(first, knowledge_limit=replace(first.knowledge_limit,
+                     query=replace(query, arguments=(("subject", "concept:муравей"),))))
+    a, b = composer.compose(first)[0], composer.compose(second)[0]
+    assert a.text == b.text and first.key != second.key
+    for plan in (first, second):
+        metadata = composer.metadata_for(a.text, plan_key=plan.key)
+        assert metadata["message_plan_key"] == plan.key
+        assert metadata["message_plan"]["knowledge_limit"]["query"]["arguments"] == (
+            plan.knowledge_limit.query.arguments)
+
+
+def _embedded_question_surface(text: str, complement=None) -> str:
+    from debilgi.language.canonical_claims import ClaimQuery
+    from debilgi.language.communication import KnowledgeLimit
+    from debilgi.language.productive_nlg import unresolved_answer_thought
+    from debilgi.language.semantic_graph import parse_proposition
+
+    structure = analyze_structured_utterance(text)
+    parsed = parse_proposition(structure, perspective="user", allow_question=True)
+    question = replace(parsed, clause_kind="question")
+    if complement is not None:
+        question = replace(question, dependencies=tuple(
+            replace(d, argument=complement) if d.role == "predicate_complement" else d
+            for d in question.dependencies))
+    query = ClaimQuery(1, 2, 3, "2026-11-16", "question", predicate="быть")
+    assertion = unresolved_answer_thought(confidence=0.95)
+    assertion = replace(assertion, dependencies=tuple(
+        d for d in assertion.dependencies if d.role == "subject"))
+    plan = MessagePlan(reader_goal(structure), assertion,
+                       knowledge_limit=KnowledgeLimit(query, question, None))
+    return ResponseComposer(structure).compose(plan)[0].text
+
+
+def test_particle_li_follows_the_nominal_predicate_not_the_subject():
+    assert _embedded_question_surface("ты рад?").endswith(", рад ли я.")
+    assert _embedded_question_surface("ты веселый?").endswith(", весёлый ли я.")
+    assert _embedded_question_surface("ты не рад?").endswith(
+        ", рад ли я.")  # the negation of a polar question is its bias
+    from debilgi.language.productive_nlg import ConceptArgument, ConceptLexeme
+
+    phrase = ConceptArgument(ConceptLexeme("математик", "математик", "noun", ()),
+                             (ConceptLexeme("крутой", "крутой", "adjective", ()),),
+                             grammatical_case="nominative")
+    assert _embedded_question_surface("ты веселый?", phrase).endswith(", крутой ли я математик.")
+
+
+def test_particle_li_keeps_verbal_question_order():
+    assert _embedded_question_surface("ты хочешь бегать?").endswith(", хочу ли я бегать.")
+    assert _embedded_question_surface("ты бегаешь по утрам?").endswith(", бегаю ли я по утрам.")
+
+
+def test_witnessed_typo_is_spoken_in_dictionary_form_and_rare_unknown_words_are_withheld():
+    from debilgi.language.communication import _witnessed_word_surface
+
+    assert _witnessed_word_surface("здравтвуй", 1) == "здравствуй"
+    assert _witnessed_word_surface("дадно", 1) is None
+    assert _witnessed_word_surface("оооо", 1) == "оооо"
+    assert _witnessed_word_surface("!)", 1) == "!)"
+
+
+def test_repeating_laughter_is_not_mistaken_for_a_typo():
+    from debilgi.language.communication import _witnessed_word_surface
+
+    assert _witnessed_word_surface("ахаха", 1) == "ахаха"
+    assert _witnessed_word_surface("хехе", 1) == "хехе"
+
+
+def test_elliptical_why_without_a_delivered_turn_is_not_replaced_by_the_earlier_question():
+    from debilgi.language.dialogue_acts import analyze_turn_form
+    from debilgi.language.generative_planner import resolve_evidence_context
+    from debilgi.language.planning import ReplyContext
+
+    form = analyze_turn_form("почему?", addressed=True, follows_bot=True,
+                             previous_bot_text="Наверное, я рад.")
+    context = ReplyContext(prompt="почему?", turn_prompt="почему?", turn_form=form,
+                           consultation_messages=("user: так ты рад?",), prior_bot_turn=None)
+    resolved = resolve_evidence_context(context)
+    assert resolved.prompt == "почему?" and resolved.focus_reason == "elliptical_request_recovery"
+
+
+def test_alternative_meanings_need_independent_support_against_a_repeated_reaction():
+    from types import SimpleNamespace
+
+    from debilgi.language.generative_planner import ResponseDecision, compatible_response_decisions
+
+    def form(meaning, support):
+        return SimpleNamespace(component="core", meaning=meaning, support=support, activation=0.5,
+                               recovery_only=False, hypothesis=(), clause_kind="fragment",
+                               rule_id=meaning, evidence_ids=(), pattern_id=meaning,
+                               confidence_level="answer", rule_weight=0.7, input_features=(),
+                               target_features=(), mixture=(), known_slots=())
+
+    decision = ResponseDecision("free_form", "activated_transformation", "greeting", 0.9, 0.9,
+                                None, target_meaning="return_greeting", selection_context={})
+    forms = (form("return_greeting", 30), form("acknowledge", 1), form("appraise", 3))
+    meanings = [d.target_meaning for d in compatible_response_decisions(decision, forms, limit=4)]
+    assert "acknowledge" not in meanings and "return_greeting" in meanings

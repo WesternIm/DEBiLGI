@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from types import SimpleNamespace
 
 import discord
@@ -15,6 +16,7 @@ from debilgi.discord.delivery_repository import DeliveryRepository, decode_reply
 from debilgi.discord.reply_workflow import ReplyWorkflow
 from debilgi.events.repository import EventRepository
 from debilgi.language.research_wait import LexicalResearchPending
+from debilgi.language.response_trace import ResponseTraceRepository
 
 logger = logging.getLogger(__name__)
 _RECEIPT_RECONCILIATION_WINDOW = timedelta(hours=24)
@@ -22,6 +24,12 @@ _RECEIPT_RECONCILIATION_WINDOW = timedelta(hours=24)
 
 def delivery_nonce(event_id: str) -> str:
     return hashlib.sha256(event_id.encode()).hexdigest()[:24]
+
+
+def reply_pacing_seconds(text: str, steps: int, elapsed: float = 0.0) -> float:
+    """Bound the total visible preparation, crediting time already spent thinking."""
+    target = min(6.0, max(0.4, len(text) / 32.0 + min(16, max(0, steps)) * 0.08))
+    return max(0.0, target - max(0.0, elapsed))
 
 
 class DiscordReplyTransport:
@@ -35,6 +43,23 @@ class DiscordReplyTransport:
         if getattr(getattr(channel, 'guild', None), 'id', None) != event.guild_id:
             raise ValueError('delivery channel does not belong to the event guild')
         return channel
+
+    @asynccontextmanager
+    async def typing(self, event):
+        channel = await self.channel(event)
+        indicator = channel.typing()
+        entered = False
+        try:
+            try:
+                await indicator.__aenter__()
+                entered = True
+            except Exception:
+                logger.debug('Typing indicator unavailable', exc_info=True)
+            yield channel
+        finally:
+            if entered:
+                with suppress(Exception):
+                    await indicator.__aexit__(None, None, None)
 
     async def send(self, channel, event, reply):
         reference = None if reply.initiative else discord.MessageReference(
@@ -119,16 +144,42 @@ class ReplyDeliveryService:
                 if status == 'sending':
                     # A timeout, 5xx, or missing local receipt cannot prove non-delivery.
                     status = 'uncertain'
-                elif status == 'prepared' and isinstance(
+                elif status in {'pending', 'prepared'} and isinstance(
                     exc, (discord.Forbidden, discord.NotFound, ValueError)
                 ):
                     status = 'failed'
                 elif status == 'preparing':
                     status = 'failed' if current['attempts'] >= 3 else 'pending'
                 await self.repository.state(event_id, status, f'{type(exc).__name__}: {exc}', 30)
+                await self._trace_failure(
+                    event_id, status, f'{type(exc).__name__}: {exc}',
+                    stage='preparation' if current['status'] == 'preparing' else
+                    'bookkeeping' if current['status'] == 'sent' else 'delivery',
+                )
             return True
 
+    async def _trace_failure(self, event_id, status, reason, *, stage='delivery'):
+        await ResponseTraceRepository(self.repository.database).step(
+            event_id, stage=stage, component='reply_delivery', status=status,
+            summary='delivery worker failure; receipt remains separate',
+            details={'reason': reason, 'delivery_status': status},
+        )
+
     async def _process(self, job) -> None:
+        # Only fresh preparation/delivery has visible typing. Reconciliation
+        # and bookkeeping must never pretend to compose or send another reply.
+        typing = getattr(self.transport, 'typing', None)
+        if job['status'] in {'pending', 'prepared'} and typing is not None:
+            event = await self.events.get(str(job['event_id']))
+            if event is None:
+                raise RuntimeError('delivery event is missing')
+            started = monotonic()
+            async with typing(event) as channel:
+                await self._deliver(job, channel=channel, started=started)
+        else:
+            await self._deliver(job)
+
+    async def _deliver(self, job, *, channel=None, started=None) -> None:
         event_id = str(job['event_id'])
         event = await self.events.get(event_id)
         if event is None:
@@ -153,6 +204,9 @@ class ReplyDeliveryService:
                         'failed',
                         'receipt_not_found_after_reconciliation_window',
                     )
+                    await self._trace_failure(
+                        event_id, 'failed', 'receipt_not_found_after_reconciliation_window',
+                    )
                     logger.warning(
                         'Delivery receipt reconciliation expired: event=%s guild=%s channel=%s',
                         event_id,
@@ -161,6 +215,7 @@ class ReplyDeliveryService:
                     )
                     return
                 await self.repository.state(event_id, 'uncertain', 'receipt_not_found', 300)
+                await self._trace_failure(event_id, 'uncertain', 'receipt_not_found')
                 logger.warning('Delivery requires confirmation: event=%s guild=%s channel=%s',
                                event_id, event.guild_id, event.channel_id)
                 return
@@ -172,12 +227,24 @@ class ReplyDeliveryService:
                 return
             await self.repository.save_reply(event_id, reply)
             # Resolve the channel before the irreversible boundary.
-            channel = await self.transport.channel(event)
+            channel = channel if channel is not None else await self.transport.channel(event)
+            if started is not None:
+                elapsed = monotonic() - started
+                remaining = reply_pacing_seconds(reply.text, reply.deliberation_steps, elapsed)
+                await ResponseTraceRepository(self.repository.database).step(
+                    event_id, stage='delivery', component='typing_pacing', status='prepared',
+                    summary='visible preparation credits actual reasoning time',
+                    details={'preparation_seconds': elapsed, 'remaining_seconds': remaining,
+                             'deliberation_steps': reply.deliberation_steps},
+                )
+                if remaining:
+                    await asyncio.sleep(remaining)
             await self.repository.state(event_id, 'sending')
             try:
                 sent = await self.transport.send(channel, event, reply)
             except (discord.Forbidden, discord.NotFound) as exc:
                 await self.repository.state(event_id, 'failed', str(exc))
+                await self._trace_failure(event_id, 'failed', str(exc))
                 return
             await self.repository.sent(event_id, sent.id, sent.created_at)
         else:

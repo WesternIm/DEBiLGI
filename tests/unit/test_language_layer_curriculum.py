@@ -4,8 +4,8 @@ from debilgi.language.language_layer_curriculum import SCENES, total_turns
 def test_language_layer_curriculum_is_linked_and_covers_new_capabilities() -> None:
     skills = {skill for scene in SCENES for skill in scene.skills}
 
-    assert len(SCENES) >= 12
-    assert total_turns() >= 72
+    assert len(SCENES) >= 11
+    assert total_turns() >= 66
     assert {
         "reference_dictionary",
         "personal_interpretation",
@@ -15,7 +15,6 @@ def test_language_layer_curriculum_is_linked_and_covers_new_capabilities() -> No
         "response_plan",
         "causal_summary",
         "idle_timeout",
-        "character_markov",
         "neologism_reason",
         "human_feedback",
         "expression_gap",

@@ -138,14 +138,7 @@ async def test_unparsed_language_survives_restart_and_raw_redaction_without_self
     for item in (own, fragment, bot, elsewhere):
         await EventRepository(database).append(item)
         await memory.observe(item)
-    grams = await memory.learned_ngrams(own)
-    assert grams
-    assert any("привет" in gram for gram, _ in grams)
-    raw = await database.fetchall("SELECT gram_json FROM language_generation_ngrams")
-    assert any("привееет" in row["gram_json"] for row in raw)
-    assert not any("служебная" in gram or "межканальный" in gram for gram, _ in grams)
     await memory.restore_from_events()
-    assert grams == await memory.learned_ngrams(own)
     current = replace(message("current", "ногти"), timestamp=NOW)
     corpus = await memory.relevant_utterances(current, "ногти")
     assert corpus[0] == (own.event_id, own.payload["content"])
@@ -159,7 +152,6 @@ async def test_unparsed_language_survives_restart_and_raw_redaction_without_self
     database = Database(database_path, MIGRATIONS)
     await database.initialize()
     try:
-        assert await PropositionMemory(database).learned_ngrams(own) == grams
         assert await PropositionMemory(database).relevant_utterances(current, "ногти") == ()
     finally:
         await database.close()
@@ -189,13 +181,8 @@ async def test_lexical_dependencies_are_scoped_idempotent_and_survive_raw_redact
         for link in links
     )
     assert not any(link.governor in {"дарить", "звонить"} for link in links)
-    grams = await memory.learned_ngrams(own)
-    assert any(gram == ("ты", "пишешь") for gram, _ in grams)
-    assert not any("я" in gram for gram, _ in grams)
-    assert not any("." in gram[:-1] and gram[-1] not in {"\0end"} for gram, _ in grams)
     await memory.restore_from_events()
     assert links == await memory.learned_word_relations(own)
-    assert grams == await memory.learned_ngrams(own)
     await database.execute(
         "UPDATE events SET payload_json = json_remove(payload_json, '$.content')"
     )
@@ -205,7 +192,6 @@ async def test_lexical_dependencies_are_scoped_idempotent_and_survive_raw_redact
     try:
         memory = PropositionMemory(database)
         assert links == await memory.learned_word_relations(own)
-        assert grams == await memory.learned_ngrams(own)
     finally:
         await database.close()
 
@@ -299,7 +285,5 @@ async def test_answer_reports_keep_two_event_sources_after_restart_and_raw_redac
         )
         assert await restored.relevant_utterances(current, "проверка") == ()
         # Reconstructed propositions never become statistical speech training.
-        grams = await restored.learned_ngrams(current)
-        assert not any("дверь" in gram or "выключить" in gram for gram, _ in grams)
     finally:
         await database.close()

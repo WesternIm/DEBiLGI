@@ -175,13 +175,12 @@ async def test_unattributed_attention_and_silence_never_train_values(database, c
 
 async def test_targeted_feedback_is_idempotent_and_goals_require_valued_execution(database):
     repo = MeaningIntentRepository(database)
-    selected = await teach(database, repo, proposal(), 1, positive=True)
+    await teach(database, repo, proposal(), 1, positive=True)
     feedback = await EventRepository(database).get("feedback:1")
     assert not await repo.observe(feedback)
     goals = await repo.learned_goals(event("next", 20))
-    assert len(goals) == 1 and goals[0].action.predicate.lemma == "отвечать"
-    assert goals[0].evidence_id == "learned_preference:" + selected.intention_id
-    assert not goals[0].action.negated
+    # A single valued answer is useful for choice learning, not a preference.
+    assert not goals
     await teach(database, repo, proposal(), 2, positive=False)
     assert not await repo.learned_goals(event("balanced", 20))
 
@@ -290,3 +289,32 @@ async def test_preferences_survive_database_restart(database):
     restored = MeaningIntentRepository(database, exploration_rate=0)
     selected = await choose(database, restored, event("restored", 20), (proposal(),))
     assert selected.expected_reward == 1 and selected.sample_count == 1
+
+
+async def test_night_hypothesis_said_by_day_is_remembered_as_the_delivered_turn(database):
+    from dataclasses import asdict
+
+    repo = MeaningIntentRepository(database)
+    prompt = event("prompt:sleep", 1)
+    selected = await choose(database, repo, prompt, (proposal(),))
+    hypothesis = proposal("быть")
+    plan = asdict(replace(hypothesis.plan, hypothesis=(("kind", "experience_opinion"),
+                                                       ("operator", "наверное"))))
+    adopted = await repo.adopt_hypothesis(selected, plan, "sleep:h1", "plan-key-h1")
+    assert adopted.choice["sleep_hypothesis_id"] == "sleep:h1"
+    assert await repo.record_sent(prompt, intention_id=selected.intention_id,
+                                  response_message_id=777,
+                                  created_at=prompt.utc_timestamp + timedelta(seconds=1),
+                                  text="Наверное, я рад.")
+    row = await database.fetchone(
+        "SELECT operation,plan_key,response_text,plan_json FROM language_meaning_intentions "
+        "WHERE intention_id=?", (selected.intention_id,))
+    assert (row["operation"], row["plan_key"], row["response_text"]) == (
+        "sleep_hypothesis", "plan-key-h1", "Наверное, я рад.")
+    assert json.loads(row["plan_json"])["hypothesis"][1] == ["operator", "наверное"]
+    # Said by day, it is neither a fact nor a pending "response:*" hypothesis awaiting a yes.
+    for table in ("meaning_claims", "meaning_evidence"):
+        assert (await database.fetchone(f"SELECT COUNT(*) FROM {table}"))[0] == 0
+    assert (await database.fetchone(
+        "SELECT COUNT(*) FROM continuous_cognition_hypotheses WHERE signature LIKE 'response:%'"
+    ))[0] == 0

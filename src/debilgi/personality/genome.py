@@ -8,6 +8,16 @@ from dataclasses import asdict, dataclass
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticProtection:
+    features: frozenset[str]
+    weight: float = 1.0
+
+    def __post_init__(self):
+        if not 0.0 <= self.weight <= 1.0:
+            raise ValueError("protection weight must be between 0 and 1")
+
+
+@dataclass(frozen=True, slots=True)
 class PersonalityGenome:
     genome_id: str
     version: int
@@ -23,6 +33,15 @@ class PersonalityGenome:
     novelty_seeking: float
     response_threshold: float
     initiative: float
+    semantic_protections: tuple[SemanticProtection, ...] = ()
+
+    def protection_weight(self, features) -> float:
+        """Innate weights have no learned multiplier or mutable state."""
+        supplied = frozenset(features)
+        return max(
+            (rule.weight for rule in self.semantic_protections if rule.features <= supplied),
+            default=0.0,
+        )
 
     def __post_init__(self) -> None:
         if not self.genome_id or self.version <= 0:
@@ -36,12 +55,20 @@ class PersonalityGenome:
         return {
             name: float(value)
             for name, value in data.items()
-            if name not in {"genome_id", "version"}
+            if name not in {"genome_id", "version", "semantic_protections"}
         }
 
     @property
     def signature(self) -> str:
-        encoded = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
+        data = asdict(self)
+        if not self.semantic_protections:
+            data.pop("semantic_protections")
+        else:
+            data["semantic_protections"] = [
+                {"features": sorted(r.features), "weight": r.weight}
+                for r in self.semantic_protections
+            ]
+        encoded = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()[:16]
 
 

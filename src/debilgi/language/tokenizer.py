@@ -5,7 +5,9 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 
+_WORD_RE = re.compile(r"^[^\W_]+(?:[-'][^\W_]+)*$", re.UNICODE)
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _ROLE_RE = re.compile(r"<@&\d+>")
 _USER_RE = re.compile(r"<@!?\d+>")
@@ -19,6 +21,7 @@ _TOKEN_RE = re.compile(
     r"|[^\s\w]",
     re.UNICODE,
 )
+_CHAT_JOIN_RE = re.compile(r"(?<!\w)всмысле(?!\w)")
 _ELONGATED_RUN_RE = re.compile(r"(.)\1{2,}", re.IGNORECASE | re.UNICODE)
 
 
@@ -45,7 +48,7 @@ def tokenize(text: str, *, max_tokens: int = 500, max_token_length: int = 100) -
     if max_tokens <= 0 or max_token_length <= 0:
         raise ValueError("token limits must be positive")
     normalized = normalize_discord_markup(text).lower()
-    normalized = re.sub(r"(?<!\w)всмысле(?!\w)", "в смысле", normalized)
+    normalized = _CHAT_JOIN_RE.sub("в смысле", normalized)
     tokens = _TOKEN_RE.findall(normalized)
     return tuple(token[:max_token_length] for token in tokens[:max_tokens])
 
@@ -57,6 +60,17 @@ def normalize_chat_token(
 ) -> ChatTokenNormalization:
     """Normalize chat elongation/reduplication without losing its intensity."""
 
+    if is_known is None:
+        return _cached_chat_token(token)
+    return _normalize_chat_token(token, is_known=is_known)
+
+
+@lru_cache(maxsize=32768)
+def _cached_chat_token(token: str) -> ChatTokenNormalization:
+    return _normalize_chat_token(token)
+
+
+def _normalize_chat_token(token, *, is_known=None):
     surface = token.casefold().replace("’", "'").strip("-' ")
     if not surface:
         return ChatTokenNormalization(token, surface)
@@ -100,25 +114,45 @@ def _canonical_elongation(
     word: str,
     is_known: Callable[[str], bool] | None,
 ) -> str:
+    variants = elongation_variants(word)
+    if is_known is not None:
+        known = tuple(candidate for candidate in variants if is_known(candidate))
+        if known:
+            # Doubled consonants can be lexical; a doubled vowel is not
+            # evidence for a governed pronoun in an isolated reaction.
+            consonant = any(
+                m.group(1) not in "аеёиоуыэюяaeiou" for m in _ELONGATED_RUN_RE.finditer(word)
+            )
+            return (max if consonant else min)(known, key=len)
+    return min(variants, key=len)
+
+
+def elongation_variants(word: str) -> tuple[str, ...]:
+    """Keep both reductions available to contextual morphology."""
     runs = tuple(_ELONGATED_RUN_RE.finditer(word))
     if not runs:
-        return word
+        return (word,)
     variants = [""]
     cursor = 0
     for match in runs:
         prefix = word[cursor : match.start()]
         character = match.group(1)
         variants = [
-            f"{variant}{prefix}{character * width}"
-            for variant in variants
-            for width in (1, 2)
+            f"{variant}{prefix}{character * width}" for variant in variants for width in (1, 2)
         ]
         cursor = match.end()
     variants = [f"{variant}{word[cursor:]}" for variant in variants]
-    if is_known is not None:
-        known = tuple(candidate for candidate in variants if is_known(candidate))
-        if known:
-            # Preserve a legitimate Russian double consonant when both the
-            # one- and two-letter reductions happen to exist in a dictionary.
-            return max(known, key=len)
-    return min(variants, key=len)
+    return tuple(variants)
+
+
+@lru_cache(maxsize=16384)
+def normalize_word(word: str) -> str:
+    return word.casefold().replace("’", "'").strip("-' ")
+
+
+def is_word_form(word: str) -> bool:
+    return bool(word and _WORD_RE.fullmatch(word))
+
+
+def words_from_text(text: str) -> tuple[str, ...]:
+    return tuple(word for token in tokenize(text) if is_word_form(word := normalize_word(token)))

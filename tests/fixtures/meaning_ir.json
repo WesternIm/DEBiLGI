@@ -1,0 +1,1286 @@
+[
+  {
+    "text": "Я читаю газету.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "direct_object": [
+            "газета"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Газету читаю я.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "direct_object": [
+            "газета"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Ты изучаешь карту.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ],
+          "direct_object": [
+            "карта"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Карту изучаешь ты.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ],
+          "direct_object": [
+            "карта"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Марина нашла билет.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "марина"
+          ],
+          "direct_object": [
+            "билет"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Билет нашла Марина.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "марина"
+          ],
+          "direct_object": [
+            "билет"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Пётр чинит велосипед.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "пётр"
+          ],
+          "direct_object": [
+            "велосипед"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Велосипед чинит Пётр.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "пётр"
+          ],
+          "direct_object": [
+            "велосипед"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Мы обсуждали выставку.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "мы"
+          ],
+          "direct_object": [
+            "выставка"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Вы обсуждали поездку.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "вы"
+          ],
+          "direct_object": [
+            "поездка"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Я куплю словарь.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "direct_object": [
+            "словарь"
+          ]
+        },
+        "tense": "future",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Ты напишешь письмо.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ],
+          "direct_object": [
+            "письмо"
+          ]
+        },
+        "tense": "future",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Андрей потерял зонт.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "андрей"
+          ],
+          "direct_object": [
+            "зонт"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Зонт потерял Андрей.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "андрей"
+          ],
+          "direct_object": [
+            "зонт"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Я работал весь день.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "duration": [
+            "день"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Весь день я работал.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "duration": [
+            "день"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Ты отдыхал целый месяц.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ],
+          "duration": [
+            "месяц"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Целый месяц отдыхал ты.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ],
+          "duration": [
+            "месяц"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Я гуляю два часа.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "duration": [
+            "час"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Два часа я гуляю.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "duration": [
+            "час"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Она ждала три минуты.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "она"
+          ],
+          "duration": [
+            "минута"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Три минуты она ждала.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "она"
+          ],
+          "duration": [
+            "минута"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Мы учились целый год.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "мы"
+          ],
+          "duration": [
+            "год"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Вы тренировались всю неделю.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "вы"
+          ],
+          "duration": [
+            "неделя"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Мне нравится лепить.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "experiencer": [
+            "я"
+          ],
+          "action_complement": [
+            "лепить"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Тебе нравится плавать.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "experiencer": [
+            "ты"
+          ],
+          "action_complement": [
+            "плавать"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Нам нравится танцевать.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "experiencer": [
+            "мы"
+          ],
+          "action_complement": [
+            "танцевать"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Рисовать нравится мне.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "experiencer": [
+            "я"
+          ],
+          "action_complement": [
+            "рисовать"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Мне нравится музыка.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "experiencer": [
+            "я"
+          ],
+          "subject": [
+            "музыка"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Музыка нравится тебе.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "experiencer": [
+            "ты"
+          ],
+          "subject": [
+            "музыка"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Марине нравится театр.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "experiencer": [
+            "марина"
+          ],
+          "subject": [
+            "театр"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Театр нравится Андрею.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "experiencer": [
+            "андрей"
+          ],
+          "subject": [
+            "театр"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Небо синее.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "небо"
+          ],
+          "predicate_complement": [
+            "синий"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "nominal_statement"
+      }
+    ]
+  },
+  {
+    "text": "Море спокойное.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "море"
+          ],
+          "predicate_complement": [
+            "спокойный"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "nominal_statement"
+      }
+    ]
+  },
+  {
+    "text": "Маша голодна.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "маша"
+          ],
+          "predicate_complement": [
+            "голодный"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "nominal_statement"
+      }
+    ]
+  },
+  {
+    "text": "Ты врач.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ],
+          "predicate_complement": [
+            "врач"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "nominal_statement"
+      }
+    ]
+  },
+  {
+    "text": "Как дела?",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "дело"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "question"
+      }
+    ],
+    "construction": "state_inquiry"
+  },
+  {
+    "text": "Как здоровье?",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "здоровье"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "question"
+      }
+    ],
+    "construction": "state_inquiry"
+  },
+  {
+    "text": "Как настроение?",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "настроение"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "question"
+      }
+    ],
+    "construction": "state_inquiry"
+  },
+  {
+    "text": "Ты кто?",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "question"
+      }
+    ],
+    "construction": "nominal_inquiry"
+  },
+  {
+    "text": "Кто ты?",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "question"
+      }
+    ],
+    "construction": "nominal_inquiry"
+  },
+  {
+    "text": "Вы кто?",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "вы"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "question"
+      }
+    ],
+    "construction": "nominal_inquiry"
+  },
+  {
+    "text": "Объясни, почему небо голубое.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "predicate": [
+            "объяснить"
+          ]
+        },
+        "kind": "command",
+        "tense": null,
+        "negated": false
+      },
+      {
+        "roles": {
+          "subject": [
+            "небо"
+          ],
+          "predicate_complement": [
+            "голубой"
+          ]
+        },
+        "kind": "question",
+        "tense": "present",
+        "negated": false
+      }
+    ],
+    "link": "ccomp:interrogative"
+  },
+  {
+    "text": "Расскажи, почему море солёное.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "predicate": [
+            "рассказать"
+          ]
+        },
+        "kind": "command",
+        "tense": null,
+        "negated": false
+      },
+      {
+        "roles": {
+          "subject": [
+            "море"
+          ],
+          "predicate_complement": [
+            "солёный"
+          ]
+        },
+        "kind": "question",
+        "tense": "present",
+        "negated": false
+      }
+    ],
+    "link": "ccomp:interrogative"
+  },
+  {
+    "text": "Скажи, почему стекло прозрачное.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "predicate": [
+            "сказать"
+          ]
+        },
+        "kind": "command",
+        "tense": null,
+        "negated": false
+      },
+      {
+        "roles": {
+          "subject": [
+            "стекло"
+          ],
+          "predicate_complement": [
+            "прозрачный"
+          ]
+        },
+        "kind": "question",
+        "tense": "present",
+        "negated": false
+      }
+    ],
+    "link": "ccomp:interrogative"
+  },
+  {
+    "text": "Я спрашиваю, любишь ли ты музыку?",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "predicate": [
+            "спрашивать"
+          ]
+        },
+        "kind": "statement",
+        "tense": "present",
+        "negated": false
+      },
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ],
+          "direct_object": [
+            "музыка"
+          ]
+        },
+        "kind": "question",
+        "tense": "present",
+        "negated": false
+      }
+    ],
+    "link": "ccomp:interrogative"
+  },
+  {
+    "text": "Я спрашиваю, читаешь ли ты газету?",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "predicate": [
+            "спрашивать"
+          ]
+        },
+        "kind": "statement",
+        "tense": "present",
+        "negated": false
+      },
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ],
+          "direct_object": [
+            "газета"
+          ]
+        },
+        "kind": "question",
+        "tense": "present",
+        "negated": false
+      }
+    ],
+    "link": "ccomp:interrogative"
+  },
+  {
+    "text": "Я спрашиваю, не читаешь ли ты журнал?",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "predicate": [
+            "спрашивать"
+          ]
+        },
+        "kind": "statement",
+        "tense": "present",
+        "negated": false
+      },
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ],
+          "direct_object": [
+            "журнал"
+          ]
+        },
+        "kind": "question",
+        "tense": "present",
+        "negated": true
+      }
+    ],
+    "link": "ccomp:interrogative"
+  },
+  {
+    "text": "Нет, я читаю журнал.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "direct_object": [
+            "журнал"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ],
+    "correction": true
+  },
+  {
+    "text": "Нет, я изучаю карту.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "direct_object": [
+            "карта"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ],
+    "correction": true
+  },
+  {
+    "text": "Нет, я купил словарь.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "direct_object": [
+            "словарь"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ],
+    "correction": true
+  },
+  {
+    "text": "Я не читаю газету.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ]
+        },
+        "tense": "present",
+        "negated": true,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Газету я не читаю.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ]
+        },
+        "tense": "present",
+        "negated": true,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Ты не изучаешь карту.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ]
+        },
+        "tense": "present",
+        "negated": true,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Маша не голодна.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "маша"
+          ]
+        },
+        "tense": "present",
+        "negated": true,
+        "kind": "nominal_statement"
+      }
+    ]
+  },
+  {
+    "text": "Маша голодна.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "маша"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "nominal_statement"
+      }
+    ]
+  },
+  {
+    "text": "Я не хочу читать.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ]
+        },
+        "tense": "present",
+        "negated": true,
+        "kind": "statement"
+      }
+    ],
+    "operator": "хотеть"
+  },
+  {
+    "text": "Я хочу не читать.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ],
+    "operator": "хотеть"
+  },
+  {
+    "text": "Ты не можешь рисовать.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ]
+        },
+        "tense": "present",
+        "negated": true,
+        "kind": "statement"
+      }
+    ],
+    "operator": "мочь"
+  },
+  {
+    "text": "Ты можешь не рисовать.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "ты"
+          ]
+        },
+        "tense": "present",
+        "negated": false,
+        "kind": "statement"
+      }
+    ],
+    "operator": "мочь"
+  },
+  {
+    "text": "Я читаю ты рисуешь.",
+    "supported": false,
+    "reason": "multiple_unlinked_predicates"
+  },
+  {
+    "text": "Я, возможно, читаю газету.",
+    "supported": false,
+    "reason": "epistemic_scope"
+  },
+  {
+    "text": "Марина якобы нашла билет.",
+    "supported": false,
+    "reason": "epistemic_scope"
+  },
+  {
+    "text": "«Я читаю книгу».",
+    "supported": false,
+    "reason": "quoted_scope"
+  },
+  {
+    "text": "Фиолетовый рядом.",
+    "supported": false,
+    "reason": "fragment"
+  },
+  {
+    "text": "Я работал час.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "duration": [
+            "час"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Час работал я.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "duration": [
+            "час"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Я гулял неделю.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "duration": [
+            "неделя"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  },
+  {
+    "text": "Неделю я гулял.",
+    "supported": true,
+    "clauses": [
+      {
+        "roles": {
+          "subject": [
+            "я"
+          ],
+          "duration": [
+            "неделя"
+          ]
+        },
+        "tense": "past",
+        "negated": false,
+        "kind": "statement"
+      }
+    ]
+  }
+]

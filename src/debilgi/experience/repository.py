@@ -18,15 +18,11 @@ class ExperienceStats:
     resolved: int
     expired: int
     average_reward: float | None
-    learned_transitions: int
 
 
 class ExperienceRepository:
-    def __init__(self, database: Database, *, learning_rate: float = 0.35) -> None:
-        if not 0.0 < learning_rate <= 1.0:
-            raise ValueError("learning_rate must be between 0 and 1")
+    def __init__(self, database: Database) -> None:
         self._database = database
-        self._learning_rate = learning_rate
 
     async def register(
         self,
@@ -140,36 +136,8 @@ class ExperienceRepository:
             )
             if cursor.rowcount != 1:
                 return False
-            adjustment = reward * self._learning_rate
             positive = int(reward > 0.0)
             negative = int(reward < 0.0)
-            for context, next_token in self._transitions(experience.response_tokens):
-                await connection.execute(
-                    """
-                    INSERT INTO language_experience_transitions (
-                        guild_id, context_json, next_token, weight, uses,
-                        positive_outcomes, negative_outcomes, updated_at
-                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-                    ON CONFLICT (guild_id, context_json, next_token) DO UPDATE SET
-                        weight = MAX(-4.0, MIN(4.0,
-                            language_experience_transitions.weight + excluded.weight)),
-                        uses = language_experience_transitions.uses + 1,
-                        positive_outcomes = language_experience_transitions.positive_outcomes
-                            + excluded.positive_outcomes,
-                        negative_outcomes = language_experience_transitions.negative_outcomes
-                            + excluded.negative_outcomes,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        experience.guild_id,
-                        _json(context),
-                        next_token,
-                        adjustment,
-                        positive,
-                        negative,
-                        resolved_at.isoformat(),
-                    ),
-                )
             await connection.execute(
                 """
                 INSERT INTO cognition_self_models (
@@ -213,8 +181,13 @@ class ExperienceRepository:
         row = await self._database.fetchone(
             "SELECT * FROM cognition_self_models WHERE guild_id = ?", (guild_id,)
         )
+        claims = await self._database.fetchall(
+            """SELECT c.claim_id FROM meaning_claims c JOIN agent_activities a
+               ON a.claim_id = c.claim_id WHERE c.guild_id = ? ORDER BY c.claim_id""", (guild_id,),
+        )
+        claim_ids = tuple(c["claim_id"] for c in claims)
         if row is None:
-            return SelfModel(guild_id, 0, 0, 0, 0.0, 0, 0, 0.5, None)
+            return SelfModel(guild_id, 0, 0, 0, 0.0, 0, 0, 0.5, None, claim_ids)
         return SelfModel(
             guild_id=guild_id,
             utterances_observed=int(row["utterances_observed"]),
@@ -225,27 +198,9 @@ class ExperienceRepository:
             initiative_successes=int(row["initiative_successes"]),
             efficacy=float(row["efficacy"]),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            claim_ids=claim_ids,
         )
 
-    async def transition_adjustments(
-        self, guild_id: int, limit: int = 1000
-    ) -> tuple[tuple[tuple[str, ...], float], ...]:
-        rows = await self._database.fetchall(
-            """
-            SELECT context_json, next_token, weight
-            FROM language_experience_transitions
-            WHERE guild_id = ? AND weight != 0.0
-            ORDER BY ABS(weight) DESC, updated_at DESC LIMIT ?
-            """,
-            (guild_id, max(1, min(limit, 5000))),
-        )
-        return tuple(
-            (
-                (*tuple(json.loads(str(row["context_json"]))), str(row["next_token"])),
-                float(row["weight"]),
-            )
-            for row in rows
-        )
 
     async def stats(self, guild_id: int) -> ExperienceStats:
         row = await self._database.fetchone(
@@ -259,10 +214,6 @@ class ExperienceRepository:
             """,
             (guild_id,),
         )
-        transition_row = await self._database.fetchone(
-            "SELECT COUNT(*) AS count FROM language_experience_transitions WHERE guild_id = ?",
-            (guild_id,),
-        )
         return ExperienceStats(
             pending=int(row["pending"] or 0) if row else 0,
             resolved=int(row["resolved"] or 0) if row else 0,
@@ -272,7 +223,6 @@ class ExperienceRepository:
                 if row is not None and row["average_reward"] is not None
                 else None
             ),
-            learned_transitions=int(transition_row["count"] or 0) if transition_row else 0,
         )
 
     async def unreflected(self, limit: int = 500) -> tuple[UtteranceExperience, ...]:
@@ -291,13 +241,6 @@ class ExperienceRepository:
         )
         return tuple(self._from_row(row) for row in rows)
 
-    @staticmethod
-    def _transitions(tokens: tuple[str, ...]) -> tuple[tuple[tuple[str, ...], str], ...]:
-        result: list[tuple[tuple[str, ...], str]] = []
-        for position in range(1, len(tokens)):
-            for size in range(1, min(3, position) + 1):
-                result.append((tokens[position - size : position], tokens[position]))
-        return tuple(result)
 
     @staticmethod
     def _from_row(row: Any) -> UtteranceExperience:

@@ -12,7 +12,7 @@ from debilgi.cognition.models import ActionType
 from debilgi.config import Settings
 from debilgi.language.archive_repository import ArchiveRepository
 from debilgi.language.discourse import DiscourseMemoryRepository
-from debilgi.language.memory_based import MemoryPhraseGenerator
+from debilgi.language.grounded_generator import GroundedConstructionGenerator
 from debilgi.language.models import ArchivedMessage
 from debilgi.language.planning import ReplyContext, StructuredThought, UtterancePlan
 from debilgi.language.semantics import SemanticMemoryRepository
@@ -238,7 +238,6 @@ async def _generate(
     context = ReplyContext(
         prompt=prompt,
         memory_messages=await repository.recent_texts(guild_id, CHANNEL_ID, 120),
-        memory_ngrams=await repository.common_ngrams(guild_id),
         reply_heads=await repository.matching_reply_heads(guild_id, tokens),
         knowledge_facts=await semantic.context(guild_id, tokens),
         seed=f"foundation-probe:{index}",
@@ -249,8 +248,7 @@ async def _generate(
         thought=StructuredThought(ActionType.SHORT_REPLY, None, "recall", 0.8, ()),
         context=context,
     )
-    return MemoryPhraseGenerator(
-        max_output_tokens=settings.language_max_output_tokens,
+    return GroundedConstructionGenerator(
         max_output_chars=settings.language_max_output_chars,
     ).generate(plan)
 

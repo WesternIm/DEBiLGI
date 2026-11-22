@@ -18,9 +18,9 @@ from typing import Any
 import aiohttp
 
 from debilgi.events.models import Event, EventType
-from debilgi.language.character_markov import normalize_word, words_from_text
 from debilgi.language.lexical_matching import fuzzy_match_allowed
 from debilgi.language.lexicon import LexiconService
+from debilgi.language.tokenizer import normalize_word, words_from_text
 from debilgi.storage.database import Database
 
 logger = logging.getLogger(__name__)

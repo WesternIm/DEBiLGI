@@ -1,5 +1,34 @@
+import pytest
+
 from debilgi.language.surface_coherence import evaluate_surface
 from debilgi.language.surface_policy import internal_surface_reason
+
+
+@pytest.mark.parametrize(("text", "reason"), [
+    ("Я любишь собак.", "subject_verb_person_mismatch"),
+    ("Мы любит собак.", "subject_verb_number_mismatch"),
+    ("Ты бы тоже любишь.", "conditional_requires_past_or_infinitive"),
+    ("Я думаю о собаку.", "preposition_case_mismatch"),
+])
+def test_morphological_violations_are_arbitration_rejections(text, reason):
+    from debilgi.language.arbitration import ResponseArbitrator, ResponseCandidate
+
+    assert reason in evaluate_surface(text).hard_issues
+    candidate = ResponseCandidate.create(
+        event_id="test", source="learned_distribution", renderer="test", text=text,
+        speech_act="brief_statement", source_confidence=1,
+        metadata={"allow_rough_surface": True, "locally_composed": True},
+    )
+    assert f"surface:{reason}" in ResponseArbitrator._hard_rejections(candidate)
+
+
+@pytest.mark.parametrize("text", [
+    "Я люблю собак.", "Ты бы любил собак.", "Мне бы поспать.",
+    "Я знаю, что ты любишь собак.", "Коты и собаки бегают.", "Привет!",
+    "О ком ты говоришь?", "Я думаю о собаке.",
+])
+def test_clause_local_agreement_accepts_valid_forms(text):
+    assert not evaluate_surface(text).hard_issues
 
 
 def test_document_bullet_is_not_a_conversational_surface():
@@ -87,3 +116,9 @@ def test_position_reason_is_not_mistaken_for_internal_evidence_bookkeeping() -> 
 def test_genitive_object_is_licensed_by_negation_only() -> None:
     assert "governed_case_mismatch" not in evaluate_surface("Я не имею желудка.").hard_issues
     assert "governed_case_mismatch" in evaluate_surface("Я имею желудка.").hard_issues
+
+
+def test_expressive_parenthesis_before_a_closing_quote_is_not_unbalanced():
+    assert "unbalanced_delimiters" not in evaluate_surface("Я сказал «дадно!)».").hard_issues
+    assert "unbalanced_delimiters" in evaluate_surface("Я (не знаю.").hard_issues
+    assert "unbalanced_delimiters" in evaluate_surface("Я сказал «привет.").hard_issues

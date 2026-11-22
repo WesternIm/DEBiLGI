@@ -258,3 +258,61 @@ def test_explicit_wh_focus_cannot_be_demoted_by_a_learned_order() -> None:
 
     assert len(surfaces) == 1
     assert surfaces[0].text.casefold() == "что ты думаешь о марсе?"
+
+
+def _conditional(subject: str, verb: str, *, negated=False, tail=(), modal=None):
+    feats = (("mood", "conditional"),)
+    lex = ConceptLexeme(verb, verb, "verb", feats)
+    deps = [SemanticDependency("subject", ConceptArgument(
+        ConceptLexeme(subject, subject, "pronoun")))]
+    deps.extend(tail)
+    return ClauseThought(predicate=lex, dependencies=tuple(deps), negated=negated,
+                         confidence=0.6)
+
+
+def test_conditional_mood_is_past_form_plus_particle() -> None:
+    for subject, verb, expected in (
+        ("я", "полететь", "Я полетел бы."),
+        ("мы", "полететь", "Мы полетели бы."),
+        ("ты", "полететь", "Ты полетел бы."),
+    ):
+        text = realize_thought(_conditional(subject, verb), limit=1)[0].text
+        assert text == expected
+
+
+def test_conditional_mood_negation_and_object_order() -> None:
+    thought = _conditional("я", "полететь", negated=True)
+    assert realize_thought(thought, limit=1)[0].text == "Я не полетел бы."
+    with_object = _conditional("я", "открыть", tail=(SemanticDependency(
+        "direct_object", ConceptArgument(ConceptLexeme("дверь", "дверь", "noun"))),))
+    assert realize_thought(with_object, limit=1)[0].text == "Я открыл бы дверь."
+
+
+def test_conditional_mood_agrees_with_subject_gender_and_reads_back() -> None:
+    from debilgi.language.semantic_graph import conditional_proposition
+
+    feminine = ConceptLexeme("она", "она", "pronoun", (("gender", "feminine"),
+                                                      ("number", "singular")))
+    thought = ClauseThought(
+        predicate=ConceptLexeme("полететь", "полететь", "verb", (("mood", "conditional"),)),
+        dependencies=(SemanticDependency("subject", ConceptArgument(feminine)),),
+        confidence=0.6)
+    text = realize_thought(thought, limit=1)[0].text
+    assert text == "Она полетела бы."
+    # The reverse reader finds the particle among the consequent's operators.
+    own = text.rstrip(".").lower()
+    read = conditional_proposition(f"Если она хотела, то {own}")
+    assert read is not None and read.irrealis
+    assert conditional_proposition("Если она хотела, то она полетела").irrealis is False
+
+
+def test_conditional_modal_keeps_infinitive_after_particle() -> None:
+    thought = ClauseThought(
+        predicate=ConceptLexeme("хотеть", "хотеть", "verb", (("mood", "conditional"),)),
+        dependencies=(
+            SemanticDependency("subject", ConceptArgument(ConceptLexeme("я", "я", "pronoun"))),
+            SemanticDependency("action_complement", ConceptArgument(
+                ConceptLexeme("полететь", "полететь", "verb"))),
+        ),
+        predicate_class="modal", confidence=0.6)
+    assert realize_thought(thought, limit=1)[0].text == "Я хотел бы полететь."

@@ -1,6 +1,5 @@
 import pytest
 
-from debilgi.discord.replies import _previous_answer_grounding
 from debilgi.language.arbitration import ArbitrationProfile, ResponseArbitrator, ResponseCandidate
 from debilgi.language.grounded_repair import prior_claim_review_thought
 from debilgi.language.productive_nlg import realize_thought
@@ -40,15 +39,14 @@ def test_explanation_requires_evidence_or_an_explicit_knowledge_gap():
     assert requirement_rejection(prompt, {"unresolved_requirement": "explain_reason"}) is None
 
 
-@pytest.mark.parametrize("text", ["Я считаю себя хищником.", "Я не считаю себя хищником."])
-def test_own_utterance_is_a_claim_not_verified_truth(text):
-    facts = dict(_previous_answer_grounding((f"agent: {text}",)))
-    assert "truth=" not in facts["previous_answer.statement"]
-    assert "epistemic_status=unverified_claim" in facts["previous_answer.statement"]
+def test_a_free_mode_label_alone_does_not_bypass_the_reason_requirement():
+    assert requirement_rejection("Почему дерево упало?", {
+        "response_decision": {"mode": "free_form"}, "reaction_meaning": "express_limit",
+    }, text="не знаю") == "reason_required_not_polarity_or_word_meaning"
 
 
-def test_own_question_cannot_become_an_asserted_fact():
-    assert _previous_answer_grounding(("agent: Ты считаешь себя хищником?",)) == ()
+
+
 
 
 @pytest.mark.parametrize("history", [

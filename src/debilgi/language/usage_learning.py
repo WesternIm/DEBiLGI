@@ -9,11 +9,10 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from debilgi.dataset.self_dataset import SelfDatasetRepository
-from debilgi.language.character_markov import normalize_word
 from debilgi.language.content import content_lemmas
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
 from debilgi.language.semantics import extract_semantic_frames
-from debilgi.language.tokenizer import tokenize
+from debilgi.language.tokenizer import normalize_word, tokenize
 from debilgi.storage.database import Database
 
 

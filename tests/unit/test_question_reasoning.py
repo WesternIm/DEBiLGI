@@ -1,4 +1,3 @@
-from debilgi.discord.replies import SafeMentionReplyService
 from debilgi.language.lexicon import ConfidenceProfile, WordAnalysis
 from debilgi.language.question_reasoning import (
     analyze_semantic_question,
@@ -33,12 +32,9 @@ def test_complete_comparison_reports_knowledge_gap_not_missing_question() -> Non
 
     assert frame is not None
     result = reason_from_internal_knowledge(frame, ())
-    fallback = SafeMentionReplyService._fallback_for_plan(None, (), prompt=prompt)
 
     assert result.needs_study is True
     assert result.text == ""
-    assert "доизуч" not in fallback
-    assert "не хватает самого действия или вопроса" not in fallback
 
 
 def test_selects_alternative_from_internalized_meaning_links() -> None:

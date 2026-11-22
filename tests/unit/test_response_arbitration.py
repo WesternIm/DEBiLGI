@@ -59,6 +59,50 @@ def grounded_answer(text="Лиса взяла ключ."):
     )
 
 
+@pytest.mark.parametrize("source", [
+    "semantic_reasoning", "proposition_memory", "learned_distribution",
+    "learned_dialogue_structure", "interlocutor_clarification", "discord_identity",
+    "affective_stance", "new_independent_producer",
+])
+def test_all_candidates_have_provenance_without_changing_reference_arbitration(source):
+    from types import MappingProxyType
+
+    reference = grounded_answer()
+    alternative = candidate("А какие собаки?", source=source, metadata={
+        "corpus_source_event_ids": ("human:dogs",),
+    })
+    before = decide(reference, alternative)
+    for item in (reference, alternative):
+        diagnostic = item.metadata["diagnostic"]
+        assert diagnostic["content_source"] and diagnostic["origin"]
+        assert diagnostic["plan_id"] and diagnostic["meaning_id"]
+        assert diagnostic["plan_basis"] == "surface_only"
+        # Reconstruct metadata before stage 0 without rebuilding candidate IDs,
+        # content proposals, evidence or any scoring inputs.
+        object.__setattr__(item, "metadata", MappingProxyType({
+            key: value for key, value in item.metadata.items() if key != "diagnostic"
+        }))
+    after = decide(reference, alternative)
+    assert before.winner == after.winner
+    assert before.selection_reason == after.selection_reason
+    assert [(s.total, s.features, s.eligible, s.rejection_reasons) for s in before.scores] == [
+        (s.total, s.features, s.eligible, s.rejection_reasons) for s in after.scores
+    ]
+
+
+def test_semantic_plan_ids_survive_surface_variants():
+    first = candidate("Ты читаешь книгу.", source="semantic_reasoning", metadata={
+        "intention_plan_key": "existing-semantic-key", "meaning_intention_id": "intent:one",
+    })
+    second = candidate("Книгу ты читаешь.", source="semantic_reasoning", metadata={
+        "intention_plan_key": "existing-semantic-key", "meaning_intention_id": "intent:two",
+    })
+    assert first.candidate_id != second.candidate_id
+    assert first.metadata["diagnostic"]["plan_id"] == second.metadata["diagnostic"]["plan_id"]
+    assert first.metadata["diagnostic"]["meaning_id"] == second.metadata["diagnostic"]["meaning_id"]
+    assert first.metadata["diagnostic"]["plan_basis"] == "semantic_plan"
+
+
 def composed_question(prompt, predicate):
     composer = ResponseComposer(analyze_structured_utterance(prompt))
     thought = ClauseThought(
@@ -475,3 +519,49 @@ def test_recovery_merge_keeps_content_for_every_persisted_surface() -> None:
     assert merged.used_fallback
     assert len(merged.scores) == 2
     assert referenced_proposals <= persisted_proposals
+
+
+def test_recent_reply_penalty_is_separate_from_reusing_words_inside_phrase():
+    from debilgi.language.arbitration import extract_features
+
+    item = candidate("Да да!", source="semantic_reasoning")
+    fresh = extract_features(item, prompt="согласен?", focus_concepts=(), recent_replies=())
+    repeated = extract_features(item, prompt="согласен?", focus_concepts=(),
+                                recent_replies=("да да.",))
+    assert fresh.intra_phrase_repetition > 0 and fresh.repetition_penalty == 0
+    assert repeated.repetition_penalty == 1
+    assert repeated.intra_phrase_repetition == fresh.intra_phrase_repetition
+
+
+def test_neutral_subject_order_beats_marked_final_personal_subject():
+    neutral = candidate("Я сказал «Привет».", source="semantic_reasoning", metadata={
+        "role_order": ("subject", "predicate", "direct_object"),
+        "choice_context": {"enabled": True, "personality": {"patience": .5}},
+    })
+    marked = candidate("Сказал «Привет» я.", source="semantic_reasoning", metadata={
+        "role_order": ("predicate", "direct_object", "subject"),
+        "choice_context": {"enabled": True, "personality": {"patience": .5}},
+    })
+    decision = decide(marked, neutral)
+    assert decision.winner.text == neutral.text
+    assert decision.winner.metadata["surface_choice"]["considered"] == 2
+
+
+def test_receipt_recency_distinguishes_two_previously_used_surfaces():
+    from debilgi.language.dialogue_learning import response_repetition
+
+    recent = ("Я не знаю ответа.", "Я не знаю ответа на этот вопрос.")
+    assert response_repetition(recent[0], recent) > response_repetition(recent[1], recent)
+    assert response_repetition("Я знаю ответ.", recent) == 0
+
+
+def test_hedge_operator_calibrates_affirmed_and_negated_guesses_alike():
+    plan = {"hypothesis": [["kind", "experience_opinion"], ["operator", "наверное"]]}
+
+    def calibration(text):
+        item = candidate(text, source="semantic_reasoning", confidence=0.5,
+                         metadata={"message_plan": plan})
+        return extract_features(item, prompt="так ты рад?", focus_concepts=(),
+                                recent_replies=()).uncertainty_calibration
+
+    assert calibration("Наверное, я рад.") == calibration("Наверное, я не рад.") == 1.0

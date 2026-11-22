@@ -17,6 +17,9 @@ from debilgi.language.productive_nlg import (
 )
 from debilgi.language.request_focus import polarity_of
 from debilgi.language.structured_utterance import (
+    PARSER_VERSION,
+    SemanticScope,
+    SemanticTime,
     TokenInterpretation,
     analyze_structured_utterance,
 )
@@ -58,6 +61,7 @@ def thought_from_data(data: dict) -> ClauseThought:
             value["part_of_speech"],
             tuple(tuple(pair) for pair in value["features"]),
             value["entity_kind"],
+            value.get("participant_ref"),
         )
 
     dependencies = tuple(
@@ -70,9 +74,13 @@ def thought_from_data(data: dict) -> ClauseThought:
                 item["argument"]["grammatical_case"],
                 tuple(lexeme(modifier) for modifier in item["argument"]["postmodifiers"]),
             ),
+            item.get("head"),
         )
         for item in data["dependencies"]
     )
+    time = dict(data.get("semantic_time", {}))
+    if "duration_indices" in time:
+        time["duration_indices"] = tuple(time["duration_indices"])
     return ClauseThought(
         lexeme(data["predicate"]),
         dependencies,
@@ -83,6 +91,13 @@ def thought_from_data(data: dict) -> ClauseThought:
         confidence=data["confidence"],
         evidence=tuple(data["evidence"]),
         predicate_class=data["predicate_class"],
+        semantic_time=SemanticTime(**time),
+        scopes=tuple(
+            SemanticScope(s["operator"], s["token_index"], tuple(s["target_indices"]))
+            for s in data.get("scopes", ())
+        ),
+        parser_version=data.get("parser_version", PARSER_VERSION),
+        source_event_id=data.get("source_event_id"),
     )
 
 
@@ -167,11 +182,14 @@ def question_obligation(text: str) -> QuestionObligation | None:
             person.lemma,
             person.lemma,
             "pronoun",
-            (("case", "nominative"), *tuple(
-                feature
-                for feature in person.grammatical_features
-                if feature[0] in {"number", "person"}
-            )),
+            (
+                ("case", "nominative"),
+                *tuple(
+                    feature
+                    for feature in person.grammatical_features
+                    if feature[0] in {"number", "person"}
+                ),
+            ),
         )
         thought = ClauseThought(
             ConceptLexeme(
@@ -369,9 +387,7 @@ def resolve_dialogue_exchange(prompt: str, context: tuple[str, ...]) -> Dialogue
             }[obligation.expected_role],
         )
     bound_role = (
-        "predicate_complement"
-        if obligation.expected_role == "name"
-        else obligation.expected_role
+        "predicate_complement" if obligation.expected_role == "name" else obligation.expected_role
     )
     additions = [SemanticDependency(bound_role, argument)]
     if obligation.expected_role not in {"location", "cause"}:

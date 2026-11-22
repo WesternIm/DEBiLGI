@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from debilgi.language.grammar import role
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
+from debilgi.language.pragmatics import analyze_pragmatics
 from debilgi.language.tokenizer import tokenize
 from debilgi.language.valency import assess_predicate_valency, governed_object_case
 
@@ -40,7 +41,7 @@ class SurfaceCoherence:
         return not self.hard_issues and self.score >= 0.72
 
 
-def evaluate_surface(text: str) -> SurfaceCoherence:
+def evaluate_surface(text: str, *, dialogue_act: bool = False) -> SurfaceCoherence:
     """Measure readable sentence structure independently of source and topic."""
 
     stripped = text.strip()
@@ -61,7 +62,8 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
     lexical = tuple(token for token in tokens if token[:1].isalnum())
     if not lexical:
         issues.append("no_lexical_content")
-    if tokens and role(tokens[-1]) in {"preposition", "conjunction", "question"}:
+    if (tokens and role(tokens[-1]) in {"preposition", "conjunction", "question"}
+            and not dialogue_act):
         issues.append("unfinished_ending")
 
     connector_counts = Counter(
@@ -76,6 +78,7 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
     from debilgi.language.structured_utterance import analyze_structured_utterance
 
     structure = analyze_structured_utterance(stripped)
+    issues.extend(_morphological_issues(structure))
     for clause in structure.clauses:
         if clause.predicate_index is None:
             continue
@@ -264,14 +267,17 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
             or "question" in roles
             or (len(words) <= 3 and bool(set(roles) & _SAFE_SHORT_ROLES))
             or (len(words) <= 3 and "pronoun" in roles and "adverb" in roles)
+            or (len(words) <= 3 and "greeting" in analyze_pragmatics(sentence).functions)
         )
-        complete = finite_predicate or elliptical
+        complete = finite_predicate or elliptical or dialogue_act
         completeness.append(1.0 if complete else 0.45 if len(words) >= 3 else 0.15)
 
         first = words[0].casefold().replace("ё", "е")
         if first in _CONTINUATION_MARKERS and not finite_predicate:
             issues.append("dangling_continuation")
-        if len(words) == 1 and roles[0] in {"content", "adjective", "preposition"}:
+        if (len(words) == 1 and roles[0] in {"content", "adjective", "preposition"}
+                and not dialogue_act
+                and "greeting" not in analyze_pragmatics(sentence).functions):
             issues.append("nominal_fragment")
         if has_infinitive and not finite_predicate and first in _CONTINUATION_MARKERS:
             issues.append("infinitive_fragment")
@@ -298,8 +304,72 @@ def evaluate_surface(text: str) -> SurfaceCoherence:
 
 
 def _balanced_delimiters(text: str) -> bool:
+    # In chat a closing parenthesis can be an expressive mark. An actual
+    # opened parenthesis must still have its closing delimiter.
+    if "(" not in text:
+        text = re.sub(r"(?<=[\w!?])\)+(?=[\s»\"”.,!?…]|$)", "", text)
     pairs = (("(", ")"), ("[", "]"), ("{", "}"), ("«", "»"))
     return all(text.count(opening) == text.count(closing) for opening, closing in pairs)
+
+
+def _morphological_issues(structure) -> tuple[str, ...]:
+    """Check clause-local agreement, accepting genuinely ambiguous word forms.
+
+    A sentence-wide first-noun/first-verb comparison crosses clause boundaries.
+    Use the parser's subjects and the dictionary alternatives instead. Unknown
+    features are not evidence of a violation.
+    """
+    issues = []
+    for clause in structure.clauses:
+        for complement in clause.complements:
+            expected = DEFAULT_MORPHOLOGY.expected_cases(
+                structure.tokens[complement.preposition_index].surface
+            )
+            heads = [structure.tokens[i] for i in complement.object_indices
+                     if structure.tokens[i].part_of_speech in {"noun", "pronoun"}
+                     and i not in clause.subject_indices]
+            if not expected or not heads:
+                continue
+            alternatives = DEFAULT_MORPHOLOGY.parse_word(heads[-1].surface)
+            if (any(r.case for r in alternatives)
+                    and not any(r.case in expected for r in alternatives)):
+                issues.append("preposition_case_mismatch")
+        if clause.predicate_index is None:
+            continue
+        token = structure.tokens[clause.predicate_index]
+        verbs = tuple(
+            reading for reading in DEFAULT_MORPHOLOGY.parse_word(token.surface)
+            if reading.part_of_speech == "verb" and "INFN" not in reading.grammemes
+        )
+        if not verbs:
+            continue
+        words = {t.surface.casefold() for t in
+                 structure.tokens[clause.token_start:clause.token_end]}
+        if words & {"бы", "б"} and all(v.tense in {"present", "future"} for v in verbs):
+            issues.append("conditional_requires_past_or_infinitive")
+        if len(clause.subject_indices) != 1 or clause.coordinations:
+            continue
+        subject = structure.tokens[clause.subject_indices[0]]
+        subjects = tuple(
+            reading for reading in DEFAULT_MORPHOLOGY.parse_word(subject.surface)
+            if reading.case == "nominative" and reading.part_of_speech in {"noun", "pronoun"}
+        )
+        if not subjects:
+            continue
+        for feature in ("number", "person", "gender"):
+            def compatible(s, v, feature=feature):
+                if feature == "person" and v.tense == "past":
+                    return True
+                if feature == "gender" and (v.tense != "past" or v.number == "plural"):
+                    return True
+                left = getattr(s, feature)
+                if feature == "person" and s.part_of_speech == "noun":
+                    left = "third"
+                right = getattr(v, feature)
+                return left is None or right is None or left == right
+            if not any(compatible(s, v) for s in subjects for v in verbs):
+                issues.append(f"subject_verb_{feature}_mismatch")
+    return tuple(dict.fromkeys(issues))
 
 
 def _continues_prepositional_complement(structure, clause, token_index: int) -> bool:

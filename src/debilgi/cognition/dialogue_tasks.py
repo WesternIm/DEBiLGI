@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -98,6 +98,25 @@ def _normalized_words(text: str) -> tuple[str, ...]:
     )
 
 
+def _from_agent_side(words: tuple[str, ...]) -> tuple[str, ...]:
+    """The asker's words as the agent says them: person is a feature, the form is re-inflected."""
+    from debilgi.language.morphology import DEFAULT_MORPHOLOGY, deictic_counterpart
+
+    result = []
+    for word in words:
+        mapped = word
+        for reading in DEFAULT_MORPHOLOGY.parse_word(word):
+            other = deictic_counterpart(reading.lemma, inclusive_possessives=False)
+            if other:
+                features = {
+                    k: v for k, v in reading.features().items() if k in {"case", "number", "gender"}
+                }
+                mapped = (DEFAULT_MORPHOLOGY.inflect(other, **features) or other).casefold()
+                break
+        result.append(mapped.replace("ё", "е"))
+    return tuple(result)
+
+
 def _contains_sequence(words: tuple[str, ...], sequence: tuple[str, ...]) -> bool:
     if not sequence or len(sequence) > len(words):
         return False
@@ -115,7 +134,13 @@ def contact_response_binding(text: str) -> float:
     action; the check is semantic and does not prescribe a ready phrase.
     """
 
+    from debilgi.language.pragmatics import analyze_pragmatics
+
     structure = analyze_structured_utterance(text)
+    if ("greeting" in analyze_pragmatics(text).functions
+            and not any(c.predicate_index is not None or c.clause_kind in {"question", "command"}
+                        for c in structure.clauses)):
+        return 1.0
     clause = _main_clause(structure)
     if (
         clause is None
@@ -187,6 +212,8 @@ class TaskObjective:
     missing_slots: tuple[str, ...] = ()
     target_event_id: str | None = None
     required_response_act: str | None = None
+    request_text: str | None = None
+    response_options: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +500,35 @@ def infer_dialogue_task(
     )
 
 
+def _verified_content_question(metadata):
+    """A failed assertion may become a question only with the identical proof body."""
+    from debilgi.language.dialogue_obligations import thought_from_data
+
+    plan = metadata.get("message_plan") or {}
+    if not isinstance(plan, Mapping) or not metadata.get("reader_checked"):
+        return False
+    try:
+        kind = dict(plan.get("hypothesis") or ()).get("kind")
+    except (TypeError, ValueError):
+        return False
+    if kind != "verify_known_content" or not isinstance(plan.get("claim"), Mapping):
+        return False
+    claim = thought_from_data(plan["claim"])
+    if claim.clause_kind != "question" or not claim.evidence:
+        return False
+    for premise in metadata.get("premises", ()):
+        kind = (premise.get("kind") if isinstance(premise, Mapping)
+                else getattr(premise, "kind", None))
+        if kind not in {"canonical_claim", "sent_turn"}:
+            continue
+        known = (thought_from_data(premise["thought"]) if isinstance(premise, Mapping)
+                 else premise.thought)
+        if replace(claim, clause_kind=known.clause_kind, confidence=known.confidence,
+                   focus_role=known.focus_role) == known:
+            return True
+    return False
+
+
 def evaluate_task_progress(
     task: DialogueTask,
     text: str,
@@ -481,14 +537,49 @@ def evaluate_task_progress(
     """Measure the candidate against the task effect, never against phrase frequency."""
 
     metadata = metadata or {}
+    if _verified_content_question(metadata):
+        return TaskProgress(0.58, ("requests_verification_of_proved_content",))
+    from debilgi.language.dialogue_learning import ellipsis_variable, observed_reaction_binding
+
+    if observed_reaction_binding(str(metadata.get("focused_request", "")), text, metadata):
+        return TaskProgress(1.0, ("observed_reaction_fulfills_current_social_act",))
+    plan = metadata.get("message_plan") or {}
+    claim = plan.get("claim", {}) if isinstance(plan, Mapping) else {}
+    if (metadata.get("reader_checked") and metadata.get("genuine_clarification")
+            and claim.get("clause_kind") == "question" and claim.get("focus_role") == "topic"
+            and ellipsis_variable(str(metadata.get("focused_request", "")))
+            and any(getattr(p, "kind", None) == "human_question_grammar"
+                    or isinstance(p, Mapping) and p.get("kind") == "human_question_grammar"
+                    for p in metadata.get("premises", ()))):
+        return TaskProgress(0.65, ("requests_unbound_interrogative_argument",))
+    decision = metadata.get("response_decision") or {}
+    if (isinstance(decision, Mapping)
+            and metadata.get("reader_checked") and any(
+                getattr(p, "kind", None) == "sent_turn"
+                or isinstance(p, Mapping) and p.get("kind") == "sent_turn"
+                for p in metadata.get("premises", ()))):
+        return TaskProgress(1.0, ("explains_delivered_turn",))
     words = _normalized_words(text)
     lemmas = set(content_lemmas(text))
     objective = task.objective
     reasons: list[str] = []
+    if metadata.get("epistemic_status") == "fantasy" and metadata.get("reader_checked"):
+        from debilgi.language.request_focus import is_invention_request
+
+        # A request to make something up is answered by making something up (marked as such).
+        if is_invention_request(objective.request_text or objective.required_content or ""):
+            return TaskProgress(0.9, ("invention_offered",))
+        if metadata.get("fantasy_continuation"):
+            return TaskProgress(0.6, ("game_continued",))  # «почему?» asked of a game under way
 
     if task.goal == "perform_utterance":
         requested = _normalized_words(objective.required_content or "")
-        if requested and (words == requested or _contains_sequence(words, requested)):
+        spoken_by_agent = _from_agent_side(requested)
+        if requested and (
+            words == requested
+            or _contains_sequence(words, requested)
+            or _contains_sequence(words, spoken_by_agent)
+        ):
             return TaskProgress(1.0, ("requested_content_realized",))
         return TaskProgress(0.0, ("requested_content_absent",))
 
@@ -504,8 +595,17 @@ def evaluate_task_progress(
     genuine_clarification = bool(
         metadata.get("genuine_clarification")
         or metadata.get("unresolved_reference")
+        or metadata.get("curiosity_licensed")
         or metadata.get("response_move") in {"clarify_reference", "request_required_argument"}
     )
+    if (metadata.get("ambiguous_slot") and len(metadata.get("alternatives", ())) >= 2
+            and metadata.get("expected_information_gain", 0) > 0 and genuine_clarification):
+        return TaskProgress(0.96, ("specific_ambiguity_requests_discriminating_information",))
+    if (genuine_clarification and metadata.get("meaning_origin") == "interlocutor_repair"
+            and metadata.get("corpus_source_event_ids")
+            and metadata.get("focus_from_current_turn")
+            and metadata.get("clarification_budget") == 1):
+        return TaskProgress(0.62, ("learned_question_requests_intention_evidence",))
     if (
         objective.required_response_act in {"answer", "repair"}
         and candidate_is_question
@@ -514,6 +614,14 @@ def evaluate_task_progress(
         return TaskProgress(0.0, ("question_does_not_fulfill_response_obligation",))
     if candidate_is_command and objective.required_response_act != "perform":
         return TaskProgress(0.0, ("command_reverses_response_obligation",))
+    if (candidate_is_question and task.goal == "satisfy_directive"
+            and not genuine_clarification):
+        return TaskProgress(0.0, ("question_does_not_perform_requested_action",))
+    if (candidate_is_command and task.goal == "satisfy_directive"
+            and candidate_clause.predicate_index is not None
+            and candidate_structure.tokens[candidate_clause.predicate_index].lemma
+            == objective.predicate):
+        return TaskProgress(0.0, ("repeated_directive_does_not_perform_it",))
 
     focused_request = metadata.get("focused_request")
     focus = (
@@ -521,8 +629,20 @@ def evaluate_task_progress(
         if isinstance(focused_request, str)
         else set(objective.focus_terms)
     ) - _GENERIC_FOCUS - _QUESTION_WORDS
-    overlap = len(lemmas & focus) / len(focus) if focus else 0.0
-    predicate_fit = float(bool(objective.predicate and objective.predicate in lemmas))
+    from debilgi.language.lexical_matching import aspect_pair
+    from debilgi.language.morphology import deictic_counterpart
+
+    def _in_lemmas(term: str) -> bool:
+        # The agent answers from its own side: the asker's «мой»/«я» is its «твой»/«ты», and the
+        # same verb in the other aspect is the same action (morphology decides both).
+        return (
+            term in lemmas
+            or deictic_counterpart(term, inclusive_possessives=False) in lemmas
+            or any(aspect_pair(term, lemma) for lemma in lemmas)
+        )
+
+    overlap = sum(_in_lemmas(term) for term in focus) / len(focus) if focus else 0.0
+    predicate_fit = float(bool(objective.predicate and _in_lemmas(objective.predicate)))
     polar_question = bool(objective.question_word is None and objective.predicate)
     polar = float(polar_question and bool(set(words[:2]) & {"да", "нет"}))
     grounded = float(bool(metadata.get("premises") or metadata.get("reasoning_evidence")))
@@ -540,6 +660,16 @@ def evaluate_task_progress(
             metadata.get("corpus_source_event_ids")
             or metadata.get("uses_persistent_word_statistics")
         )
+        if (
+            learned_support
+            and metadata.get("learned_prompt_act") == "greeting"
+            and metadata.get("learned_response_act") == "greeting"
+            and not candidate_is_question
+        ):
+            from debilgi.language.pragmatics import analyze_pragmatics
+
+            if "greeting" in analyze_pragmatics(text).functions:
+                return TaskProgress(0.90, ("observed_reciprocal_social_act",))
         semantic_transform = bool(
             metadata.get("meaning_origin") == "affect_weighted_stance"
             and metadata.get("semantic_origin") == "current_turn_roles"
@@ -629,6 +759,34 @@ def evaluate_task_progress(
     if task.goal == "answer_question":
         score = overlap * 0.42 + predicate_fit * 0.20 + polar * 0.45
         score += grounded * 0.22 + answered_slot * 0.18
+        limit = metadata.get("epistemic_query")
+        if (limit is not None and getattr(limit, "query", None) is not None
+                and limit.query.exclude_event_id in {
+                    task.source_event_id, objective.target_event_id}
+                and metadata.get("communicative_status") == "express_limit"):
+            score = max(score, 0.96)
+            reasons.append("typed_knowledge_limit_for_current_query")
+        if (metadata.get("derivation") == "supposition" and grounded
+                and metadata.get("epistemic_status") != "fantasy"):
+            # A marked supposition on the agent's own record answers the open question.
+            score = max(score, 0.9)
+            reasons.append("supposition_offered")
+        if metadata.get("derivation") == "curiosity" and metadata.get("curiosity_licensed"):
+            # Not knowing the topic of the question, the agent asks about that very topic: the
+            # inquiry carries the dialogue on (as a clarification does), it is no answer.
+            score = max(score, 0.58)
+            reasons.append("unknown_topic_inquired")
+        if (
+            metadata.get("derivation") == "retrieve_self_claim"
+            and metadata.get("claim_query_event_id") == task.source_event_id
+            and any(getattr(p, "kind", None) == "canonical_claim"
+                    and any(d.role == "subject" and
+                            (d.argument.head.participant_ref or "").startswith("discord:agent:")
+                            for d in p.thought.dependencies)
+                    for p in metadata.get("premises", ()))
+        ):
+            score = max(score, 0.96)
+            reasons.append("canonical_self_query_bound_to_operational_source")
         if (
             objective.question_word == "кто"
             and metadata.get("identity_grounded") is True
@@ -702,7 +860,20 @@ def evaluate_task_progress(
     if response_move and obligation_fit >= 0.70:
         score = max(score, obligation_fit * 0.72)
         reasons.append("dialogue_obligation_fulfilled")
-    if objective.missing_slots and text.rstrip().endswith("?"):
+    if metadata.get("derivation") == "explain_delivered_basis" and grounded and answered_slot:
+        # The asked reason is the premise the agent really had, with its evidence.
+        score = max(score, 0.96)
+        reasons.append("own_basis_given_for_why")
+    if (metadata.get("derivation") == "supposition" and grounded
+            and metadata.get("epistemic_status") != "fantasy"):
+        # A marked supposition on the agent's own record answers a request for one.
+        score = max(score, 0.9)
+        reasons.append("supposition_offered")
+    if metadata.get("derivation") == "verify_reported_position":
+        # The reported words are checked against the agent's own delivered turns.
+        score = max(score, 0.96)
+        reasons.append("reported_position_checked")
+    if objective.missing_slots and text.rstrip().endswith("?") and genuine_clarification:
         score = max(score, 0.58)
         reasons.append("missing_slot_queried")
     if overlap:
@@ -718,6 +889,10 @@ def task_candidate_metadata(
     metadata: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     result = dict(metadata or {})
+    if _verified_content_question(result):
+        result.update(genuine_clarification=True, response_move="clarify_intended_meaning",
+                      semantic_recovery=True, hypothetical_assertions=0,
+                      hypothesis=result["message_plan"]["hypothesis"])
     if task is None:
         return result
     result["dialogue_task_id"] = task.task_id
@@ -731,6 +906,7 @@ def task_candidate_metadata(
             # surface when the current task happens to be low confidence.
             "dialogue_task_required": True,
             "dialogue_task_progress": progress.score,
+            "obligation_fit": progress.score,
             "dialogue_task_progress_reasons": progress.reasons,
             "context_relevance": max(
                 progress.score,
@@ -766,6 +942,42 @@ class DialogueTaskRepository:
         if existing is not None:
             return await self.situation(event.guild_id, event.channel_id, event.actor_id)
 
+        from debilgi.config import thought_content_enabled
+        from debilgi.language.morphology import DEFAULT_MORPHOLOGY
+        from debilgi.language.request_focus import (
+            focus_request,
+            is_fragment_reaction,
+            is_response_control,
+            response_alternatives,
+        )
+
+        situation = await self.situation(event.guild_id, event.channel_id, event.actor_id)
+        terms = set(content_lemmas(prompt))
+        pending_tasks = [t for t in situation.open_tasks if t.goal == "answer_question"
+                         and t.objective.request_text] if situation else []
+        fresh_tasks = await self._fresh_open_questions(event)
+        if fresh_tasks:
+            # A request that is still being talked about outranks stale tasks:
+            # open tasks are never retired, so the priority top-12 can hide it.
+            pending_tasks = fresh_tasks
+        if thought_content_enabled():
+            # A reaction («серьёзно??») registered as a question is not the request that an
+            # explicit command after it («а ты предположи») continues (stage 4.32).
+            pending_tasks = [t for t in pending_tasks
+                             if not is_fragment_reaction(t.objective.request_text)]
+        pending_task = max(pending_tasks, key=lambda t: (
+            len(terms & set(t.objective.focus_terms)),
+            bool(t.objective.response_options) if terms <= {"оба", "весь"} else False,
+            t.updated_at), default=None)
+        pending = pending_task.objective.request_text if pending_task else None
+        report_option = bool(pending_task and pending_task.objective.response_options
+                             and "?" not in prompt and not is_response_control(prompt)
+                             and terms & {DEFAULT_MORPHOLOGY.lemma(o)
+                                          for o in pending_task.objective.response_options})
+        focus = focus_request(prompt, consultation_messages, open_request=pending)
+        if prompt != focus.request_text:
+            dialogue_state = None
+        prompt = focus.request_text
         latest_agent = _latest_role_turn(consultation_messages, "agent")
         latest_user = _latest_role_turn(consultation_messages, "user")
         draft = infer_dialogue_task(
@@ -775,8 +987,23 @@ class DialogueTaskRepository:
             latest_agent_turn=latest_agent,
             latest_user_turn=latest_user,
         )
+        draft = replace(draft, objective=replace(
+            draft.objective, request_text=prompt,
+            response_options=focus.alternatives or response_alternatives(prompt)))
         now = event.utc_timestamp
         async with self._database.transaction() as connection:
+            if report_option:
+                # The raw human assertion remains attributed and working.
+                # Unsupported nominal comparison does not become a world fact.
+                await connection.execute(
+                    "INSERT OR IGNORE INTO dialogue_task_events "
+                    "(task_id,event_id,relation,observation_json,observed_at) "
+                    "VALUES (?,?,'human_answer',?,?)",
+                    (pending_task.task_id, event.event_id,
+                     _json({"text": prompt, "source": "human", "status": "working",
+                            "response_options": pending_task.objective.response_options}),
+                     now.isoformat()))
+
             prior = await (
                 await connection.execute(
                     """SELECT a.*, t.signature, t.goal, t.objective_json
@@ -1069,6 +1296,20 @@ class DialogueTaskRepository:
             )
         return True
 
+    async def _fresh_open_questions(self, event: Event) -> list[DialogueTask]:
+        cutoff = (event.utc_timestamp - self._attempt_window).isoformat()
+        rows = await self._database.fetchall(
+            """SELECT * FROM dialogue_tasks
+               WHERE guild_id = ? AND channel_id = ? AND user_id = ?
+                 AND status IN ('open', 'attempted') AND goal = 'answer_question'
+                 AND updated_at >= ? AND updated_at <= ? ORDER BY updated_at DESC LIMIT 12""",
+            (event.guild_id, event.channel_id, event.actor_id, cutoff,
+             event.utc_timestamp.isoformat()),
+        )
+        return [
+            task for task in (_task_from_row(row) for row in rows) if task.objective.request_text
+        ]
+
     async def task(self, task_id: str) -> DialogueTask | None:
         row = await self._database.fetchone(
             "SELECT * FROM dialogue_tasks WHERE task_id = ?", (task_id,)
@@ -1310,6 +1551,8 @@ def _task_from_row(row) -> DialogueTask:
         revisions=tuple(tuple(item) for item in raw.get("revisions", ())),
         missing_slots=tuple(raw.get("missing_slots", ())),
         target_event_id=raw.get("target_event_id"),
+        request_text=raw.get("request_text"),
+        response_options=tuple(raw.get("response_options", ())),
         required_response_act=(
             raw.get("required_response_act")
             or (

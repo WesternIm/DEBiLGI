@@ -8,10 +8,15 @@ and assembles a sentence.  No complete response wording is stored here.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
-from debilgi.language.structured_utterance import StructuredUtterance
+from debilgi.language.structured_utterance import (
+    PARSER_VERSION,
+    SemanticScope,
+    SemanticTime,
+    StructuredUtterance,
+)
 from debilgi.language.valency import assess_predicate_valency, governed_object_case
 
 _ARGUMENT_ROLES = frozenset(
@@ -25,6 +30,7 @@ _ARGUMENT_ROLES = frozenset(
         "cause",
         "location",
         "topic",
+        "comparison",
     }
 )
 _CORE_ROLE_ORDER = (
@@ -39,6 +45,7 @@ _CORE_ROLE_ORDER = (
     "cause",
     "location",
     "topic",
+    "comparison",
 )
 _QUESTION_FOCUS_LEMMAS = frozenset(
     {
@@ -64,6 +71,7 @@ class ConceptLexeme:
     part_of_speech: str | None = None
     features: tuple[tuple[str, str], ...] = ()
     entity_kind: str | None = None
+    participant_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,8 +85,35 @@ class ConceptArgument:
 
 @dataclass(frozen=True, slots=True)
 class SemanticDependency:
+    """One argument of a thought.
+
+    ``head`` is the tree link (stage 4.24): the role of the dependency whose word governs this
+    argument, ``None`` for the clause predicate. The default keeps every historical thought, its
+    ``proposition_key`` and its readers unchanged; only an opt-in reader (``parse_proposition(
+    tree=True)``) or a planner that knows the attachment (the object of «быть» in «хотел бы быть
+    собакой») fills it.
+    """
+
     role: str
     argument: ConceptArgument
+    head: str | None = None
+
+
+def identity_graph(value) -> dict:
+    """``asdict`` as it was before the ``head`` link existed: an unattached dependency
+    (``head is None``, every historical thought) has no ``head`` key, so ids and keys hashed
+    from the graph stay byte for byte what they were."""
+
+    def clean(item):
+        if isinstance(item, dict):
+            return {k: clean(v) for k, v in item.items() if not (k == "head" and v is None)}
+        if isinstance(item, tuple):
+            return tuple(clean(v) for v in item)
+        if isinstance(item, list):
+            return [clean(v) for v in item]
+        return item
+
+    return clean(asdict(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +129,10 @@ class ClauseThought:
     confidence: float = 0.0
     evidence: tuple[str, ...] = ()
     predicate_class: str = "lexical"
+    semantic_time: SemanticTime = SemanticTime()
+    scopes: tuple[SemanticScope, ...] = ()
+    parser_version: str = PARSER_VERSION
+    source_event_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +154,9 @@ class DependencyPattern:
 
     @property
     def valid(self) -> bool:
+        if self.predicate_class == "dialogue_act":
+            return bool(self.roles) and self.roles == tuple(
+                f"act:{i}" for i in range(len(self.roles)))
         allowed = {*_ARGUMENT_ROLES, "predicate", "negation"}
         role_set = set(self.roles)
         negation_index = self.roles.index("negation") if "negation" in role_set else None
@@ -438,8 +480,82 @@ def realize_thought(
     *,
     limit: int = 6,
 ) -> tuple[ProductiveSurface, ...]:
-    """Realize several grammatical role orders without retrieving a reply."""
+    """Realize several grammatical role orders without retrieving a reply.
 
+    With ``DEBILGI_GRAMMARIAN=1`` the personal network of ``language/grammarian.py`` words the
+    plan first; when it refuses (low confidence, an incomplete or unsupported plan, an error) —
+    and always when the flag is off — the deterministic realizer below answers exactly as
+    before. The network's surface, when accepted, stands first and the deterministic ones
+    follow as alternatives for the reader check of the composer.
+    """
+    surfaces = _realize_thought_deterministic(thought, patterns, limit=limit)
+    from debilgi.language import grammarian
+
+    if not grammarian.enabled() or not surfaces or thought.predicate_class == "dialogue_act":
+        return surfaces
+    if len(patterns) == 1:
+        # one explicit pattern is an order the caller demands (an embedded question, a short
+        # act): not the network's to choose
+        grammarian.note_fallback(thought, "order_fixed_by_caller")
+        return surfaces
+    answer, _record = grammarian.realize(thought)
+    if answer is None:
+        return surfaces
+    text = _close_sentence(thought, answer.body)
+    if not text:
+        return surfaces
+    seen = " ".join(text.casefold().split())
+    network = ProductiveSurface(
+        text=text,
+        role_order=answer.role_order,
+        confidence=min(thought.confidence, answer.confidence),
+        source="grammarian",
+        construction_id=None,
+    )
+    rest = tuple(s for s in surfaces if " ".join(s.text.casefold().split()) != seen)
+    return (network, *rest)[: max(1, min(limit, 12))]
+
+
+def _close_sentence(thought: ClauseThought, body: str) -> str:
+    """The answer marker, the capital and the sentence end of a clause (shared by realizers)."""
+    if thought.response_polarity is not None:
+        marker = "Да" if thought.response_polarity else "Нет"
+        body = f"{marker}, {body}"
+    punctuation = "?" if thought.clause_kind == "question" else "."
+    body = body.strip(" .!?…")
+    return body[:1].upper() + body[1:] + punctuation if body else ""
+
+
+def _realize_thought_deterministic(
+    thought: ClauseThought,
+    patterns: tuple[DependencyPattern, ...] = (),
+    *,
+    limit: int = 6,
+) -> tuple[ProductiveSurface, ...]:
+    if thought.predicate_class == "dialogue_act":
+        import re
+
+        order = tuple(d.role for d in thought.dependencies)
+        pattern = next((p for p in patterns if p.valid and p.predicate_class == "dialogue_act"
+                        and p.roles == order), None)
+        if pattern is None:
+            return ()
+        words = []
+        for item in thought.dependencies:
+            if not item.role.startswith("act:"):
+                return ()
+            lexeme = item.argument.head
+            features = dict(lexeme.features)
+            if features.get("number") == "plural":
+                features.pop("gender", None)
+            word = (DEFAULT_MORPHOLOGY.inflect(lexeme.lemma, **features)
+                    if features else lexeme.surface)
+            if not word:
+                return ()
+            words.append(word)
+        text = re.sub(r"\s+([,.!?;:)])", r"\1", " ".join(words))
+        return ((ProductiveSurface(text, tuple(d.role for d in thought.dependencies),
+                                   thought.confidence, "dialogue_act", None),) if text else ())
     role_values = {item.role: item.argument for item in thought.dependencies}
     if "subject" not in role_values or not thought.predicate.lemma:
         return ()
@@ -450,6 +566,9 @@ def realize_thought(
     ):
         # Arguments of the embedded action aren't arguments of the modal.
         predicate_roles = {"subject", "action_complement"}
+    heads = {item.role: item.head for item in thought.dependencies if item.head}
+    # A comparison and the arguments of an embedded verb are not arguments of the predicate.
+    predicate_roles -= {*heads, "comparison"} - {"action_complement"}
     valency = assess_predicate_valency(
         thought.predicate.lemma,
         present_roles=frozenset(predicate_roles),
@@ -520,13 +639,15 @@ def realize_thought(
             "location",
             "topic",
             "manner",
+            "comparison",
         )
         if thought.predicate_class == "modal"
         else _CORE_ROLE_ORDER
     )
     default = tuple(role for role in base_order if role in present_roles)
     orders.append((default, 0.86, "productive_grammar", None))
-    if thought.focus_role in present_roles and thought.focus_role not in {"subject", "predicate"}:
+    if (thought.focus_role in present_roles and thought.focus_role != "predicate"
+            and (thought.focus_role != "subject" or thought.clause_kind == "question")):
         focused = (
             thought.focus_role,
             *(role for role in default if role != thought.focus_role),
@@ -539,6 +660,13 @@ def realize_thought(
                 None,
             )
         )
+    if heads:
+        # An argument of an embedded verb stands next to that verb, whatever order a learned
+        # pattern gave the roles of the whole clause («хотел бы собаку быть» is not a clause).
+        orders = [
+            (_attach_to_heads(order, heads, thought.focus_role), *rest)
+            for order, *rest in orders
+        ]
     focused_argument = (
         role_values.get(thought.focus_role) if thought.focus_role is not None else None
     )
@@ -546,7 +674,8 @@ def realize_thought(
         thought.clause_kind == "question"
         and thought.focus_role in present_roles
         and focused_argument is not None
-        and focused_argument.head.lemma in _QUESTION_FOCUS_LEMMAS
+        and any(lexeme.lemma in _QUESTION_FOCUS_LEMMAS
+                for lexeme in (focused_argument.head, *focused_argument.modifiers))
     )
     if requires_fronted_question_focus:
         # ``focus_role`` is an explicit information-structure instruction.
@@ -580,6 +709,27 @@ def realize_thought(
         if len(surfaces) >= max(1, min(limit, 12)):
             break
     return tuple(surfaces)
+
+
+def _attach_to_heads(
+    order: tuple[str, ...], heads: dict[str, str], focus_role: str | None = None
+) -> tuple[str, ...]:
+    """Move every role with a ``head`` right behind that head role (stable, no role lost)."""
+    movable = [
+        role for role in order
+        if role in heads and heads[role] in order and not (order[0] == role == focus_role)
+    ]
+    result = [role for role in order if role not in movable]
+    for role in movable:
+        head = heads[role]
+        if head not in result:
+            result.append(role)
+            continue
+        index = result.index(head) + 1
+        while index < len(result) and heads.get(result[index]) == head:
+            index += 1
+        result.insert(index, role)
+    return tuple(result)
 
 
 def _observed_predicate_class(
@@ -621,7 +771,9 @@ def _realize_order(
     role_values: dict[str, ConceptArgument],
 ) -> str:
     subject = role_values.get("subject")
+    heads = {item.role: item.head for item in thought.dependencies if item.head}
     predicate_features = _predicate_features(thought.predicate, subject)
+    conditional = dict(thought.predicate.features).get("mood") == "conditional"
     words: list[str] = []
     for role in order:
         if role == "negation":
@@ -638,11 +790,25 @@ def _realize_order(
                 predicate_features,
             )
             words.append(predicate)
+            if conditional and predicate:
+                # Conditional mood: the past form plus the particle after the verb.
+                words.append("бы")
         else:
             argument = role_values.get(role)
             if argument is None:
                 continue
-            case = _case_for_role(thought.predicate.lemma, role, argument)
+            if role == "subject" and ("elided", "true") in argument.head.features:
+                continue  # the person is carried by the verb form (pro-drop), not said
+            governor = role_values.get(heads.get(role, ""))
+            case = (
+                _case_for_role(governor.head.lemma, role, argument, nested=True)
+                if governor is not None
+                else _case_for_role(thought.predicate.lemma, role, argument)
+            )
+            if role == "comparison" and not argument.preposition:
+                # The relation of likeness is a meaning of the plan; its closed-class word
+                # is the one the plan names, «как» when it names none.
+                argument = replace(argument, preposition="как")
             if (
                 thought.predicate_class in {"copular", "modal"}
                 and role == "predicate_complement"
@@ -673,13 +839,7 @@ def _realize_order(
             words.append(rendered)
     if not words:
         return ""
-    body = " ".join(words)
-    if thought.response_polarity is not None:
-        marker = "Да" if thought.response_polarity else "Нет"
-        body = f"{marker}, {body}"
-    punctuation = "?" if thought.clause_kind == "question" else "."
-    body = body.strip(" .!?…")
-    return body[:1].upper() + body[1:] + punctuation if body else ""
+    return _close_sentence(thought, " ".join(words))
 
 
 def _realize_predicate(
@@ -717,6 +877,8 @@ def _predicate_features(
         for name, value in predicate.features
         if name in {"tense", "number", "gender", "person"}
     }
+    if dict(predicate.features).get("mood") == "conditional":
+        features["tense"] = "past"
     if subject is None:
         return features
     subject_features = _inferred_head_features(subject.head)
@@ -754,17 +916,37 @@ def _predicate_features(
     return features
 
 
+def _nominal_complement_case(verb_lemma: str) -> str | None:
+    """The case a bare noun takes after a verb that cannot govern the accusative.
+
+    An intransitive verb with no lexical profile (быть, стать, казаться, остаться … and any
+    verb not seen before) can only carry its noun as a predicative complement, which Russian
+    puts in the instrumental. The verb's transitivity comes from its morphology, not from a
+    list of verbs; a lexical profile of government (``valency``) always goes first.
+    """
+    reading = DEFAULT_MORPHOLOGY.best(verb_lemma)
+    if reading is not None and reading.features().get("transitivity") == "intransitive":
+        return "instrumental"
+    return None
+
+
 def _case_for_role(
     predicate_lemma: str,
     role: str,
     argument: ConceptArgument,
+    *,
+    nested: bool = False,
 ) -> str | None:
+    """Case of an argument; ``predicate_lemma`` is the word that governs it (its ``head``)."""
     if argument.grammatical_case:
         return argument.grammatical_case
-    if role == "subject":
+    if role in {"subject", "comparison"}:
         return "nominative"
     if role == "direct_object":
-        return governed_object_case(predicate_lemma, role, "accusative")
+        governed = governed_object_case(predicate_lemma, role, "")
+        if governed:
+            return governed
+        return (nested and _nominal_complement_case(predicate_lemma)) or "accusative"
     if role == "indirect_object":
         return governed_object_case(predicate_lemma, role, "dative")
     if role == "predicate_complement":
@@ -791,6 +973,12 @@ def _render_argument(
     if argument.head.part_of_speech in {"adjective", "participle"} and head_features.get("gender"):
         requested["gender"] = head_features["gender"]
     inflection_base = argument.head.lemma
+    name_reading = DEFAULT_MORPHOLOGY.best(inflection_base)
+    proper_name = bool(name_reading and name_reading.is_known
+                       and {"Name", "Surn"} & name_reading.grammemes
+                       and not argument.head.surface.startswith("«"))
+    if proper_name:
+        inflection_base = inflection_base[:1].upper() + inflection_base[1:]
     if argument.head.part_of_speech == "participle":
         # Its lemma is a verb; inflect the observed participle to retain voice.
         inflection_base = argument.head.surface
@@ -818,7 +1006,8 @@ def _render_argument(
             return short_surface
     head = (
         argument.head.surface
-        if argument.head.entity_kind is not None or head_features.get("indeclinable") == "true"
+        if (argument.head.entity_kind is not None and not proper_name
+            or head_features.get("indeclinable") == "true")
         else DEFAULT_MORPHOLOGY.inflect(inflection_base, **requested) or argument.head.surface
     )
     modifier_features = dict(requested)
@@ -841,7 +1030,15 @@ def _render_argument(
     )
     postmodifiers = tuple(item.surface for item in argument.postmodifiers)
     phrase = " ".join((*modifiers, head, *postmodifiers)).strip()
-    return f"{argument.preposition} {phrase}" if argument.preposition else phrase
+    preposition = preposition_allomorph(argument.preposition, phrase)
+    return f"{preposition} {phrase}" if preposition else phrase
+
+
+def preposition_allomorph(preposition: str | None, next_word: str) -> str | None:
+    """«о» stands as «об» before a vowel (shared by every realizer)."""
+    if preposition == "о" and next_word[:1].casefold() in "аэиоуы":
+        return "об"
+    return preposition
 
 
 def _inferred_head_features(head: ConceptLexeme) -> dict[str, str]:

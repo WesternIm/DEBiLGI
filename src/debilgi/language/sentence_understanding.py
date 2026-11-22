@@ -7,7 +7,6 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 
-from debilgi.language.character_markov import normalize_word
 from debilgi.language.comprehension_tasks import ComprehensionTask, plan_comprehension
 from debilgi.language.content import content_lemmas
 from debilgi.language.entities import EntityAnalysis, EntityMention
@@ -16,6 +15,7 @@ from debilgi.language.lexical_gaps import nonblocking_event_terms, nonblocking_r
 from debilgi.language.lexicon import WordAnalysis
 from debilgi.language.morphology import DEFAULT_MORPHOLOGY
 from debilgi.language.structured_utterance import analyze_structured_utterance
+from debilgi.language.tokenizer import normalize_word
 from debilgi.language.valency import predicate_valency
 from debilgi.storage.database import Database
 

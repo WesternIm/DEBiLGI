@@ -2,9 +2,6 @@ from decimal import Decimal
 
 import pytest
 
-from debilgi.cognition.models import ActionType
-from debilgi.language.memory_based import MemoryPhraseGenerator
-from debilgi.language.planning import ReplyContext, StructuredThought, UtterancePlan
 from debilgi.literacy.reasoner import analyze_symbols, calculate, facts_for
 
 
@@ -71,14 +68,3 @@ def test_count_comparison_parity_and_symbol_meaning() -> None:
     assert fact_text("что больше: 12 или 7?") == "12 > 7; больше 12."
     assert fact_text("число 8 чётное или нечётное?") == "Число 8 — чётное."
     assert "сложение" in fact_text("что означает символ +?")
-
-
-def test_exact_symbolic_answer_bypasses_probabilistic_generation() -> None:
-    plan = UtterancePlan(
-        speech_act="brief_statement",
-        max_tokens=72,
-        thought=StructuredThought(ActionType.SHORT_REPLY, None, "calculate", 1.0, ()),
-        context=ReplyContext(prompt="2+2", exact_answer="2 + 2 = 4"),
-    )
-
-    assert MemoryPhraseGenerator().generate(plan) == "2 + 2 = 4"

@@ -1,4 +1,4 @@
-"""Observe consequences and slowly reinforce or weaken generated transitions."""
+"""Observe consequences and update the experience of delivered utterances."""
 
 from __future__ import annotations
 
@@ -115,10 +115,6 @@ class ExperienceConsolidator:
         )
         return True
 
-    async def transition_adjustments(
-        self, guild_id: int
-    ) -> tuple[tuple[tuple[str, ...], float], ...]:
-        return await self.repository.transition_adjustments(guild_id)
 
     async def _expire(self, event: Event) -> None:
         cutoff = event.utc_timestamp - self.config.feedback_window

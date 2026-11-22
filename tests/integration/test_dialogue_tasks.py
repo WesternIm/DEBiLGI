@@ -30,6 +30,18 @@ from debilgi.storage.database import Database
 NOW = datetime(2026, 9, 20, 9, tzinfo=UTC)
 
 
+async def test_unknown_directive_slot_does_not_license_any_counterquestion(database):
+    event = message("self-description", "привет, расскажи о себе")
+    await save(database, event)
+    situation = await DialogueTaskRepository(database).deliberate(
+        event, prompt=event.payload["content"], consultation_messages=(), dialogue_state=None,
+    )
+    task = situation.active_task
+    assert task.goal == "satisfy_directive"
+    assert evaluate_task_progress(task, "А ты кто?").score == 0
+    assert evaluate_task_progress(task, "Расскажи о себе.").score == 0
+
+
 @pytest.fixture
 async def database(tmp_path):
     database = Database(

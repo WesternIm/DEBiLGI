@@ -28,6 +28,19 @@ class AffectiveStance:
     topics: tuple[str, ...]
 
 
+def reaction_alignment(*, form=None, affect_features=(), personality=None) -> float:
+    """The same stance policy applies without an understood proposition.
+
+    Habitual coarse punctuation is a manner; a change in that manner is an
+    additional resistance cue. Neither licenses a factual assertion.
+    """
+    value = _alignment_weight(affect_features, personality)
+    if form is not None:
+        value -= 0.16 * ("coarse" in form.tone_change)
+        value -= 0.08 * ("caps" in form.tone_change)
+    return max(0.08, min(0.92, value))
+
+
 def affective_stances(
     text: str,
     *,

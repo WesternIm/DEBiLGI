@@ -465,3 +465,14 @@ def test_secondary_adjective_predicate_is_bound_to_the_action(text):
     assert adjective.part_of_speech == "adjective"
     assert dict(adjective.grammatical_features)["case"] == "instrumental"
     assert adjective.semantic_role == "predicate_complement"
+
+
+def test_rhetorical_challenge_keeps_the_addressee_as_subject_without_a_verb():
+    from debilgi.language.communication import reader_goal
+
+    structure = analyze_structured_utterance("ты что рад?")
+    roles = {t.surface: t.semantic_role for t in structure.tokens}
+    assert roles["ты"] == "subject" and roles["что"] == "pragmatic_marker"
+    assert reader_goal(structure).kind == "respond"
+    verbal = analyze_structured_utterance("ты что делаешь?")
+    assert reader_goal(verbal).kind == "answer_slot" and reader_goal(verbal).question_word == "что"

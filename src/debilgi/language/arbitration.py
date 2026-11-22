@@ -19,6 +19,7 @@ from debilgi.language.facts import (
 )
 from debilgi.language.lexical_gaps import irrelevant_lexical_question
 from debilgi.language.response_requirements import requirement_rejection
+from debilgi.language.response_trace import content_diagnostic
 from debilgi.language.structural_learning import (
     learned_structural_bonus,
     structural_response_features,
@@ -91,6 +92,15 @@ class SurfaceCandidate:
     required_facts: tuple[StructuredFact, ...] = ()
     key_points: tuple[str, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", MappingProxyType({
+            **self.metadata,
+            "diagnostic": content_diagnostic(
+                source=self.source, renderer=self.renderer, speech_act=self.speech_act,
+                metadata=self.metadata, candidate_id=self.candidate_id, text=self.text,
+            ),
+        }))
 
     @classmethod
     def create(
@@ -212,6 +222,12 @@ class CandidateFeatures:
     retrieval_dump_penalty: float
     repetition_penalty: float
     broken_surface_penalty: float
+    intra_phrase_repetition: float = 0.0
+    meaning_activation: float | None = None
+    meaning_preference: float | None = None
+    personal_warmth: float | None = None
+    personal_expressiveness: float | None = None
+    personal_brevity: float | None = None
 
     def as_dict(self) -> dict[str, float | None]:
         return {
@@ -245,6 +261,12 @@ DEFAULT_WEIGHTS: Mapping[str, float] = MappingProxyType(
         "retrieval_dump_penalty": 0.80,
         "repetition_penalty": 1.10,
         "broken_surface_penalty": 2.00,
+        "intra_phrase_repetition": 0.20,
+        "meaning_activation": 0.65,
+        "meaning_preference": 1.15,
+        "personal_warmth": 0.60,
+        "personal_expressiveness": 0.45,
+        "personal_brevity": 0.35,
     }
 )
 
@@ -284,6 +306,7 @@ _PENALTY_NAMES = frozenset(
         "reference_copy_penalty",
         "retrieval_dump_penalty",
         "repetition_penalty",
+        "intra_phrase_repetition",
         "broken_surface_penalty",
     }
 )
@@ -319,6 +342,13 @@ class ScoredCandidate:
     rejection_reasons: tuple[str, ...]
     admission_score: float = 0.0
     answer_status: str = "candidate"
+    construction_repeat: float = 0.0
+    marked_order: float = 0.0
+    # Boredom of the candidate (stage 4.33, flag only): what it repeats of the agent's journal.
+    boredom: float = 0.0
+    # Said so often lately that any admitted wording that is not spent goes before it (but a
+    # spent one is still said when nothing else is admitted: B never silences by itself).
+    spent: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,16 +474,25 @@ class ResponseArbitrator:
             candidate = score.candidate
             metadata = candidate.metadata
             plan = metadata.get("message_plan")
-            if candidate.source != "semantic_reasoning" or not plan or not metadata.get("premises"):
+            if score.eligible and metadata.get("communicative_status") == "express_limit":
+                usable.append(score)
+                continue
+            if (not score.eligible or candidate.source != "semantic_reasoning"
+                    or not plan or not metadata.get("premises")):
                 continue
             thought = thought_from_data(plan["claim"])
             supported = supported_alternative(kwargs["prompt"], options, thought)
             if supported is not None and candidate.text.casefold() == supported.casefold():
                 usable.append(score)
-        selected = max(usable, key=lambda score: score.total, default=None)
+        # Keep the deliberate choice if it already belongs to the answer domain.
+        selected = next((s for s in usable if decision.winner and
+                         s.candidate.candidate_id == decision.winner.candidate_id), None)
+        selected = selected or max(usable, key=lambda score: score.total, default=None)
         return replace(
             decision,
-            winner=selected.candidate if selected else None,
+            winner=(decision.winner if selected and decision.winner and
+                    selected.candidate.candidate_id == decision.winner.candidate_id
+                    else selected.candidate if selected else None),
             selection_reason="grounded_observed_answer_domain",
             selected_proposal_ids=(selected.candidate.proposal.proposal_id,) if selected else (),
         )
@@ -502,13 +541,41 @@ class ResponseArbitrator:
         )
         eligible = tuple(item for item in scores if item.eligible)
         admitted = tuple(item for item in eligible if item.admission_score >= self.minimum_score)
+        sleep_trial = any(s.candidate.metadata.get("reader_checked")
+                          and (s.candidate.metadata.get("sleep_hypothesis_id")
+                               and (s.candidate.metadata.get("sleep_opinion") or
+                                    s.candidate.metadata.get("repair_unbound_reference"))
+                               or s.candidate.metadata.get("supposition_licensed")
+                               or s.candidate.metadata.get("curiosity_licensed")
+                               or s.candidate.metadata.get("fantasy_licensed"))
+                          for s in admitted)
+        neutral = _neutral_siblings(admitted)
         winner_score = max(
             admitted,
             key=lambda item: (
                 # Preserve competition between different valid answer methods;
                 # only a no-answer recovery belongs to a lower priority pool.
                 int(item.answer_status != "recovery"),
+                # A checked trial may compete with a scoped Unknown on its
+                # original hole. Reliable Known never admits a sleep trial.
+                int(not sleep_trial or
+                    item.candidate.metadata.get("communicative_status") != "express_limit" or
+                    item.candidate.metadata.get("repair_unbound_reference", False) or
+                    item.candidate.metadata.get("supposition_licensed", False) or
+                    item.candidate.metadata.get("curiosity_licensed", False)),
+                int(not item.spent),
+                # The clause skeleton the agent has just used loses to any admitted
+                # alternative built differently (a way of not knowing, a guess, a game).
+                int(item.construction_repeat < 0.5),
+                # The same plan worded with its personal subject behind the verb never beats
+                # its neutral wording (the reordering is no way to avoid saying a thing twice).
+                int(item.marked_order == 0 or item.candidate.metadata.get(
+                    "message_plan_key") not in neutral),
+                # What the agent has said less lately (B), not what a hash of the event picks:
+                # with a journal the last tie is the wording itself, not a draw.
+                -item.boredom,
                 item.total,
+                _lexical_tie(item),
                 _stable_number(f"{event_id}|{item.candidate.candidate_id}"),
             ),
             default=None,
@@ -523,6 +590,13 @@ class ResponseArbitrator:
             if eligible
             else "no_eligible_candidates"
         )
+        if winner is not None and winner.metadata.get("choice_context", {}).get("enabled"):
+            options = [s for s in admitted if s.answer_status == winner_score.answer_status]
+            chosen, personal = self._deliberate_surface(options, winner, recent_replies)
+            winner = replace(chosen, metadata={**chosen.metadata, "surface_choice": personal,
+                             "diagnostic": {**chosen.metadata.get("diagnostic", {}),
+                                            "surface_choice": personal}})
+            reason = "personal_surface_choice"
         return ArbitrationDecision(
             decision_id=f"arbitration:{uuid4()}",
             event_id=event_id,
@@ -536,6 +610,39 @@ class ResponseArbitrator:
             content_scores=content_scores,
             selected_proposal_ids=selected_proposal_ids,
         )
+
+    @staticmethod
+    def _deliberate_surface(options, original, recent):
+        """Quality admits surfaces; memory and character choose within that set."""
+        from debilgi.language.dialogue_learning import normalized_response
+
+        context = original.metadata.get("choice_context", {})
+        traits = context.get("personality", {})
+        affect = context.get("affect", {})
+        # State determines the preferred utterance length continuously. Exact
+        # ties preserve the evidence/activation order, never alphabet or a draw.
+        target = traits.get("target_tokens", 12) * (1 + affect.get("state_interest", 0) * .2)
+        features = [s.features.as_dict() for s in options]
+        neutral = _neutral_siblings(options)
+        selected = max(range(len(options)), key=lambda i: (
+            int(not options[i].spent),
+            int(options[i].marked_order == 0 or options[i].candidate.metadata.get(
+                "message_plan_key") not in neutral),
+            -options[i].boredom,
+            options[i].total,
+            -abs(len(normalized_response(options[i].candidate.text).split()) - target),
+            options[i].candidate.metadata.get("meaning_activation", 0.0),
+        ))
+        chosen = options[selected].candidate
+        contributions = [dict(s.weighted_components) for s in options]
+        reasons = [{"source": "weighted_features", "criterion": "proportional_preference",
+                    "totals": [s.total for s in options], "contributions": contributions}]
+        return chosen, {"considered": len(options), "score_first": original.candidate_id,
+                        "selected": chosen.candidate_id,
+                        "not_first_by_score": chosen.candidate_id != original.candidate_id,
+                        "decisive_source": "weighted_features", "reasons": reasons,
+                        "features": features, "state_target_words": target,
+                        "recent_source": "scoped_delivered_replies" if recent else None}
 
     @staticmethod
     def _score_content(
@@ -598,7 +705,7 @@ class ResponseArbitrator:
             reasons = (*reasons, issue)
         if irrelevant_lexical_question(prompt, candidate.text):
             reasons = (*reasons, "definition_not_required_for_event")
-        if unmet := requirement_rejection(prompt, candidate.metadata):
+        if unmet := requirement_rejection(prompt, candidate.metadata, text=candidate.text):
             reasons = (*reasons, unmet)
         if issue := _question_response_rejection(candidate):
             reasons = (*reasons, issue)
@@ -608,6 +715,19 @@ class ResponseArbitrator:
             focus_concepts=focus_concepts,
             recent_replies=recent_replies,
         )
+        from debilgi.language.communication import (
+            CONSTRUCTION_WEIGHED,
+            CONSTRUCTION_WEIGHED_STATUSES,
+            construction_repetition,
+        )
+
+        weighed = (candidate.metadata.get("communicative_status") in CONSTRUCTION_WEIGHED
+                   or candidate.metadata.get("epistemic_status") in CONSTRUCTION_WEIGHED_STATUSES)
+        construction_repeat = (construction_repetition(candidate.text, recent_replies)
+                               if weighed and recent_replies else 0.0)
+        if construction_repeat:
+            features = replace(features, repetition_penalty=max(
+                features.repetition_penalty, _clamp(construction_repeat)))
         components: dict[str, float] = {}
         measured_features = {
             name: value for name, value in features.as_dict().items() if value is not None
@@ -648,7 +768,7 @@ class ResponseArbitrator:
         # Feedback about wording ranks admitted answers, but cannot suppress an
         # otherwise grounded answer or turn lack of an answer into evidence.
         admission_score = total
-        if answer_status in {"grounded_answer", "dialogue_response"}:
+        if answer_status in {"grounded_answer", "dialogue_response", "hypothesis_answer"}:
             stable_weights = {name: DEFAULT_WEIGHTS.get(name, 0.0) for name in measured_features}
             admission_score = sum(
                 (-1 if name in _PENALTY_NAMES else 1) * stable_weights[name] * value
@@ -659,6 +779,7 @@ class ResponseArbitrator:
                     weight for name, weight in stable_weights.items() if name not in _PENALTY_NAMES
                 ),
             )
+        bored = candidate.metadata.get("boredom")
         if reasons:
             total = min(total, -10.0)
             admission_score = min(admission_score, -10.0)
@@ -671,6 +792,10 @@ class ResponseArbitrator:
             rejection_reasons=reasons,
             admission_score=admission_score,
             answer_status=answer_status,
+            construction_repeat=construction_repeat,
+            marked_order=_marked_order(candidate),
+            boredom=float(bored.get("value", 0.0)) if isinstance(bored, Mapping) else 0.0,
+            spent=bool(bored.get("spent")) if isinstance(bored, Mapping) else False,
         )
 
     @staticmethod
@@ -686,7 +811,11 @@ class ResponseArbitrator:
             reasons.append("technical_token")
         if internal_surface_reason(normalized) is not None:
             reasons.append("internal_diagnostic_leak")
-        surface = evaluate_surface(text)
+        from debilgi.language.dialogue_learning import observed_reaction_binding
+
+        surface = evaluate_surface(text, dialogue_act=bool(observed_reaction_binding(
+            str(candidate.metadata.get("focused_request", "")), text, candidate.metadata,
+        )))
         researched_fact_surface = bool(
             candidate.metadata.get("foreground_research") is True
             and candidate.metadata.get("allow_rough_surface") is not True
@@ -801,22 +930,33 @@ def extract_features(
     fact_grounding = _overlap(candidate_terms, required_terms) if required_terms else None
     tokens = tokenize(text)
     words = tuple(token for token in tokens if token[:1].isalnum())
-    surface = evaluate_surface(text)
-    grammar_fit = surface.score
+    from debilgi.language.dialogue_learning import observed_reaction_binding
+
+    surface = evaluate_surface(text, dialogue_act=bool(observed_reaction_binding(
+        prompt, text, candidate.metadata,
+    )))
+    order = tuple(candidate.metadata.get("role_order", ()))
+    # Default Russian declarative order. A learned n-gram cannot turn the
+    # marked final-subject order into perfect neutral grammar.
+    marked_order = _marked_order(candidate)
+    grammar_fit = surface.score * (1 - .25 * marked_order)
     specificity = min(1.0, len(candidate_terms) / 6.0)
     target_length = 16
     length_fit = 1.0 - min(1.0, abs(len(words) - target_length) / target_length)
-    recent_similarity = max(
-        (
-            SequenceMatcher(None, text.casefold(), item.casefold()).ratio()
-            for item in recent_replies
-        ),
-        default=0.0,
-    )
+    from debilgi.language.dialogue_learning import response_repetition, response_similarity
+
+    recent_similarity = response_similarity(text, recent_replies)
     non_repetition = 1.0 - recent_similarity
     speech_act_fit = _speech_act_fit(candidate.speech_act, text)
     speech_act_fit = max(speech_act_fit, dialogue_binding)
     uncertainty_words = set(word.casefold() for word in words) & _UNCERTAINTY_MARKERS
+    if any(
+        len(pair) == 2 and (pair[0] == "operator" or tuple(pair) == ("kind", "fantasy"))
+        for pair in (candidate.metadata.get("message_plan") or {}).get("hypothesis") or ()
+    ):
+        # The hedge is the plan's epistemic operator, not a word of the claim: a negated
+        # and an affirmed guess are equally hedged ("не" alone is not uncertainty).
+        uncertainty_words = {"operator"}
     uncertainty_calibration = (
         1.0
         if candidate.source_confidence >= 0.70 and not uncertainty_words
@@ -826,7 +966,13 @@ def extract_features(
     )
     truth_grounding = _metadata_score(candidate, "truth_grounding", fact_grounding)
     stance_consistency = _metadata_score(candidate, "stance_consistency", None)
-    semantic_frame_fit = _metadata_score(candidate, "semantic_frame_fit", speech_act_fit)
+    message_plan = candidate.metadata.get("message_plan") or {}
+    claim = message_plan.get("claim", {})
+    required_roles = {"predicate", *(d["role"] for d in claim.get("dependencies", ()))}
+    frame_fit = (dialogue_binding if claim.get("predicate_class") == "dialogue_act" else
+                 len(set(order) & required_roles) / len(required_roles)
+                 if claim and order else grammar_fit)
+    semantic_frame_fit = _metadata_score(candidate, "semantic_frame_fit", frame_fit)
     social_coherence = _metadata_score(candidate, "social_coherence", None)
     prompt_similarity = SequenceMatcher(None, " ".join(tokenize(prompt)), " ".join(tokens)).ratio()
     prompt_echo_penalty = max(0.0, (prompt_similarity - 0.62) / 0.38)
@@ -836,7 +982,8 @@ def extract_features(
         if candidate.source in {"exact_archive", "lexical_reference", "knowledge_retrieval"}
         else 0.0
     )
-    repetition_penalty = 1.0 - len(set(words)) / max(1, len(words))
+    repetition_penalty = response_repetition(text, recent_replies)
+    intra_phrase_repetition = 1.0 - len(set(words)) / max(1, len(words))
     soft_surface = bool(
         candidate.metadata.get("allow_rough_surface") is True
         and candidate.metadata.get("locally_composed") is True
@@ -844,7 +991,24 @@ def extract_features(
         and not (set(surface.hard_issues) - COMPOSED_SURFACE_SOFT_ISSUES)
     )
     broken_surface_penalty = 0.15 if soft_surface else float(bool(surface.hard_issues))
+    broken_surface_penalty = max(broken_surface_penalty, .25 * marked_order)
+    context = candidate.metadata.get("choice_context", {})
+    traits, affect = context.get("personality", {}), context.get("affect", {})
+    personal = bool(context.get("enabled"))
+    valence = .72 * affect.get("emotion_valence", 0) + .28 * affect.get("mood_valence", 0)
+    warmth = traits.get("warmth", traits.get("sociability", .5)) - .5 + .5 * valence
+    expression = traits.get("expressiveness", .5) - .5 + .2 * affect.get("emotion_arousal", 0)
+    brevity = .5 - traits.get("patience", .5) - valence * .25
     return CandidateFeatures(
+        intra_phrase_repetition=intra_phrase_repetition,
+        meaning_activation=(_metadata_score(candidate, "meaning_activation", None)
+                            if personal else None),
+        meaning_preference=(_metadata_score(candidate, "meaning_preference", None)
+                            if personal else None),
+        personal_warmth=(.5 + warmth * (1 if ")" in text else -1) / 2) if personal else None,
+        personal_expressiveness=(
+            .5 + expression * (1 if "!" in text else -1) / 2) if personal else None,
+        personal_brevity=(.5 + brevity * (1 - len(words) / 24) / 2) if personal else None,
         applicability=_clamp(applicability) if applicability is not None else None,
         context_relevance=_clamp(context_relevance),
         source_confidence=candidate.source_confidence,
@@ -870,6 +1034,23 @@ def extract_features(
     )
 
 
+def _marked_order(candidate) -> float:
+    """How far a personal subject (я/ты/мы/вы) is moved behind its predicate (0 = neutral order)."""
+    order = tuple(candidate.metadata.get("role_order", ()))
+    if "subject" not in order or "predicate" not in order or (
+            order.index("subject") < order.index("predicate")):
+        return 0.0
+    parsed = analyze_structured_utterance(candidate.text)
+    personal = any(parsed.tokens[i].lemma in {"я", "ты", "мы", "вы"}
+                   for c in parsed.clauses for i in c.subject_indices)
+    return order.index("subject") / max(1, len(order) - 1) if personal else 0.0
+
+
+def _neutral_siblings(scored) -> set:
+    """Plans that were also worded in the neutral order: their marked variants are not needed."""
+    return {s.candidate.metadata.get("message_plan_key") for s in scored if s.marked_order == 0}
+
+
 def _answer_status(
     candidate: ResponseCandidate,
     features: CandidateFeatures,
@@ -882,6 +1063,8 @@ def _answer_status(
         or metadata.get("semantic_recovery") is True
     ):
         return "recovery"
+    if metadata.get("epistemic_status") == "fantasy" and metadata.get("locally_composed"):
+        return "fantasy_answer"  # play is never a dialogue act, a grounded answer or a hypothesis
     if _dialogue_binding(candidate, prompt) > 0.0:
         return "dialogue_response"
     composed = bool(
@@ -920,7 +1103,9 @@ def _answer_status(
         and not metadata.get("response_signal_mismatch")
         and metadata.get("semantic_scaffold") is not True
     ):
-        return "grounded_answer"
+        return ("hypothesis_answer" if (metadata.get("sleep_hypothesis_id") or
+                                        metadata.get("supposition_licensed")) and
+                metadata.get("epistemic_status") == "hypothesis" else "grounded_answer")
     return "candidate"
 
 
@@ -931,7 +1116,11 @@ def _dialogue_binding(candidate: ResponseCandidate, prompt: str) -> float:
     checks apply to new plans and new predicates. Questions requesting facts
     still require answer evidence rather than conversational appropriateness.
     """
+    from debilgi.language.dialogue_learning import observed_reaction_binding
+
     metadata = candidate.metadata
+    if binding := observed_reaction_binding(prompt, candidate.text, metadata):
+        return binding
     plan = metadata.get("message_plan")
     if (
         not isinstance(plan, Mapping)
@@ -968,8 +1157,15 @@ def _question_response_rejection(
     if not candidate.text.rstrip().endswith("?"):
         return None
     response_move = candidate.metadata.get("response_move")
+    from debilgi.language.dialogue_learning import observed_reaction_binding
+
+    if observed_reaction_binding(
+        str(candidate.metadata.get("focused_request", "")), candidate.text, candidate.metadata,
+    ):
+        return None
     genuine_clarification = bool(
         candidate.metadata.get("genuine_clarification")
+        or candidate.metadata.get("curiosity_licensed")
         or candidate.metadata.get("unresolved_reference")
         or response_move in {
             "clarify_reference",
@@ -1016,6 +1212,13 @@ def _overlap(left: set[str], right: set[str]) -> float:
     if not left or not right:
         return 0.0
     return len(left & right) / max(1, len(left | right))
+
+
+def _lexical_tie(item) -> tuple:
+    """With a boredom reading the final tie is alphabetical (first wording wins), never a draw."""
+    if not isinstance(item.candidate.metadata.get("boredom"), Mapping):
+        return ()
+    return tuple(-ord(ch) for ch in item.candidate.text)
 
 
 def _stable_number(value: str) -> int:

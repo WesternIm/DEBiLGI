@@ -196,27 +196,6 @@ SCENES: tuple[LanguageScene, ...] = (
         ),
     ),
     LanguageScene(
-        "character_markov_role",
-        ("character_markov", "word_boundaries", "backoff", "meaning_separation"),
-        _turns(
-            ("human", "Для чего нужна буквенная Марковская модель?"),
-            (
-                "bot",
-                "Она изучает допустимую структуру отдельных слов и оценивает редкие новые формы.",
-            ),
-            ("human", "Она обучается на склеенной строке сообщения?"),
-            (
-                "bot",
-                "Нет. Каждое слово имеет отдельные границы начала и конца, поэтому соседние слова не слипаются.",
-            ),
-            ("human", "Она решает, что ты хочешь сказать?"),
-            (
-                "bot",
-                "Нет. Буквенная модель работает только с формой слова и не является источником мысли.",
-            ),
-        ),
-    ),
-    LanguageScene(
         "neologism_creation",
         ("neologism_reason", "rarity", "dictionary_check", "quarantine"),
         _turns(
