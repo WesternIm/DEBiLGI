@@ -509,6 +509,7 @@ class ResponseArbitrator:
         structural_weights: Mapping[str, float] | None = None,
         used_fallback: bool = False,
         clarifiable_terms: tuple[str, ...] | None = None,
+        waive_floor: str | None = None,
     ) -> ArbitrationDecision:
         unique = self._deduplicate(candidates)
         proposals = {candidate.proposal.proposal_id: candidate.proposal for candidate in unique}
@@ -541,11 +542,21 @@ class ResponseArbitrator:
         )
         eligible = tuple(item for item in scores if item.eligible)
         admitted = tuple(item for item in eligible if item.admission_score >= self.minimum_score)
+        if waive_floor and not admitted:
+            # Inner failure of a turn that is not an attack (4.44): the floor ranks several
+            # answers, it does not turn the only honest ones into silence. The second pass of
+            # a failure («repair») competes with nothing but the silence the failure would have
+            # caused; otherwise only the honest limit is let through (learned wording feedback
+            # still ranks the eligible ones).
+            admitted = eligible if waive_floor == "repair" else tuple(
+                item for item in eligible
+                if item.candidate.metadata.get("communicative_status") == "express_limit")
         sleep_trial = any(s.candidate.metadata.get("reader_checked")
                           and (s.candidate.metadata.get("sleep_hypothesis_id")
                                and (s.candidate.metadata.get("sleep_opinion") or
                                     s.candidate.metadata.get("repair_unbound_reference"))
                                or s.candidate.metadata.get("supposition_licensed")
+                               or s.candidate.metadata.get("opinion_licensed")
                                or s.candidate.metadata.get("curiosity_licensed")
                                or s.candidate.metadata.get("fantasy_licensed"))
                           for s in admitted)
@@ -562,6 +573,7 @@ class ResponseArbitrator:
                     item.candidate.metadata.get("communicative_status") != "express_limit" or
                     item.candidate.metadata.get("repair_unbound_reference", False) or
                     item.candidate.metadata.get("supposition_licensed", False) or
+                    item.candidate.metadata.get("opinion_licensed", False) or
                     item.candidate.metadata.get("curiosity_licensed", False)),
                 int(not item.spent),
                 # The clause skeleton the agent has just used loses to any admitted

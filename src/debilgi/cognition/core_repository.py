@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections import OrderedDict
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -381,6 +382,25 @@ class CognitiveRepository:
                 result = result_item
         assert result is not None
         return result
+
+    async def record_bot_action_response(
+        self, guild_id: int, user_id: int, sample: float, rate: float
+    ) -> EntityModel | None:
+        """How this person answers the agent's actions (4.42, flag only): the moving average of
+        the sign of their reactions to the agent's moves, 0 cold, 0.5 neutral, 1 warm. The model
+        of the person is the only place it lives (the cache is kept in step)."""
+        old = await self.entity_model(guild_id, EntityType.USER, user_id)
+        if old is None:
+            return None
+        value = _ema(old.bot_action_response, sample, rate)
+        await self._database.execute(
+            """UPDATE cognition_entity_models SET bot_action_response = ?
+               WHERE guild_id = ? AND entity_type = ? AND entity_id = ?""",
+            (value, guild_id, EntityType.USER.value, user_id),
+        )
+        model = replace(old, bot_action_response=value)
+        self._cache_model(model)
+        return model
 
     async def entity_model(
         self, guild_id: int, entity_type: EntityType, entity_id: int

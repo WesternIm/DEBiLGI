@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import math
 import re
 from collections import OrderedDict
 from collections.abc import Iterable
@@ -158,6 +160,15 @@ def elided_subject(proposal):
     return replace(proposal, plan=replace(proposal.plan, claim=replace(
         claim, dependencies=dependencies)))
 
+class _InnerFailure:
+    """The first pass failed inside (4.40): the reason, for the repair pass."""
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
 class SafeMentionReplyService:
     def __init__(
         self,
@@ -206,6 +217,7 @@ class SafeMentionReplyService:
         self._experience_consolidator = experience_consolidator
         self._meaning_intents = meaning_intents
         self._interlocutor_withhold_reasons: OrderedDict[str, str] = OrderedDict()
+        self._held_steps: dict[str, list[dict]] = {}
         self._affect = affect
         self._dialogue_tasks = dialogue_tasks
         self._initiative_policy = initiative_policy
@@ -260,6 +272,11 @@ class SafeMentionReplyService:
         details: dict[str, object] | None = None,
     ) -> None:
         if self._response_traces is None:
+            return
+        held = self._held_steps.get(event_id)
+        if held is not None:
+            held.append(dict(event_id=event_id, stage=stage, component=component, status=status,
+                             summary=summary, details=details))
             return
         await self._response_traces.step(
             event_id,
@@ -1048,7 +1065,46 @@ class SafeMentionReplyService:
     async def _generate_canonical_reply(
         self, event: Event, utterance, *, remember: bool = True
     ) -> str:
-        """One local evidence path; no fallback to act-specific semantic scripts."""
+        """One local evidence path; no fallback to act-specific semantic scripts.
+
+        With the flag (4.40) an inner failure of the first pass (no observed social form, an
+        unrealizable plan) is not the end: a second pass offers only a question about what was
+        not understood. The trace keeps one decision per event: the steps of a first pass that
+        is repeated are not written.
+        """
+        from debilgi.config import thought_content_enabled
+
+        if not thought_content_enabled():
+            return await self._canonical_pass(event, utterance, remember=remember)
+        held = self._held_steps[event.event_id] = []
+        try:
+            result = await self._canonical_pass(event, utterance, remember=remember,
+                                                may_repair=True)
+        except BaseException:
+            self._held_steps.pop(event.event_id, None)
+            await self._flush_steps(held)
+            raise
+        self._held_steps.pop(event.event_id, None)
+        if isinstance(result, _InnerFailure):
+            return await self._canonical_pass(event, utterance, remember=remember,
+                                              repair=result.reason)
+        await self._flush_steps(held)
+        return result
+
+    async def _repair_possible(self, event, context, failure, irritation, boredom, allowed) -> bool:
+        learning = self._semantic_assimilation.dialogue_learning
+        return bool(await learning.repair_plans(
+            event, context, failure, allowed=allowed, irritation=irritation, boredom=boredom))
+
+    async def _flush_steps(self, held: list) -> None:
+        for step in held:
+            await self._trace_step(**step)
+
+    async def _canonical_pass(
+        self, event: Event, utterance, *, remember: bool = True, repair: str | None = None,
+        may_repair: bool = False,
+    ) -> str:
+        """One pass of the evidence path (see ``_generate_canonical_reply``)."""
         started = perf_counter()
         context = utterance.context
         if self._semantic_assimilation is not None:
@@ -1160,6 +1216,14 @@ class SafeMentionReplyService:
                 )
             ):
                 planning = replace(planning, proposals=held_position)
+            elif (opined := await self._opinion_plans(event, context, planning)):
+                # A view of its own (4.45) next to the honest limit, which stays if it loses —
+                # but not once the stance is held: it has said what it thinks, "I do not know"
+                # would be untrue.
+                held_view = any(json.loads(dict(p.plan.hypothesis).get("basis") or "{}").get("held")
+                                for p in opined)
+                planning = replace(planning, proposals=opined if held_view
+                                   else (*opined, *planning.proposals))
             elif supposed := await (
                 self._semantic_assimilation.dialogue_learning.supposition_plans(
                     event, context, planning
@@ -1240,7 +1304,8 @@ class SafeMentionReplyService:
                     hostile=hostile,
                 )
             recent_reactions = await learning.recent_reactions(event)
-            recent_surfaces = await learning.recent_reactions(event, minutes=60)
+            recent_surfaces = await learning.recent_reactions(
+                event, minutes=60, include_repairs=True)
         hypothesis_allowed = (
             await learning.hypothesis_allowed(event)
             if self._semantic_assimilation is not None
@@ -1256,6 +1321,13 @@ class SafeMentionReplyService:
             and context.turn_form.addressed
             and (accepting_report or reactive_act(context.prompt) == "acknowledgment")
         )
+        if boredom is not None and any(
+                p.operation == "ask_unbound_variable" for p in planning.proposals) and not (
+                partner_repair_allowed and await learning.repair_rate_ok(event, boredom)):
+            # The question about the unbound variable is a repair too (4.40): it obeys the same
+            # budget (not twice in a row) and the same rate (not above people's own).
+            planning = replace(planning, proposals=tuple(
+                p for p in planning.proposals if p.operation != "ask_unbound_variable"))
         # Curiosity (4.38, flag only): a question about the unknown topic competes with the limit.
         curious = (
             await self._semantic_assimilation.dialogue_learning.curiosity_plans(
@@ -1296,6 +1368,29 @@ class SafeMentionReplyService:
                 rule_id=None, allow_hook_question=False, known_slots=(), hypothesis=(),
                 compatible_supports=(),
             )
+        if repair is not None and self._semantic_assimilation is not None:
+            repairs = await learning.repair_plans(
+                event, context, repair, allowed=partner_repair_allowed,
+                irritation=irritation, boredom=boredom)
+            if repairs:
+                mode_decision = replace(
+                    mode_decision, mode="answer", act="clarify_variable",
+                    reason="repair_of_failure", confidence_level="answer", target_meaning=None,
+                    rule_id=None, allow_hook_question=False, known_slots=(), hypothesis=(),
+                    compatible_supports=())
+                planning = replace(planning, proposals=repairs)
+                curious = ()
+        if repair is None and self._semantic_assimilation is not None:
+            received = await learning.reception_plans(event, context, irritation=irritation)
+            if received:
+                # The reply to the agent's own question is received (4.44), not a new topic.
+                mode_decision = replace(
+                    mode_decision, mode="answer", act="acknowledge_report",
+                    reason="report_received", confidence_level="answer", target_meaning=None,
+                    rule_id=None, allow_hook_question=False, known_slots=(), hypothesis=(),
+                    compatible_supports=())
+                planning = replace(planning, proposals=received)
+                curious = ()
         if not mode_decision.input_features:
             from debilgi.language.dialogue_learning import turn_features
 
@@ -1312,13 +1407,16 @@ class SafeMentionReplyService:
         proposals = tuple(
             p
             for p in planning.proposals
-            if p.plan.claim.clause_kind != "question" or p.operation == "ask_unbound_variable"
+            if p.plan.claim.clause_kind != "question"
+            or p.operation in {"ask_unbound_variable", "repair"}
         )
         if mode_decision.mode in {"free_form", "clarification"}:
             act_plan = response_act_plan(context, mode_decision, observed_forms)
             proposals = (act_plan,) if act_plan is not None else ()
         elif mode_decision.mode == "silence_or_unknown":
             limit = knowledge_limit_plan(context) if mode_decision.act == "express_limit" else None
+            if limit is not None and self._semantic_assimilation is not None:
+                limit = await learning.remember_position(event, context, limit)  # (4.44)
             proposals = (limit,) if limit else ()
             if limit and curious:
                 proposals = (*proposals, *curious)
@@ -1384,6 +1482,34 @@ class SafeMentionReplyService:
                     checked_surfaces[proposal.plan.key] = surfaces
                     plan_decisions[proposal.plan.key] = option
             proposals = tuple(plans)
+            if boredom is not None and proposals and self._meaning_intents is not None:
+                # What this person pressed again after this operation (4.41) meets alternatives:
+                # the honest limit about the very request, else a question about it (4.40).
+                left_open = await self._meaning_intents.unclosed_by_operation(
+                    event, planning.objective)
+                # ... and what this person is predicted to meet with laughter, hostility or
+                # rejection (4.42: the person's own tested reactions, never another person's)
+                from debilgi.experience.meaning_intents import move_type
+
+                unwelcome = await self._meaning_intents.unwelcome_by_operation(event)
+                if any(p.operation in left_open
+                       or move_type(p.operation, dict(p.plan.hypothesis).get("kind")) in unwelcome
+                       for p in proposals):
+                    extra = knowledge_limit_plan(context)
+                    if extra is None and self._semantic_assimilation is not None:
+                        extra = next(iter(await learning.repair_plans(
+                            event, context, "demand_left_open", allowed=partner_repair_allowed,
+                            irritation=irritation, boredom=boredom)), None)
+                    if extra is not None and extra.plan.knowledge_limit is not None and not (
+                            context.word_relations or context.dependency_patterns
+                            or context.corpus_utterances):
+                        extra = None  # (a limit with no observed wording would fail to be said)
+                    if extra is not None and extra.plan.key not in {p.plan.key for p in proposals}:
+                        surfaces = composer.compose(
+                            extra.plan, (*extra.patterns, *context.dependency_patterns))
+                        if surfaces:
+                            proposals = (*proposals, extra)
+                            checked_surfaces[extra.plan.key] = surfaces
         recent_reply_texts = tuple((t for t, _, _ in recent_surfaces))
         if not recent_reply_texts:
             recent_reply_texts = await self._recent_self_replies(event)
@@ -1391,7 +1517,7 @@ class SafeMentionReplyService:
         if len(sole_limit) == 1 and all(
             p.plan.knowledge_limit is not None
             or dict(p.plan.hypothesis).get("kind") == "fantasy"
-            or p.operation == "curiosity"
+            or p.operation in {"curiosity", "opinion"}
             for p in proposals
         ):
             from debilgi.language.dialogue_learning import response_repetition
@@ -1407,7 +1533,8 @@ class SafeMentionReplyService:
             # The same words, or the same clause skeleton, as a recent reply: other forms of
             # not knowing compete (the compact limit; the limit with the person carried by
             # the verb, when people of this server are seen to say it so).
-            playing = any(dict(p.plan.hypothesis).get("kind") == "fantasy" for p in proposals)
+            playing = any(dict(p.plan.hypothesis).get("kind") == "fantasy" or p.operation
+                          == "opinion" for p in proposals)
             if surfaces and (playing or any(
                 response_repetition(s.text, recent_reply_texts) > 0
                 or construction_repetition(s.text, recent_reply_texts) >= 0.25
@@ -1510,6 +1637,10 @@ class SafeMentionReplyService:
             if curious and selection is not None and selection.proposal.operation != "curiosity":
                 # The policy kept the limit: the inquiry did not win the drives, it is not offered.
                 proposals = tuple(p for p in proposals if p.operation != "curiosity")
+            if selection is not None and selection.proposal.operation != "opinion":
+                # (4.45) the policy, with what this person is predicted to do to a view of its own
+                # (H) and who they are for the agent (P), kept another move: no view is offered.
+                proposals = tuple(p for p in proposals if p.operation != "opinion")
             if selection is not None:
                 mode_decision = plan_decisions.get(selection.proposal.plan.key, mode_decision)
                 is_question = selection.proposal.plan.claim.clause_kind == "question"
@@ -1722,12 +1853,12 @@ class SafeMentionReplyService:
                                     proposal_decision.expected_information_gain
                                 ),
                                 "genuine_clarification": mode_decision.mode == "clarification"
-                                or proposal.operation == "ask_unbound_variable",
+                                or proposal.operation in {"ask_unbound_variable", "repair"},
                                 "response_move": proposal_decision.act,
                                 "epistemic_query": proposal.plan.knowledge_limit,
                                 "unresolved_requirement": "explain_reason"
                                 if proposal.operation
-                                in {"ask_unbound_variable", "bind_delivered_variable"}
+                                in {"ask_unbound_variable", "bind_delivered_variable", "repair"}
                                 else "review_prior_claim"
                                 if proposal.operation == "verify_reported_position"
                                 and not proposal.premises
@@ -1741,8 +1872,16 @@ class SafeMentionReplyService:
                                 # hypothesis, never a fact of the agent or of a person.
                                 "supposition_licensed": proposal.operation == "supposition"
                                 and not is_fantasy,
+                                # A view of its own (4.45): a stance of the agent, never a claim,
+                                # a fact or a hypothesis of the world; its ground goes to basis.
+                                "opinion_licensed": proposal.operation == "opinion",
+                                "opinion": json.loads(dict(proposal.plan.hypothesis).get(
+                                    "basis") or "null") if proposal.operation == "opinion"
+                                else None,
                                 # A question about the unknown topic: never a claim of anyone.
                                 "curiosity_licensed": proposal.operation == "curiosity",
+                                "repair_licensed": proposal.operation == "repair",
+                                "report_licensed": proposal.operation == "acknowledge_report",
                                 "curiosity_target": proposal.premises[0].text
                                 if proposal.operation == "curiosity" and proposal.premises
                                 else None,
@@ -1754,7 +1893,8 @@ class SafeMentionReplyService:
                                 "epistemic_status": "fantasy"
                                 if is_fantasy
                                 else "hypothesis"
-                                if proposal.operation == "supposition" else None,
+                                if proposal.operation == "supposition"
+                                else "opinion" if proposal.operation == "opinion" else None,
                                 "obligation_fit": sum(
                                     (
                                         (role, lemma)
@@ -1900,6 +2040,8 @@ class SafeMentionReplyService:
             if self._arbitration_repository is not None
             else {}
         )
+        from debilgi.config import thought_content_enabled
+
         select = (
             self._arbitrator.decide_answer_domain
             if context.response_options
@@ -1915,6 +2057,10 @@ class SafeMentionReplyService:
             recent_replies=recent_replies,
             profile=profile,
             structural_weights=structural_weights,
+            **({"waive_floor": "repair" if repair is not None else "limit"}
+               if thought_content_enabled() and not hostile and not (
+                   irritation is not None and irritation.value > irritation.sensitivity)
+               else {}),
         )
         if decision.winner is not None and selection is not None:
             key = decision.winner.metadata.get("intention_plan_key")
@@ -1928,7 +2074,8 @@ class SafeMentionReplyService:
                     pattern_id=decision.winner.metadata.get("exchange_pattern_id"),
                     basis=delivered_basis(
                         final_proposal.premises, decision.winner.metadata
-                    ) if decision.winner.metadata.get("fantasy") else None,
+                    ) if (decision.winner.metadata.get("fantasy")
+                          or decision.winner.metadata.get("opinion_licensed")) else None,
                 )
             elif (
                 decision.winner.metadata.get("sleep_hypothesis_id")
@@ -1964,13 +2111,20 @@ class SafeMentionReplyService:
             details={"decision": mode_decision, "deliberation": deliberation},
         )
         if decision.winner is None:
-            self._interlocutor_withhold_reasons[event.event_id] = (
+            failure = (
                 mode_decision.reason
                 if mode_decision.act == "withhold"
                 else "no_observed_social_form"
                 if mode_decision.mode == "free_form"
                 else "unrealizable_selected_plan"
             )
+            if (may_repair and boredom is not None and self._semantic_assimilation is not None
+                    and failure in {"no_observed_social_form", "unrealizable_selected_plan"}
+                    and await self._repair_possible(event, context, failure, irritation,
+                                                    boredom, partner_repair_allowed)):
+                # An inner failure is not a decision to be silent: ask what was not understood.
+                return _InnerFailure(failure)
+            self._interlocutor_withhold_reasons[event.event_id] = failure
         decision = replace(decision, latency_ms=(perf_counter() - started) * 1000.0)
         await self._trace_step(
             event.event_id,
@@ -2029,8 +2183,12 @@ class SafeMentionReplyService:
             else frozenset())
         report = proposal.operation == "verify_reported_position" and any(
             p.kind == "sent_turn" for p in proposal.premises)
+        # A repair question said again in the same words to the same person is spent as a
+        # limit is (4.40): the third time within the journal's memory is no longer asked.
+        asked_again = proposal.operation == "repair" and reading.surface >= (
+            1.0 - math.exp(-ledger.sensitivity * TIRED_REPEATS))
         spent = (limit is not None and reading.repeats >= TIRED_REPEATS) or (
-            report and reading.same_plan > 0)
+            report and reading.same_plan > 0) or asked_again
         return {**reading.as_data(), "spent": spent}
 
     @staticmethod
@@ -2049,6 +2207,20 @@ class SafeMentionReplyService:
         row = said[0]
         return (delivered_report_plan(reader_goal(context.structure), {
             "receipt_id": row.receipt_id, "text": row.text}),)
+
+    async def _opinion_plans(self, event: Event, context, planning) -> tuple:
+        """A view of the agent's own on what is asked (4.45, flag only): its ground S and the
+        kind of move it is (H, P) are read by `MeaningIntentRepository`; the plan by learning."""
+        from debilgi.config import thought_content_enabled
+
+        if (not thought_content_enabled() or self._meaning_intents is None
+                or self._semantic_assimilation is None):
+            return ()
+        irritation = (await self._meaning_intents.irritation(event, context.prompt)
+                      if context.turn_form is not None and context.turn_form.addressed else None)
+        return await self._semantic_assimilation.dialogue_learning.opinion_plans(
+            event, context, planning, sympathy=self._meaning_intents.sympathy,
+            irritation=irritation)
 
     async def _recent_self_replies(self, event: Event) -> tuple[str, ...]:
         if event.channel_id is None:

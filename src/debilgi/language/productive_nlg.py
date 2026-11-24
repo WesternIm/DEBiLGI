@@ -526,6 +526,12 @@ def _close_sentence(thought: ClauseThought, body: str) -> str:
     return body[:1].upper() + body[1:] + punctuation if body else ""
 
 
+def _thought_content() -> bool:
+    from debilgi.config import thought_content_enabled
+
+    return thought_content_enabled()
+
+
 def _realize_thought_deterministic(
     thought: ClauseThought,
     patterns: tuple[DependencyPattern, ...] = (),
@@ -561,7 +567,8 @@ def _realize_thought_deterministic(
         return ()
     predicate_roles = set(role_values)
     if (
-        thought.predicate.lemma in {"мочь", "уметь", "хотеть"}
+        (thought.predicate.lemma in {"мочь", "уметь", "хотеть"}
+         or thought.predicate_class == "modal" and _thought_content())
         and "action_complement" in predicate_roles
     ):
         # Arguments of the embedded action aren't arguments of the modal.
@@ -1055,6 +1062,13 @@ def _inferred_head_features(head: ConceptLexeme) -> dict[str, str]:
     if reading is not None:
         inferred.update(reading.features())
     inferred.update(dict(head.features))
+    if head.lemma == "я" and not inferred.get("gender") and _thought_content():
+        # (4.42, flag only) the agent speaks of itself in the gender of its own character (the
+        # owner's decision, the one recorded for the grammarian): never in the gender that an
+        # ambiguous reading of the adjective («тупой» is also feminine genitive) would lend
+        from debilgi.language.grammarian import self_gender
+
+        inferred["gender"] = self_gender()
     if inferred.get("number") == "plural":
         inferred.pop("gender", None)
     return inferred

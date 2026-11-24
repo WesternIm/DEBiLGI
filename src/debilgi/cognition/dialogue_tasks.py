@@ -250,6 +250,7 @@ class DialogueSituation:
     open_tasks: tuple[DialogueTask, ...]
     revision: int
     updated_at: datetime
+    pressed: float = 0.0  # (4.41, flag only) how hard the open demand is held: decayed pressings
 
     @property
     def features(self) -> tuple[tuple[str, float], ...]:
@@ -257,6 +258,7 @@ class DialogueSituation:
         if task is None:
             return ()
         return (
+            *((("task_pressed", min(1.0, self.pressed)),) if self.pressed else ()),
             ("task_priority", task.priority),
             ("task_confidence", task.confidence),
             ("task_recurrence", min(1.0, task.recurrence_count / 4.0)),
@@ -596,11 +598,20 @@ def evaluate_task_progress(
         metadata.get("genuine_clarification")
         or metadata.get("unresolved_reference")
         or metadata.get("curiosity_licensed")
+        or metadata.get("repair_licensed")
         or metadata.get("response_move") in {"clarify_reference", "request_required_argument"}
     )
     if (metadata.get("ambiguous_slot") and len(metadata.get("alternatives", ())) >= 2
             and metadata.get("expected_information_gain", 0) > 0 and genuine_clarification):
         return TaskProgress(0.96, ("specific_ambiguity_requests_discriminating_information",))
+    if metadata.get("derivation") == "acknowledge_report" and metadata.get("report_licensed"):
+        # The reply to the agent's own question is received (4.44): the point it raised is closed
+        # the way a misunderstanding asked about is, by carrying the dialogue on.
+        return TaskProgress(0.58, ("report_received",))
+    if metadata.get("derivation") == "repair" and metadata.get("repair_licensed"):
+        # What was not understood is asked about (4.40), whatever the open task: the question
+        # carries the dialogue on as a clarification does; it is no answer and no claim.
+        return TaskProgress(0.58, ("misunderstanding_asked",))
     if (genuine_clarification and metadata.get("meaning_origin") == "interlocutor_repair"
             and metadata.get("corpus_source_event_ids")
             and metadata.get("focus_from_current_turn")
@@ -766,11 +777,20 @@ def evaluate_task_progress(
                 and metadata.get("communicative_status") == "express_limit"):
             score = max(score, 0.96)
             reasons.append("typed_knowledge_limit_for_current_query")
-        if (metadata.get("derivation") == "supposition" and grounded
+        if (metadata.get("derivation") in {"supposition", "opinion"} and grounded
                 and metadata.get("epistemic_status") != "fantasy"):
-            # A marked supposition on the agent's own record answers the open question.
+            # A marked supposition on the agent's own record (or a view of its own, 4.45)
+            # answers the open question.
             score = max(score, 0.9)
             reasons.append("supposition_offered")
+        from debilgi.config import thought_content_enabled
+
+        if (metadata.get("derivation") == "explain_delivered_basis" and grounded and answered_slot
+                and thought_content_enabled()):
+            # (4.46, flag only) «а почему ты так думаешь?» keeps the verb of the delivered turn as
+            # its focus: the reason the agent really had still answers the open question
+            score = max(score, 0.96)
+            reasons.append("own_basis_given_for_why")
         if metadata.get("derivation") == "curiosity" and metadata.get("curiosity_licensed"):
             # Not knowing the topic of the question, the agent asks about that very topic: the
             # inquiry carries the dialogue on (as a clarification does), it is no answer.
@@ -864,9 +884,10 @@ def evaluate_task_progress(
         # The asked reason is the premise the agent really had, with its evidence.
         score = max(score, 0.96)
         reasons.append("own_basis_given_for_why")
-    if (metadata.get("derivation") == "supposition" and grounded
+    if (metadata.get("derivation") in {"supposition", "opinion"} and grounded
             and metadata.get("epistemic_status") != "fantasy"):
-        # A marked supposition on the agent's own record answers a request for one.
+        # A marked supposition on the agent's own record (or a view of its own, 4.45)
+        # answers a request for one.
         score = max(score, 0.9)
         reasons.append("supposition_offered")
     if metadata.get("derivation") == "verify_reported_position":
@@ -1044,6 +1065,27 @@ class DialogueTaskRepository:
                     )
                 if draft.goal == "repair_shared_model":
                     parent_task_id = str(prior["task_id"])
+                if assessment == "failed" and thought_content_enabled():
+                    # The demand was pressed again (the same request, «почему», «какое»): it is
+                    # not closed. It is held by the turn it started from, whatever tasks the
+                    # pressings spawned, and stays open (4.41).
+                    root = str(prior["task_id"])
+                    for _ in range(8):
+                        parent = await (await connection.execute(
+                            "SELECT parent_task_id FROM dialogue_tasks WHERE task_id = ?",
+                            (root,))).fetchone()
+                        if parent is None or not parent["parent_task_id"]:
+                            break
+                        root = str(parent["parent_task_id"])
+                    await connection.execute(
+                        "INSERT OR IGNORE INTO dialogue_task_events (task_id, event_id, relation,"
+                        " observation_json, observed_at) VALUES (?, ?, 'pressed', ?, ?)",
+                        (root, event.event_id,
+                         _json({"after_task": str(prior["task_id"]),
+                                "attempt": str(prior["attempt_id"])}), now.isoformat()))
+                    await connection.execute(
+                        "UPDATE dialogue_tasks SET status = 'open', updated_at = ?"
+                        " WHERE task_id = ? AND status != 'open'", (now.isoformat(), root))
 
             row = await (
                 await connection.execute(
@@ -1338,6 +1380,12 @@ class DialogueTaskRepository:
         active = next((task for task in tasks if task.task_id == active_id), None)
         if active is None and active_id:
             active = await self.task(active_id)
+        pressed = 0.0
+        from debilgi.config import thought_content_enabled
+
+        if active is not None and thought_content_enabled():
+            pressed = await self._pressed_weight(active, datetime.fromisoformat(
+                str(state["updated_at"])))
         return DialogueSituation(
             guild_id,
             channel_id,
@@ -1346,7 +1394,26 @@ class DialogueTaskRepository:
             tasks,
             int(state["revision"]),
             datetime.fromisoformat(str(state["updated_at"])),
+            pressed,
         )
+
+    async def _pressed_weight(self, task: DialogueTask, now: datetime) -> float:
+        """Pressings of the demand this task descends from, each 2^(-age/T_R) (R's horizon)."""
+        from debilgi.cognition.affect import IRRITATION_HALF_LIFE
+
+        root = task.task_id
+        for _ in range(8):
+            row = await self._database.fetchone(
+                "SELECT parent_task_id FROM dialogue_tasks WHERE task_id = ?", (root,))
+            if row is None or not row["parent_task_id"]:
+                break
+            root = str(row["parent_task_id"])
+        rows = await self._database.fetchall(
+            "SELECT observed_at FROM dialogue_task_events "
+            "WHERE task_id = ? AND relation = 'pressed'",
+            (root,))
+        return sum(0.5 ** (max(0.0, (now - datetime.fromisoformat(str(r["observed_at"])))
+                               .total_seconds()) / IRRITATION_HALF_LIFE) for r in rows)
 
 
 def _main_clause(structure: StructuredUtterance):

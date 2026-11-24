@@ -191,6 +191,7 @@ def parse_proposition(
     tree: bool = False,
     evaluation: bool = False,
     definition: bool = False,
+    action_object: bool = False,
 ) -> ClauseThought | None:
     """Parse a complete simple proposition, including zero copula and modality.
 
@@ -323,9 +324,14 @@ def parse_proposition(
         if any(t.lemma != "быть" for t in infinitives):
             return None
         used.update(t.index for t in infinitives)
-    elif predicate_class == "modal":
+    elif predicate_class == "modal" or (
+        # (4.41, opt-in, flag only) the object of a question retold by the agent is kept:
+        # «ты любишь спать?» asks about «спать», whatever the verb that governs the infinitive
+        action_object and marker_free and predicate is not None and len(infinitives) == 1
+    ):
         if len(infinitives) != 1:
             return None
+        predicate_class = "modal"
         action = infinitives[0]
         dependencies.append(
             SemanticDependency(

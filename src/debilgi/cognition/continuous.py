@@ -604,6 +604,8 @@ class ContinuousCognitionService:
             await self.rhythm_once()
             if not self.sleeping:
                 return 0
+            await self.review_person_hypotheses()
+            await self.consolidate_chat_norms()
             produced = 0
             unit = None
             try:
@@ -1175,6 +1177,34 @@ class ContinuousCognitionService:
             return "premise" if same else None  # an opposite-sign question may be a challenge
         return "supports" if same else "contradicts"
 
+    async def consolidate_chat_norms(self) -> int:
+        """Night, by server (4.43, flag only): the norms of the chat (what is register and what an
+        attack, what the chat laughs at, what it answers with hostility) are recounted from the
+        reactions of ≥2 different people. Norms are hypotheses; they are per server and hold no
+        names. Seed and corpus exchanges do not count: C starts empty."""
+        from debilgi.cognition.chat_norms import consolidate
+        from debilgi.config import thought_content_enabled
+
+        if not thought_content_enabled():
+            return 0
+        guilds = await self._database.fetchall(
+            "SELECT DISTINCT guild_id FROM language_observed_exchanges ORDER BY guild_id")
+        return sum([await consolidate(self._database, row[0], self._now()) for row in guilds])
+
+    async def review_person_hypotheses(self) -> int:
+        """Night, by person (4.42, flag only): the trust of every hypothesis about a person is
+        recounted from its own evidence at the night's clock — what was not confirmed for days
+        fades. A hypothesis stays a hypothesis: no status here makes it a fact or a claim."""
+        from debilgi.config import thought_content_enabled
+        from debilgi.experience.meaning_intents import reweigh_person
+
+        if not thought_content_enabled():
+            return 0
+        rows = await self._database.fetchall(
+            "SELECT hypothesis_id FROM continuous_cognition_hypotheses "
+            "WHERE signature LIKE 'person:%' AND status != 'rejected' ORDER BY subject_key")
+        return await reweigh_person(self._database, [r[0] for r in rows], self._now())
+
     async def observe_sleep_feedback(self, event: Event) -> int:
         from debilgi.experience.feedback import DEFAULT_FEEDBACK_ATTRIBUTOR
 
@@ -1511,6 +1541,7 @@ class ContinuousCognitionService:
                       confidence, status
                FROM continuous_cognition_hypotheses
                WHERE guild_id = ? AND status != 'rejected' AND signature NOT LIKE 'response:%'
+                 AND signature NOT LIKE 'person:%' AND signature NOT LIKE 'chat:%'
                ORDER BY
                    CASE status WHEN 'retained' THEN 0 ELSE 1 END,
                    confidence DESC, last_reviewed_at DESC

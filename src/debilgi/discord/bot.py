@@ -199,7 +199,8 @@ class DebilgiBot(commands.Bot):
             self.affect_repository, self.social_reaction_repository
         )
         self.experience_repository = ExperienceRepository(database)
-        self.meaning_intents = MeaningIntentRepository(database)
+        self.meaning_intents = MeaningIntentRepository(
+            database, cognition=self.cognitive_repository)
         self.dialogue_tasks = DialogueTaskRepository(database)
         self.self_dataset = SelfDatasetRepository(database)
         self.arbitration_repository = ArbitrationRepository(

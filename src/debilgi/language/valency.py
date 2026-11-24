@@ -283,7 +283,13 @@ def assess_predicate_valency(
         for slot in profile.slots
         if slot.required_in_isolated_fact and slot.role not in available
     )
-    if normalized == "хотеть" and "action_complement" in available and "direct_object" in missing:
+    from debilgi.config import thought_content_enabled
+
+    # (4.41, flag only) the infinitive of «любить спать» likewise stands for the object
+    infinitive_object = (thought_content_enabled() and "action_complement" in available
+                         and "direct_object" in missing and "action_complement" in present_roles)
+    if (normalized == "хотеть" or infinitive_object) and (
+            "action_complement" in available and "direct_object" in missing):
         # ``Хотеть`` selects either a nominal object (``хочу чай``) or an
         # infinitival action (``хочу побегать``). The infinitive fills the
         # semantic object slot instead of requiring a second accusative noun.
@@ -294,6 +300,7 @@ def assess_predicate_valency(
         role
         for role in ("direct_object", "indirect_object", "action_complement")
         if role in present_roles and role not in expected
+        and not (infinitive_object and role == "action_complement")
     )
     confidence = 0.96 - 0.34 * len(missing) - 0.08 * len(unexpected)
     return ValencyAssessment(

@@ -204,7 +204,8 @@ def knowledge_limit_plan(context: ReplyContext) -> DerivedPlan | None:
     query = result.query
     # The clause is retold by the bot: the interlocutor's possessives turn to the addressee's.
     question = parse_proposition(
-        structure, allow_question=True, possessive_deixis=True, irrealis=True, tree=True
+        structure, allow_question=True, possessive_deixis=True, irrealis=True, tree=True,
+        action_object=True,
     )
     from debilgi.language.canonical_claims import self_query
 
@@ -479,6 +480,7 @@ def decide_response_mode(
                 "explain_delivered_basis",
                 "verify_reported_position",
                 "supposition",
+                "opinion",
             }
         ),
         None,
@@ -835,12 +837,13 @@ def response_self_questions(context, forms=(), proposals=()):
             review = decision.selection_context
             composer = ResponseComposer(context.structure)
             started, previews = perf_counter(), []
-            playing = any(dict(p.plan.hypothesis).get("kind") == "fantasy" for p in proposals)
+            playing = any(dict(p.plan.hypothesis).get("kind") in {"fantasy", "opinion"}
+                          for p in proposals)
             for proposal in proposals:
                 if len(previews) >= 4 or perf_counter() - started >= 1.0:
                     break
                 # (next to a game the honest limit is previewed too, so that it stays viable)
-                if not any(e.kind in {"canonical_claim", "sent_turn", "fantasy_frame"}
+                if not any(e.kind in {"canonical_claim", "sent_turn", "fantasy_frame", "sympathy"}
                            for e in proposal.premises) and not (
                                playing and proposal.plan.knowledge_limit is not None):
                     continue

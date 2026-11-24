@@ -43,6 +43,76 @@ def _letter_cases(text: str) -> tuple[str, str, str]:
     return (text.lower(), text.lower().capitalize(), text.upper())
 
 
+def held_stance(held, current, fresh) -> tuple[str, float, bool]:
+    """(stance, score, revised) of a view (4.45): the held stance stays; it turns only on new
+    experience (`fresh`: S over what happened after the stance was taken) of at least two
+    different people, of the opposite sign and as strong as the ground the stance stood on. One
+    person pressing again is one voice — a demand to be answered (D), not a ground. With no
+    stance held, the sign of S decides (S is not 0 here: no ground, no view)."""
+    if held is None:
+        return ("support" if current.value > 0 else "oppose"), current.value, False
+    opposite = fresh.value != 0 and (fresh.value < 0) == (held.stance == "support")
+    if opposite and fresh.people >= 2 and abs(fresh.value) >= abs(held.score):
+        return ("oppose" if held.stance == "support" else "support"), fresh.value, True
+    return held.stance, held.score, False
+
+
+_PREFERENCE_PREDICATES = frozenset({"любить", "нравиться"})  # the attitude verbs (as 4.20's)
+
+
+def _opinion_reading(asked):
+    """(quality, topic lemma, the statement that would be said) of a question that asks for a
+    view, else None: «любишь/нравится X», «что ты думаешь о X», «X был прав / хорош».
+
+    The topic is a noun that is not the agent or the asker (what the agent is, knows or wants
+    for itself is not a view on the world). The statement keeps the asked clause with the agent
+    in the subject («я люблю X», «X мне нравится», «X был прав»)."""
+    from debilgi.language.semantic_graph import (
+        ClauseThought,
+        ConceptArgument,
+        ConceptLexeme,
+        SemanticDependency,
+    )
+
+    roles = {d.role: d for d in asked.dependencies}
+    lemma = asked.predicate.lemma
+
+    def topic_of(dep):
+        head = dep.argument.head if dep is not None else None
+        ok = (head is not None and head.lemma and head.lemma not in _DEIXIS
+              and head.part_of_speech != "pronoun")
+        return head.lemma if ok else None
+
+    subject = roles.get("subject")
+    if lemma == "любить" and subject is not None and subject.argument.head.lemma == "я":
+        dep = roles.get("direct_object") or roles.get("action_complement")
+        topic = topic_of(dep)
+        return (lemma, topic, asked) if topic else None
+    if lemma == "нравиться" and "indirect_object" in roles and (
+            roles["indirect_object"].argument.head.lemma == "я"):
+        topic = topic_of(subject) or topic_of(roles.get("action_complement"))
+        return (lemma, topic, asked) if topic else None
+    if lemma == "думать" and subject is not None and subject.argument.head.lemma == "я":
+        topic = topic_of(roles.get("topic"))
+        if not topic:
+            return None
+        liked = ClauseThought(
+            ConceptLexeme("нравиться", "нравиться", "verb", (("tense", "present"),)),
+            (SemanticDependency("subject", roles["topic"].argument),
+             SemanticDependency("indirect_object", ConceptArgument(
+                 ConceptLexeme("я", "я", "pronoun", (("number", "singular"), ("person", "first"))),
+                 grammatical_case="dative"))),
+            clause_kind="statement", predicate_class="lexical")
+        return ("нравиться", topic, liked)
+    if lemma == "быть" and subject is not None and subject.argument.head.lemma not in _DEIXIS:
+        topic = topic_of(subject)
+        quality = roles.get("direct_object") or roles.get("predicate_complement")
+        if topic and quality is not None and quality.argument.head.lemma not in {
+                "что", "кто", "такой", "какой"}:
+            return (quality.argument.head.lemma, topic, asked)
+    return None
+
+
 def _plan_topics(plan_json: str) -> frozenset:
     """Subject lemmas of the claim of a stored plan (what a curiosity question was about)."""
     plan = json.loads(plan_json)
@@ -51,6 +121,36 @@ def _plan_topics(plan_json: str) -> frozenset:
         *(((d.get("argument") or {}).get("head") or {}).get("lemma") or ""
           for d in claim.get("dependencies") or () if d.get("role") in {"subject", "topic"}),
         *((plan.get("goal") or {}).get("topics") or ())))
+
+def answered_topics(text: str, plan: dict) -> tuple[str, ...]:
+    """What a reply answers (4.44, flag only): the topics of the question the agent asked that
+    the reply is a statement about. A question back, a closing («понятно»), laughter, or a
+    statement about something else answers nothing. A question without a named topic (the agent
+    asked what was meant) is answered by any statement; it is keyed by its first content lemma.
+    """
+    from debilgi.cognition.affect import strip_mentions
+    from debilgi.language.content import content_lemmas
+
+    text = strip_mentions(text or "")
+    if not text or "?" in text:
+        return ()
+    structure = exchange_analysis(text)[0]
+    if any(c.clause_kind == "question" for c in structure.clauses) or reactive_act(text) in {
+            "acknowledgment", "amusement"} or {t.lemma for t in structure.tokens} & {"или", "либо"}:
+        return ()
+    lemmas = content_lemmas(text)
+    topics = _plan_topics(json.dumps(plan))
+    if not topics:
+        return lemmas[:1]
+    return tuple(sorted(topics.intersection(lemmas)))
+
+
+def reported_words(text: str) -> str:
+    """The first segment of a reply up to its first punctuation: what the person said first."""
+    from debilgi.cognition.affect import strip_mentions
+
+    return re.split(r"[,;.!?…]", strip_mentions(text or ""), maxsplit=1)[0].strip()
+
 
 _MESSAGE_TYPES = {EventType.MESSAGE_CREATED, EventType.MESSAGE_REPLIED}
 _CLOSED = frozenset({"preposition", "conjunction", "particle", "pronoun"})
@@ -149,19 +249,52 @@ def ellipsis_variable(text: str) -> dict | None:
     """Closed interrogative grammar supplies a variable, never its value."""
     structure = analyze_structured_utterance(text)
     words = [t for t in structure.tokens if t.surface[:1].isalnum()]
-    if len(words) > 5 or any(t.part_of_speech == "verb" for t in words):
-        return None
     lemmas = {t.lemma for t in words}
+    verbs = [t for t in words if t.part_of_speech == "verb"]
+    if len(words) > 5 or verbs and not (
+            thought_content_enabled_now() and len(verbs) == 1 and {"почему", "так", "ты"} <= lemmas
+            and dict(verbs[0].grammatical_features).get("person") == "second"):
+        # (4.46, flag only) «почему ты так думаешь?»: «так» points back at the delivered turn, the
+        # second-person verb is only the person's name for it — the same variable as «почему?»
+        return None
     if {"потому", "что"} <= lemmas:
         return {"role": "cause_predicate", "relation": "cause",
                 "subject": "ты" if "ты" in lemmas else None}
     if "почему" in lemmas or "что" in lemmas and "так" in lemmas:
         return {"role": "cause", "relation": "cause"}
+    if thought_content_enabled_now() and (
+            "зачем" in lemmas or any(a.lemma == "для" and b.lemma == "что"
+                                     for a, b in zip(words, words[1:], strict=False))) and not any(
+            t.part_of_speech in {"noun", "adjective", "pronoun"} and t.lemma != "что"
+            for t in words):
+        # (4.46, flag only) «для чего?» / «зачем?» with nothing else said: the purpose of what was
+        # just delivered, the same omitted event as «почему?» — asked with the person's own word
+        return {"role": "cause", "relation": "cause", "word": "зачем"}
     wh = next((t for t in words if t.lemma == "какой"), None)
     if wh:
         return {"role": "attribute", "features": {
             k: v for k, v in wh.grammatical_features if k in {"gender", "number", "case"}}}
     return None
+
+
+def thought_content_enabled_now() -> bool:
+    from debilgi.config import thought_content_enabled
+
+    return thought_content_enabled()
+
+
+def _evaluative_third_party_question(thought) -> bool:
+    """A polar question whether a third party is something («а X был прав?», «X хороший?»).
+
+    Structure only: the predicate is the copula, a complement is asked about, and the subject is
+    neither the speaker nor the addressee (a question about the bot itself is its own to answer).
+    """
+    if thought is None or thought.predicate.lemma != "быть":
+        return False
+    roles = {d.role: d.argument.head.lemma for d in thought.dependencies}
+    subject = roles.get("subject")
+    return bool(subject) and subject not in {"я", "ты", "мы", "вы"} and any(
+        role != "subject" for role in roles)
 
 
 def learned_evaluation(prompt, rows):
@@ -1822,7 +1955,12 @@ class DialogueStructureLearning:
         if (not planning.proposals or event.actor_id is None
                 or any(p.plan.knowledge_limit is None for p in planning.proposals)):
             return ()
-        asked = parse_proposition(context.structure, allow_question=True, perspective="user")
+        from debilgi.config import thought_content_enabled
+
+        # (4.45, flag only) the view of a preference («любишь изучать»), as the opinion reads it
+        asked = parse_proposition(context.structure, allow_question=True, perspective="user",
+                                  **({"evaluation": True, "action_object": True}
+                                     if thought_content_enabled() else {}))
         if asked is None or not any(c.clause_kind == "question" for c in
                                     context.structure.clauses) and "?" not in context.prompt:
             return ()
@@ -1871,6 +2009,16 @@ class DialogueStructureLearning:
                 or self._asks_own_doing(context)):
             return ()
         if asked_state == "open_questions":
+            if thought_content_enabled():
+                # (4.45) «что ты думаешь о X?» asks for a view on X, which `opinion_plans` gives
+                # when it has a ground; what the agent is working out (its open questions) is no
+                # answer to it
+                from debilgi.language.semantic_graph import parse_proposition
+
+                asked = parse_proposition(context.structure, allow_question=True,
+                                          perspective="user")
+                if asked is not None and any(d.role == "topic" for d in asked.dependencies):
+                    return ()
             return await self._open_question_plans(event, context, goal)
         if thought_content_enabled() and self._asks_doing_on_a_day(context):
             # A day was named and the record has no deed of that day (else it would be Known):
@@ -1883,6 +2031,123 @@ class DialogueStructureLearning:
             recent = await self._recent_action_plans(event, context, goal)
             return (*recent, *await self._older_deed_plans(event, context, goal, recent))
         return await self._recent_action_plans(event, context, goal)
+
+    async def opinion_plans(self, event, context, planning, *, sympathy, irritation=None) -> tuple:
+        """A view of the agent's own, next to the honest limit (stage 4.45, flag only).
+
+        Asked «ты любишь X?», «тебе нравится X?», «что ты думаешь о X?», «X был прав?», the agent
+        may say «Думаю, …» only on a ground of its own: S(X), the reactions of people to what it
+        said about X and what it keeps doing (`MeaningIntentRepository.sympathy`). No ground: no
+        view (the limit stays). The sign is the sign of S; a stance already held is kept, and it
+        turns only on new experience of at least two people that is as strong as the ground it
+        stood on — one person pressing again is a demand (D), not a ground. The marker is the
+        first-person frame verb of the people of this server («думаю»), so the view is told from
+        a fact by its wording; it is never a claim, evidence or hypothesis of the world, and is
+        written (as a stance) only when delivered. Who the person is for the agent (P) acts
+        through the weight of their reactions in S; the kind of move acts through H in the choice
+        between this view, the limit and a question.
+        """
+        from debilgi.config import thought_content_enabled
+
+        if (not thought_content_enabled() or not planning.proposals or event.actor_id is None
+                or any(p.plan.knowledge_limit is None for p in planning.proposals)):
+            return ()
+        form = context.turn_form
+        if form is None or not form.addressed or (irritation is not None and irritation.hostile):
+            return ()
+        from debilgi.language.communication import MessagePlan, reader_goal
+        from debilgi.language.generative_planner import DerivedPlan, SemanticEvidence
+        from debilgi.language.position_reasoning import PositionRepository, _position_key
+        from debilgi.language.semantic_graph import parse_proposition
+
+        structure = context.structure
+        if not (any(c.clause_kind == "question" for c in structure.clauses)
+                or "?" in context.prompt):
+            return ()
+        asked = parse_proposition(structure, allow_question=True, perspective="user",
+                                  evaluation=True, action_object=True)
+        if asked is None:
+            return ()
+        reading = _opinion_reading(asked)
+        if reading is None:
+            return ()
+        if reader_goal(structure).question_word and asked.predicate.lemma != "думать":
+            return ()  # «что ты любишь делать?» asks for the object itself: no yes/no view to give
+        quality, topic, statement = reading
+        marker = await self.learned_stance_marker(event)
+        if marker is None:
+            return ()  # a view must carry the way people of this server mark theirs
+        repository = PositionRepository(self._database)
+        key = _position_key(topic, quality)
+        held = await repository.recall(event.guild_id, key)
+        topics = frozenset({topic})
+        current = await sympathy(event, topics)
+        if held is None and not current.value:
+            return ()  # no ground of its own: nothing to say but the limit
+        fresh = current
+        if held is not None:
+            row = await self._database.fetchone(
+                "SELECT updated_at FROM language_positions WHERE guild_id=? AND position_key=?",
+                (event.guild_id, key))
+            fresh = await sympathy(event, topics, since=row["updated_at"]) if row else current
+        stance, score, revised = held_stance(held, current, fresh)
+        thought = replace(statement, clause_kind="statement", focus_role=None,
+                          negated=stance == "oppose", confidence=min(1.0, max(0.0, abs(score))),
+                          evidence=(marker[1], *current.ids[:4]))
+        ground = {"s": round(current.value, 4), **{
+            k: v for k, v in current.as_data().items() if k != "value"},
+            "held": held is not None, "revised": revised,
+            **({"held_score": round(held.score, 4)} if held is not None else {})}
+        plan = MessagePlan(reader_goal(structure), thought, speech_act="opinion", hypothesis=(
+            ("kind", "opinion"), ("operator", marker[0]), ("operator_source", marker[1]),
+            ("topic", topic), ("quality", quality), ("stance", stance), ("score", f"{score:.4f}"),
+            ("revised", "1" if revised else ""), ("ground", json.dumps(list(current.ids[:8]))),
+            ("basis", json.dumps(ground, ensure_ascii=False))),
+            mixture=(("opinion", 1.0),))
+        premises = [SemanticEvidence(current.ids[0] if current.ids else f"position:{key}",
+                                     "sympathy", topic, statement)]
+        if current.deed_claim:
+            # what the agent keeps doing is the reason it can give for a view (as for a guess)
+            from debilgi.language.dialogue_obligations import thought_from_data
+
+            row = await self._database.fetchone(
+                "SELECT thought_json FROM meaning_claims WHERE claim_id=? AND guild_id=?",
+                (current.deed_claim, event.guild_id))
+            if row is not None:
+                deed = thought_from_data(json.loads(row["thought_json"]))
+                premises.append(SemanticEvidence(current.deed_claim, "agent_observed", topic, deed))
+        return (DerivedPlan(plan, "opinion", tuple(premises),
+                            reader_goal(structure).question_word),)
+
+    async def learned_stance_marker(self, event) -> tuple[str, str] | None:
+        """The first-person present form of the frame verb of a view (`OPINION_FRAME_VERB`) that
+        the most different people of this server used, with one message that has it."""
+        from debilgi.language.communication import OPINION_FRAME_VERB
+
+        stem = OPINION_FRAME_VERB[:-2]
+        rows = await self._database.fetchall(
+            "SELECT d.source_id,d.actor_id,d.content FROM language_discourse_turns d "
+            "JOIN events e ON e.event_id=d.source_id WHERE d.guild_id=? AND d.observed_at<? "
+            "AND COALESCE(json_extract(e.payload_json,'$.author_is_bot'),0)=0 "
+            "AND (d.content LIKE ? OR d.content LIKE ?) ORDER BY d.observed_at DESC LIMIT 512",
+            (event.guild_id, event.utc_timestamp.isoformat(),
+             *(f"%{form}%" for form in _letter_cases(stem)[:2])))
+        people: dict[str, set] = {}
+        source: dict[str, str] = {}
+        for row in rows:
+            for token in exchange_analysis(row["content"])[0].tokens:
+                features = dict(token.grammatical_features)
+                if (token.lemma == OPINION_FRAME_VERB and features.get("person") == "first"
+                        and features.get("number") == "singular"
+                        and features.get("tense") == "present"):
+                    form = token.surface.casefold()
+                    people.setdefault(form, set()).add(row["actor_id"])
+                    source.setdefault(form, row["source_id"])
+        agreed = {w: a for w, a in people.items() if len(a) >= 2}
+        if not agreed:
+            return None
+        name = max(agreed, key=lambda w: (len(agreed[w]), w))
+        return name, source[name]
 
     async def curiosity_plans(self, event, context, planning, *, irritation=None,
                               boredom=None) -> tuple:
@@ -1939,6 +2204,8 @@ class DialogueStructureLearning:
         if not token.morphology_known and DEFAULT_MORPHOLOGY.has_known_neighbour(token.surface):
             return ()  # a typo of a known word, not an unknown topic
         topic = token.lemma
+        if await self._reported_by(event, (topic,)):
+            return ()  # (4.44) this person has told the agent what it is: asked and answered
         # U: the people (not the asker, not bots) and the claims that already speak of the topic.
         stem = topic[:max(3, len(topic) - 2)]
         rows = await self._database.fetchall(
@@ -2192,6 +2459,15 @@ class DialogueStructureLearning:
 
     async def play_barred(self, event, text: str) -> str | None:
         """Why the agent must not play now: the person's own tone is negative."""
+        from debilgi.config import thought_content_enabled
+        if thought_content_enabled():
+            # (4.43) a topic that ≥2 different people here answered with hostility is not played
+            # with (C); a neutral one is
+            from debilgi.cognition import chat_norms
+
+            norms = await chat_norms.load(self._database, event.guild_id)
+            if norms.barred(chat_norms._lemmas(text)):
+                return "chat_norm"
         negative = {"sadness", "anger", "shock_or_frustration", "aversion", "regret", "annoyance",
                     "annoyance_or_surprise", "coarse_emphasis", "bittersweet_emotion",
                     "skepticism_or_disappointment"}
@@ -2293,8 +2569,16 @@ class DialogueStructureLearning:
         specific = {key for key in candidates
                     if candidates[key] / max(1, total.get(key[0], 0)) >= 0.08}
         ranked = sorted(specific, key=lambda k: (-len(theme.get(k[0], ())), -candidates[k], k))
+        from debilgi.config import thought_content_enabled
+        barred = ()
+        if thought_content_enabled():
+            from debilgi.cognition import chat_norms
+
+            # (4.43) a topic the chat answers with hostility (≥2 people) is no material for play
+            barred = {n.key for n in (await chat_norms.load(
+                self._database, event.guild_id)).norms if n.kind == "word" and n.sign == "hostile"}
         for dependent, case in ranked[:6]:
-            if not self._fit_for_play(dependent):
+            if not self._fit_for_play(dependent) or dependent in barred:
                 continue
             preposition = None
             if wanted == "obl":
@@ -2456,6 +2740,13 @@ class DialogueStructureLearning:
             if frame is None:
                 return ()
         thought, slot, _ = frame
+        if thought_content_enabled_now():
+            from debilgi.cognition import chat_norms
+
+            norms = await chat_norms.load(self._database, event.guild_id)
+            if norms.barred({thought.predicate.lemma,
+                             *(d.argument.head.lemma for d in thought.dependencies)}):
+                return ()  # (4.43) the frame itself is a topic the chat answers with hostility
         if "elliptical_complement" in thought.evidence:
             # What an earlier question attached to the embedded verb is only the person's
             # question; as the agent's own play it must pass the screen material passes.
@@ -2922,9 +3213,26 @@ class DialogueStructureLearning:
         variable = ellipsis_variable(context.prompt)
         if variable is None:
             return None
+        asked_word = variable.get("word", "почему")
         prior = context.prior_bot_turn
         limited = bool(variable["role"] == "cause" and prior
                        and prior["plan"].get("knowledge_limit"))
+        reported_claim = (prior["plan"].get("claim") or {}) if prior else {}
+        reported = (reported_claim.get("evidence") or [None])[0]
+        if (thought_content_enabled_now() and variable["role"] == "cause"
+                and (reported_claim.get("predicate") or {}).get("lemma") == "сказать"
+                and str(reported).startswith("receipt:")):
+            # (4.46, flag only) «Я сказал «…»» repeated a view (4.45 opinion) already delivered:
+            # «почему?» asks for the ground of that view, which its own turn recorded
+            original = next((item for item in await own_turn_history(
+                self._database, event.guild_id, event.actor_id, event.utc_timestamp)
+                if item["receipt_id"] == reported and (item["basis"] or {}).get("opinion")), None)
+            if original is not None:
+                explained = await self.explain_delivered_basis(event, context, {
+                    "basis": original["basis"],
+                    "operations": await self.observed_operations(event)})
+                if explained is not None:
+                    return explained
         if variable["role"] == "cause" and prior and prior["plan"].get(
             "claim", {}).get("predicate_class") == "dialogue_act":
             return None  # explain the observed act, not an invented event cause
@@ -2932,6 +3240,10 @@ class DialogueStructureLearning:
             explained = await self.explain_delivered_basis(event, context, prior)
             if explained is not None:
                 return explained
+        if asked_word != "почему":
+            # (4.46) «для чего?» / «зачем?»: the purpose is the ground the agent really had (above)
+            # or nothing: no unknown-cause limit is built on the person's other word
+            return None
         question = None
         receipt = prior["receipt_id"] if prior else None
         if prior and variable["role"] in {"attribute", "cause"}:
@@ -2978,7 +3290,14 @@ class DialogueStructureLearning:
                 elif thought.clause_kind != "question":
                     question = replace(thought, clause_kind="question", dependencies=(
                         *thought.dependencies, SemanticDependency("cause", ConceptArgument(
-                            ConceptLexeme("почему", "почему", "adverb")))), focus_role="cause")
+                            ConceptLexeme(asked_word, asked_word, "adverb")))), focus_role="cause")
+        identity = None
+        if limited and question is not None:
+            # The cause of not knowing a question about the world (4.40): not knowing who/what
+            # its topic is, when the claim store really holds nothing about it.
+            identity = await self._ignorance_identity(event, prior)
+            if identity is not None:
+                question = identity[0]
         # Select lexical operators only from original human observations.
         rows = await self._database.fetchall(
             "SELECT d.source_id,d.content FROM language_discourse_turns d "
@@ -3004,12 +3323,15 @@ class DialogueStructureLearning:
                                predicate=question.predicate.lemma,
                                requested_role=question.focus_role,
                                requested_attribute=variable["role"] == "attribute")
+            if identity is not None:
+                query = identity[1]
             plan = MessagePlan(goal, assertion, knowledge_limit=KnowledgeLimit(
-                query, question, "какой" if variable["role"] == "attribute" else "почему"),
+                query, question, identity[2] if identity is not None else (
+                    "какой" if variable["role"] == "attribute" else asked_word)),
                 mixture=(("known", 1.0),), known_slots=((variable["role"], receipt, receipt),))
             return DerivedPlan(plan, "bind_delivered_variable", (
                 SemanticEvidence(receipt, "sent_turn", prior["response_text"], question),),
-                "почему" if variable["role"] == "cause" else "какой")
+                asked_word if variable["role"] == "cause" else "какой")
         if "спрашивать" not in operations:
             return None
         source = operations["спрашивать"]
@@ -3025,6 +3347,327 @@ class DialogueStructureLearning:
         return DerivedPlan(MessagePlan(goal, thought, speech_act="clarify_variable",
                                       mixture=(("reaction", 1.0),)), "ask_unbound_variable", (
             SemanticEvidence(source, "human_question_grammar", "", thought),))
+
+    async def _ignorance_identity(self, event, prior):
+        """(question, query, word): «кто/что X?» for the world topic of a delivered limit, or None.
+
+        Flag only. The topic is the noun subject of the question the limit was about (never the
+        agent or the asker); the identity is asked of the claim store itself, and only an Unknown
+        there makes «не знаю, кто/что это» the honest cause of the earlier limit.
+        """
+        from debilgi.config import thought_content_enabled
+
+        if not thought_content_enabled() or prior is None:
+            return None
+        row = await self._database.fetchone(
+            "SELECT content FROM language_discourse_turns WHERE source_id=?",
+            (prior["prompt_event_id"],))
+        if row is None or not prior["plan"].get("knowledge_limit"):
+            return None
+        from debilgi.language.proposition_memory import PropositionMemory
+        from debilgi.language.semantic_graph import (
+            ClauseThought,
+            ConceptArgument,
+            ConceptLexeme,
+            SemanticDependency,
+            parse_proposition,
+        )
+
+        # The topic is read from the question the limit answered, as curiosity reads it.
+        structure = analyze_structured_utterance(row["content"] or "")
+        if any(t.lemma in _DEIXIS for t in structure.tokens):
+            return None
+        asked = parse_proposition(structure, allow_question=True, perspective="user",
+                                  evaluation=True, definition=True)
+        if asked is None or asked.predicate.lemma != "быть":
+            return None
+        subject = next((d.argument.head for d in asked.dependencies if d.role == "subject"), None)
+        token = next((t for t in structure.tokens if subject is not None
+                      and t.lemma == subject.lemma and t.part_of_speech == "noun"), None)
+        if token is None or not token.lemma:
+            return None
+        subject = ConceptLexeme(token.lemma, token.surface, "noun", token.grammatical_features)
+        word = "кто" if "anim" in token.grammemes else "что"
+        phrase = (f"кто такой {token.surface}?" if word == "кто"
+                  else f"что такое {token.surface}?")
+        found = await PropositionMemory(self._database).retrieve_claims(event, phrase)
+        if found.status != "Unknown":
+            return None
+        question = ClauseThought(
+            ConceptLexeme("быть", "быть", "verb", (("tense", "present"),)),
+            (SemanticDependency("subject", ConceptArgument(subject)),
+             SemanticDependency("predicate_complement", ConceptArgument(
+                 ConceptLexeme(word, word, "pronoun"), grammatical_case="nominative"))),
+            clause_kind="question", focus_role="predicate_complement",
+            predicate_class="copular", evidence=(event.event_id,))
+        return question, found.query, word
+
+    async def repair_rate_ok(self, event, boredom) -> bool:
+        """The first repair is free; a further one must not lift the share of repairs among the
+        delivered turns to this person (decayed journal) above the share of questions people ask
+        back on this server: the agent does not question more than they do."""
+        from debilgi.experience.meaning_intents import decay_weight
+
+        spent = total = 0.0
+        for row in boredom.rows:
+            if not row.person:
+                continue
+            weight = decay_weight(row.age, boredom.half_life)
+            total += weight
+            spent += weight * (row.operation in {"repair", "ask_unbound_variable"})
+        return spent == 0.0 or spent + 1.0 <= (total + 1.0) * await self.human_question_share(
+            event.guild_id)
+
+    async def human_question_share(self, guild_id) -> float:
+        """The share of people's replies that are questions on this server (their own measure)."""
+        row = await self._database.fetchone(
+            "SELECT COUNT(*) n, SUM(response_act IN ('information_question','opinion_question')) q "
+            "FROM language_observed_exchanges WHERE guild_id=?", (guild_id,))
+        return (row["q"] or 0) / row["n"] if row and row["n"] else 0.0
+
+    async def repair_plans(self, event, context, reason, *, allowed=True, irritation=None,
+                           boredom=None) -> tuple:
+        """A question about what was not understood, instead of silence after an inner failure.
+
+        Stage 4.40 (``DEBILGI_THOUGHT_CONTENT``). Asked only of an addressed, non-hostile question
+        or repair turn that is not a closing of the topic, and only if the earlier repair budget
+        is not spent (``allowed``) and the repairs so far (the journal of delivered turns to this
+        person, decayed by the clock) are not above the share of questions people ask back on
+        this server. The words are those people of this server were seen to use: the operator
+        «спрашивать» (and «зачем» for the purpose) from their own turns, nothing is authored.
+        What was not understood is the variable (``спрашивать(ты, о что?)``), or, when the person
+        presses the same demand («почему», «так почему же», a repair of the last turn), the
+        purpose (``спрашивать(ты, зачем?)``). Repeating the same repair is B's business: the
+        arbitrator drops a spent one.
+        """
+        from debilgi.config import thought_content_enabled
+
+        form = context.turn_form
+        if (not thought_content_enabled() or not allowed or boredom is None
+                or event.actor_id is None or event.channel_id is None or form is None
+                or not form.addressed or form.kind not in {"question", "repair"}
+                or reactive_act(context.prompt) == "acknowledgment"
+                or (irritation is not None
+                    and (irritation.hostile or irritation.value > irritation.sensitivity))):
+            return ()
+        from debilgi.language.communication import MessagePlan, reader_goal
+        from debilgi.language.generative_planner import DerivedPlan, SemanticEvidence
+        from debilgi.language.productive_nlg import (
+            ClauseThought,
+            ConceptArgument,
+            ConceptLexeme,
+            SemanticDependency,
+        )
+        from debilgi.language.semantic_graph import parse_proposition
+
+        asked = parse_proposition(context.structure, allow_question=True, possessive_deixis=True)
+        if (asked is not None and form.kind != "repair"
+                and any(d.role == "subject" for d in asked.dependencies)
+                and reader_goal(context.structure).question_word in {"почему", "зачем"}):
+            # (4.46) a question that is read whole (who, what is said of whom) and asks only for
+            # the cause: the meaning is recovered, so «о чём ты спрашиваешь?» would be untrue
+            return ()
+        if not await self.repair_rate_ok(event, boredom):
+            return ()
+        rows = await self._database.fetchall(
+            "SELECT d.source_id,d.content FROM language_discourse_turns d "
+            "JOIN events e ON e.event_id=d.source_id WHERE d.guild_id=? AND d.observed_at<? "
+            "AND COALESCE(json_extract(e.payload_json,'$.author_is_bot'),0)=0 "
+            "AND (d.content LIKE '%спраш%' OR d.content LIKE '%зачем%' "
+            "OR d.content LIKE '%Зачем%') "
+            "ORDER BY d.observed_at DESC LIMIT 512",
+            (event.guild_id, event.utc_timestamp.isoformat()))
+        seen: dict[str, str] = {}
+        for row in rows:
+            for token in exchange_analysis(row["content"])[0].tokens:
+                if token.lemma in {"спрашивать", "зачем"}:
+                    seen.setdefault(token.lemma, row["source_id"])
+        if "спрашивать" not in seen:
+            return ()
+        variable = ellipsis_variable(context.prompt)
+        pressed = form.kind == "repair" or (variable is not None and variable["role"] == "cause")
+        verb = ConceptLexeme("спрашивать", "спрашивать", "verb", (("tense", "present"),))
+        you = SemanticDependency("subject", ConceptArgument(ConceptLexeme("ты", "ты", "pronoun")))
+        if pressed and "зачем" in seen:
+            kind, source = "purpose", (seen["спрашивать"], seen["зачем"])
+            thought = ClauseThought(verb, (you, SemanticDependency(
+                "purpose", ConceptArgument(ConceptLexeme("зачем", "зачем", "adverb")))),
+                clause_kind="question", focus_role="purpose", confidence=0.78 ** 2,
+                evidence=source)
+        else:
+            kind, source = "variable", (seen["спрашивать"],)
+            thought = ClauseThought(verb, (you, SemanticDependency(
+                "topic", ConceptArgument(ConceptLexeme("что", "что", "pronoun"),
+                                         preposition="о", grammatical_case="prepositional"))),
+                clause_kind="question", focus_role="topic", confidence=0.78 ** 2,
+                evidence=source)
+        plan = MessagePlan(reader_goal(context.structure), thought, speech_act="question",
+                           mixture=(("reaction", 1.0),))
+        return (DerivedPlan(plan, "repair", (
+            SemanticEvidence(source[0], "human_question_grammar", kind, thought),
+            SemanticEvidence(event.event_id, "inner_failure", reason, thought)), "что"),)
+
+    async def _words_seen(self, event, lemma: str, stem: str) -> str | None:
+        """The id of a turn of a person (not a bot) of this server that used `lemma`."""
+        rows = await self._database.fetchall(
+            "SELECT d.source_id,d.content FROM language_discourse_turns d "
+            "JOIN events e ON e.event_id=d.source_id WHERE d.guild_id=? AND d.observed_at<? "
+            "AND COALESCE(json_extract(e.payload_json,'$.author_is_bot'),0)=0 "
+            "AND (d.content LIKE ? OR d.content LIKE ? OR d.content LIKE ?) "
+            "ORDER BY d.observed_at DESC LIMIT 512",
+            (event.guild_id, event.utc_timestamp.isoformat(),
+             *(f"%{f}%" for f in _letter_cases(stem))))
+        for row in rows:
+            if any(t.lemma == lemma for t in exchange_analysis(row["content"])[0].tokens):
+                return row["source_id"]
+        return None
+
+    async def _reception_confirmation(self, event, context, prior_plan: dict) -> tuple:
+        """The person asks again whether the agent did what its last turn said it did («понял
+        кто он такой?» after «Я понял «…»»): a question whose predicate is the predicate of that
+        turn is answered yes by the same verb, since the agent did receive it."""
+        claim = prior_plan.get("claim") or {}
+        said = (claim.get("predicate") or {}).get("lemma")
+        if (not said or claim.get("clause_kind") == "question"
+                or not any((d.get("argument") or {}).get("head", {}).get("entity_kind")
+                           == "quoted_utterance" for d in claim.get("dependencies") or ())
+                or not any(c.clause_kind == "question" for c in context.structure.clauses)
+                or not any(t.lemma == said and t.part_of_speech == "verb"
+                           for t in context.structure.tokens)):
+            return ()
+        from debilgi.language.communication import MessagePlan, reader_goal
+        from debilgi.language.generative_planner import DerivedPlan, SemanticEvidence
+        from debilgi.language.productive_nlg import (
+            ClauseThought,
+            ConceptArgument,
+            ConceptLexeme,
+            SemanticDependency,
+        )
+
+        evidence = tuple(claim.get("evidence") or ()) or (event.event_id,)
+        thought = ClauseThought(
+            ConceptLexeme(said, said, "verb", (
+                ("tense", "past"), ("number", "singular"), ("gender", "masculine"))),
+            (SemanticDependency("subject", ConceptArgument(ConceptLexeme(
+                "я", "я", "pronoun", (("number", "singular"), ("person", "first"))))),
+             SemanticDependency("direct_object", ConceptArgument(
+                 ConceptLexeme("ты", "ты", "pronoun", (("person", "second"),)),
+                 grammatical_case="accusative"))),
+            confidence=0.78 ** 2, evidence=evidence)
+        plan = MessagePlan(reader_goal(context.structure), thought, speech_act="statement",
+                           mixture=(("reaction", 1.0),))
+        return (DerivedPlan(plan, "acknowledge_report", (
+            SemanticEvidence(evidence[0], "human_report_grammar", said, thought),
+            SemanticEvidence(event.event_id, "reported_answer", "confirmation", thought)), None),)
+
+    async def _reported_by(self, event, topics) -> dict | None:
+        """The latest position this very person reported on one of the topics (4.44, flag only):
+        {topic, event_id, text}. Only his own: a position is never read for another person."""
+        from debilgi.config import thought_content_enabled
+        from debilgi.experience.meaning_intents import REPORT_KEY, REPORT_SCOPE
+
+        if not thought_content_enabled() or event.actor_id is None or not topics:
+            return None
+        keys = [REPORT_KEY + t for t in topics]
+        row = await self._database.fetchone(
+            "SELECT p.meaning_key,p.source_event_id,d.content FROM meaning_positions p "
+            "JOIN language_discourse_turns d ON d.source_id=p.source_event_id "
+            f"WHERE p.guild_id=? AND p.actor_id=? AND p.scope=? AND p.observed_at<? "
+            f"AND p.meaning_key IN ({','.join('?' * len(keys))}) "
+            "ORDER BY p.observed_at DESC LIMIT 1",
+            (event.guild_id, event.actor_id, REPORT_SCOPE, event.utc_timestamp.isoformat(), *keys))
+        if row is None:
+            return None
+        return {"topic": row["meaning_key"][len(REPORT_KEY):], "event_id": row["source_event_id"],
+                "text": row["content"]}
+
+    async def remember_position(self, event, context, limit):
+        """The honest limit about a topic this person once told the agent about carries what he
+        said, as his words (4.44, flag only): «Не знаю, … . Ты говоришь «…».» Not a fact, not the
+        agent's claim, and only to the person who said it."""
+        from debilgi.config import thought_content_enabled
+
+        if limit is None or not thought_content_enabled() or limit.plan.knowledge_limit is None:
+            return limit
+        from debilgi.language.content import content_lemmas
+
+        found = await self._reported_by(event, content_lemmas(context.prompt))
+        quote = reported_words(found["text"]) if found else ""
+        seen = await self._words_seen(event, "говорить", "говор") if quote else None
+        if not quote or seen is None:
+            return limit
+        from debilgi.language.generative_planner import SemanticEvidence
+        from debilgi.language.productive_nlg import (
+            ClauseThought,
+            ConceptArgument,
+            ConceptLexeme,
+            SemanticDependency,
+        )
+
+        thought = ClauseThought(
+            ConceptLexeme("говорить", "говорить", "verb", (("tense", "present"),)),
+            (SemanticDependency("subject", ConceptArgument(ConceptLexeme(
+                "ты", "ты", "pronoun", (("number", "singular"), ("person", "second"))))),
+             quoted_utterance_dependency(quote)),
+            confidence=limit.plan.claim.confidence, evidence=(seen, found["event_id"]))
+        return replace(limit, plan=replace(limit.plan, follow_up=thought), premises=(
+            *limit.premises, SemanticEvidence(found["event_id"], "reported_position", quote,
+                                              thought)))
+
+    async def reception_plans(self, event, context, *, irritation=None) -> tuple:
+        """The reply of a person to a question the agent asked is received (4.44, flag only).
+
+        The reply is recognised as an answer when the agent's last delivered turn asked a
+        question (its own plan says so), and the reply is a statement about what it asked
+        (`answered_topics`). It is received as what the person said — never a fact of the world,
+        never the agent's claim: the plan is the acknowledgement «понял» with the person's own
+        first words in quotation marks. The verb is the one people of this server were seen to
+        use; the words quoted are the person's. Nothing is said about who said it.
+        """
+        from debilgi.config import thought_content_enabled
+
+        form = context.turn_form
+        prior = context.prior_bot_turn
+        if (not thought_content_enabled() or event.actor_id is None or form is None
+                or not form.addressed or not prior
+                or (irritation is not None
+                    and (irritation.hostile or irritation.value > irritation.sensitivity))):
+            return ()
+        plan_data = prior["plan"]
+        asked = (plan_data.get("claim") or {}).get("clause_kind") == "question" or (
+            (plan_data.get("follow_up") or {}).get("clause_kind") == "question")
+        text = str(event.payload.get("content", "")) or context.prompt
+        confirmed = await self._reception_confirmation(event, context, plan_data)
+        if confirmed:
+            return confirmed
+        topics = answered_topics(text, plan_data) if asked else ()
+        quote = reported_words(text)
+        if not topics or not quote:
+            return ()
+        seen = await self._words_seen(event, "понять", "поня")
+        if seen is None:
+            return ()
+        from debilgi.language.communication import MessagePlan, reader_goal
+        from debilgi.language.generative_planner import DerivedPlan, SemanticEvidence
+        from debilgi.language.productive_nlg import (
+            ClauseThought,
+            ConceptArgument,
+            ConceptLexeme,
+            SemanticDependency,
+        )
+
+        thought = ClauseThought(
+            ConceptLexeme("понять", "понять", "verb", (
+                ("tense", "past"), ("number", "singular"), ("gender", "masculine"))),
+            (SemanticDependency("subject", ConceptArgument(ConceptLexeme(
+                "я", "я", "pronoun", (("number", "singular"), ("person", "first"))))),
+             quoted_utterance_dependency(quote)),
+            confidence=0.78 ** 2, evidence=(seen, event.event_id))
+        plan = MessagePlan(reader_goal(context.structure), thought, speech_act="statement",
+                           mixture=(("reaction", 1.0),))
+        return (DerivedPlan(plan, "acknowledge_report", (
+            SemanticEvidence(seen, "human_report_grammar", "понять", thought),
+            SemanticEvidence(event.event_id, "reported_answer", quote, thought)), None),)
 
     async def sleep_answer_plans(self, event, context, *, breadth=3):
         """Borrow human answer operations, never their personal truth values.
@@ -3209,6 +3852,13 @@ class DialogueStructureLearning:
             group["rows"].append(row)
             group["match"] = max(group["match"], 1.0 if exact else .75)
         composed = False
+        if (not grouped and not goal.question_word
+                and _evaluative_third_party_question(target)):
+            # (4.43, 4.46: and with the flag off) nobody observed answered this meaning, and it
+            # asks whether someone else is something («был прав?»): crossing the question's own
+            # thought with a hedge and a polarity would be the person's bait echoed back as the
+            # agent's opinion
+            return ()
         if not grouped and not goal.question_word:
             # No human answered this meaning. Cross the question's own thought
             # (a predicate and its participants) with the learned epistemic
@@ -3486,6 +4136,13 @@ class DialogueStructureLearning:
         human = [analyze_turn_form(r["content"]) for r in rows if r["actor_id"] == event.actor_id]
         habitual = tuple(sorted(t for t in {t for f in human for t in f.tone}
                                 if sum(t in f.tone for f in human) / len(human) >= 0.5))
+        from debilgi.config import thought_content_enabled
+        if thought_content_enabled():
+            # (4.43) the chat's habitual tone is the background of «this person changed tone»
+            from debilgi.cognition import chat_norms
+
+            habitual = tuple(sorted({*habitual, *(
+                await chat_norms.load(self._database, event.guild_id)).tones()}))
         prior = next((r["content"] for r in rows
                       if r["actor_id"] == event.payload.get("bot_user_id")
                       and r["observed_at"] >= (
@@ -3602,16 +4259,25 @@ class DialogueStructureLearning:
                 )
 
     async def recent_reactions(
-        self, event: Event, *, minutes: int = 10,
+        self, event: Event, *, minutes: int = 10, include_repairs: bool = False,
     ) -> tuple[tuple[str, str | None, bool], ...]:
-        """Receipt-backed episode history, scoped to the current interlocutor."""
+        """Receipt-backed episode history, scoped to the current interlocutor.
+
+        A repair question (4.40, flag) is no reaction hook: it does not forbid the next reaction
+        its question mark; the surfaces (``include_repairs``) still remember it.
+        """
+        from debilgi.config import thought_content_enabled
+
+        skip = "" if include_repairs or not thought_content_enabled() else (
+            " AND i.operation != 'repair'")
         rows = await self._database.fetchall(
             """SELECT i.response_text,
                       json_extract(i.selection_json, '$.exchange_pattern_id') AS pattern,
                       instr(i.response_text, '?') > 0 AS question
                FROM language_meaning_intentions i
                WHERE i.guild_id = ? AND i.channel_id = ? AND i.user_id = ?
-                 AND i.sent_at >= ? AND i.sent_at < ? AND i.response_message_id IS NOT NULL
+                 AND i.sent_at >= ? AND i.sent_at < ? AND i.response_message_id IS NOT NULL"""
+            + skip + """
                ORDER BY i.sent_at DESC, i.intention_id LIMIT 6""",
             (event.guild_id, event.channel_id, event.actor_id,
              (event.utc_timestamp - timedelta(minutes=minutes)).isoformat(),

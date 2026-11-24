@@ -22,6 +22,10 @@ _TOKEN_RE = re.compile(
     re.UNICODE,
 )
 _CHAT_JOIN_RE = re.compile(r"(?<!\w)всмысле(?!\w)")
+# The enclitic question particle «ли» written with a hyphen («что-ли») or glued to the pronoun it
+# follows («чтоли») is the same two words as «что ли» (4.46); the parser read the three spellings as
+# a conjunction, a conjunction + particle and a guessed verb.
+_CHAT_LI_RE = re.compile(r"(?<=\w)-ли(?!\w)|(?<!\w)(что|чё|че)ли(?!\w)")
 _ELONGATED_RUN_RE = re.compile(r"(.)\1{2,}", re.IGNORECASE | re.UNICODE)
 
 
@@ -49,6 +53,11 @@ def tokenize(text: str, *, max_tokens: int = 500, max_token_length: int = 100) -
         raise ValueError("token limits must be positive")
     normalized = normalize_discord_markup(text).lower()
     normalized = _CHAT_JOIN_RE.sub("в смысле", normalized)
+    from debilgi.config import thought_content_enabled
+
+    if thought_content_enabled():  # (4.46) a reading, so flag 0 keeps the earlier tokens
+        normalized = _CHAT_LI_RE.sub(
+            lambda m: f"{m.group(1)} ли" if m.group(1) else " ли", normalized)
     tokens = _TOKEN_RE.findall(normalized)
     return tuple(token[:max_token_length] for token in tokens[:max_tokens])
 

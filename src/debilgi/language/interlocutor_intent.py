@@ -267,7 +267,11 @@ class InterlocutorIntentRepository:
         if prompt is None or not prior["response_text"]:
             return
         content = str(json.loads(prompt["payload_json"]).get("content", ""))
-        if reward is None and set(content_lemmas(str(event.payload.get("content", "")))) & set(
+        from debilgi.config import thought_content_enabled
+
+        if reward is None and not (
+            thought_content_enabled() and outcome == "follow_up_question"  # (4.41) pressed stays
+        ) and set(content_lemmas(str(event.payload.get("content", "")))) & set(
             content_lemmas(content) + content_lemmas(prior["response_text"])
         ):
             outcome = "topic_continued"
@@ -329,10 +333,15 @@ class InterlocutorIntentRepository:
             support = sum(sim * (3 if row["source_kind"] == "live" else 1)
                           for sim, row in samples)
             rejection = outcomes["rejected"] / len(samples)
+            # (4.41, flag only) a form the person pressed again was not what he wanted either
+            from debilgi.config import thought_content_enabled
+
+            pressing = (outcomes["follow_up_question"] / len(samples)
+                        if thought_content_enabled() else 0.0)
             continuity = (outcomes["topic_continued"] + outcomes["confirmed"]) / len(samples)
             confidence = min(0.92 if live else 0.64,
                              similarity * (0.40 + 0.20 * support / (support + 2)
-                                           + 0.15 * continuity)) * (1 - rejection)
+                                           + 0.15 * continuity)) * (1 - rejection - pressing)
             hypotheses.append(InterlocutorHypothesis(
                 _key(json.loads(raw)), signature, confidence, similarity,
                 len(samples) - live, live,
@@ -360,7 +369,16 @@ class InterlocutorIntentRepository:
              (event.utc_timestamp - timedelta(minutes=10)).isoformat(),
              event.payload.get("reply_to_message_id"), event.payload.get("reply_to_message_id")),
         )
-        return row is None or (
+        if row is None:
+            return True
+        from debilgi.config import thought_content_enabled
+
+        if thought_content_enabled():
+            # The budget counts repairs only (4.40): the agent's own curiosity, a limit with a
+            # question back, or any other question of its own does not spend it.
+            return row["operation"] not in {"ask_unbound_variable", "repair"} and (
+                not row["operation"].startswith("clarify_interlocutor:"))
+        return (
             not row["operation"].startswith("clarify_interlocutor:")
             and json.loads(row["plan_json"])["claim"]["clause_kind"] != "question"
         )

@@ -91,7 +91,7 @@ def reader_goal(structure: StructuredUtterance) -> ReaderGoal:
 
     variable = ellipsis_variable(structure.text)
     if variable and variable.get("relation") == "cause":
-        word = "почему"
+        word = variable.get("word", "почему")
     subject = tuple(structure.tokens[i].lemma for i in clause.subject_indices)
     predicate = (
         structure.tokens[clause.predicate_index].lemma
@@ -248,6 +248,11 @@ OWN_STATE_PROJECTIONS = {"думать": "open_questions"}
 # Epistemic operators of an opinion; a plan is marked only by one of these.
 EPISTEMIC_OPERATORS = frozenset({"наверное", "возможно", "вероятно"})
 
+# The frame verb of a stated opinion (4.45, flag only): «думать» in the first person is what the
+# people of the server say to mark a view as theirs, not a fact. The word itself is taken from
+# their messages (`learned_stance_marker`), a plan with this kind carries it as its operator.
+OPINION_FRAME_VERB = "думать"
+
 # The verb the agent uses to report one of its own operations (as OWN_STATE_PROJECTIONS maps
 # «думать» to the open questions): the operation of making something up is reported as a joke.
 OWN_OPERATION_VERBS = {"fantasy": "пошутить"}
@@ -312,6 +317,12 @@ def plan_issues(plan: MessagePlan) -> tuple[str, ...]:
                       and opinion.get("operator") in EPISTEMIC_OPERATORS
                       and opinion.get("operator_source") in plan.claim.evidence
                       and plan.speech_act == "opinion")
+    # A stated view (4.45): marked by the observed first-person frame verb, never a bare assertion
+    marked_opinion = marked_opinion or (
+        opinion.get("kind") == "opinion" and plan.speech_act == "opinion"
+        and plan.claim.clause_kind == "statement"
+        and DEFAULT_MORPHOLOGY.lemma(opinion.get("operator") or "") == OPINION_FRAME_VERB
+        and opinion.get("operator_source") in plan.claim.evidence)
     # A made-up statement about the agent is honest only when it is marked as play: by the
     # grammar of the unreal («бы») or by a laughter marker the agent has observed people use.
     marked_fantasy = (
@@ -946,9 +957,8 @@ class ResponseComposer:
                 )
             if reason or condition or follow_up or extras:
                 text = claim.text.rstrip(".?!")
-                if (follow_up and plan.follow_up.clause_kind == "question"
-                        and surface.source == "knowledge_limit"):
-                    # The not-knowing keeps what is not known; the question is asked after it.
+                if follow_up and surface.source == "knowledge_limit":
+                    # The not-knowing keeps what is not known; the follow-up comes after it.
                     text = surface.text.rstrip(".?!")
                 for extra in extras:
                     e = extra[0].text.rstrip(".?!")
@@ -974,7 +984,7 @@ class ResponseComposer:
                     None,
                 )
             opinion = dict(plan.hypothesis)
-            if opinion.get("kind") in {"experience_opinion", "own_evidence_opinion"}:
+            if opinion.get("kind") in {"experience_opinion", "own_evidence_opinion", "opinion"}:
                 # An observed epistemic operator scopes over the entire new
                 # proposition. No unmarked personal assertion leaves composer.
                 marker = opinion["operator"]
